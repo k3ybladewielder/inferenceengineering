@@ -1,0 +1,231 @@
+# 04 — Constrained Decoding & Structured Outputs
+
+[Previous: 03 — Engine Architectures](./03-engine-architectures.md) | [Stage 4 Overview](./README.md) | [Next: 05 — Logit Masking & Jump-Forward Decoding](./05-logit-masking-and-jump-forward-decoding.md)
+
+---
+
+## 1. Why Prompt Engineering Fails for Deterministic Contracts
+
+In agentic pipelines, function calling, and structured data extraction, an LLM must emit machine-parseable syntax (JSON conforming to a Pydantic schema, SQL, XML, or a custom DSL). Relying solely on prompting ("Return ONLY valid JSON") fails mathematically at scale:
+
+* Even if a single output has only a $\epsilon = 0.5\%$ probability of a structural error (a stray markdown fence ```` ```json ````, a trailing comma, an unescaped quote, or a hallucinated enum key), over a 20-step multi-agent workflow the probability of at least one parse failure is:
+  $$P(\text{failure}) = 1 - (1 - 0.005)^{20} \approx 9.54\%$$
+* Retry loops multiply TTFT, waste KV Cache compute, and degrade user experience.
+
+**Constrained Decoding (Grammar-Guided Generation)** eliminates structural errors completely by embedding a **formal language recognizer** (DFA or PDA/Earley parser) inside the token-sampling loop. Before sampling each token, the recognizer computes the exact subset of vocabulary tokens $V_{\text{valid}} \subseteq V$ that keep the output prefix in a valid partial derivation of the target grammar, guaranteeing **100% syntactic validity by construction**.
+
+---
+
+## 2. Formal Language Hierarchy: Regex/DFA vs. CFG/PDA
+
+From formal language theory (the Chomsky Hierarchy), two language classes govern structured LLM generation:
+
+### 2.1 Regular Languages (Type 3): Regex $\to$ NFA $\to$ DFA
+
+A **Regular Expression (Regex)** defines a regular language, convertible via Thompson's Construction into a Nondeterministic Finite Automaton (NFA) and via Subset Construction into a **Deterministic Finite Automaton (DFA)** $M = (Q, \Sigma, \delta, q_0, F)$:
+* $Q$: Finite set of states.
+* $\Sigma$: Input alphabet (ASCII/UTF-8 bytes or Unicode characters).
+* $\delta: Q \times \Sigma \to Q$: Deterministic transition function ($O(1)$ array/hash lookup per character).
+* $q_0 \in Q$: Initial state; $F \subseteq Q$: Accepting states (where `<EOS>` is permitted).
+
+**Strengths:**
+* Bounded finite state $Q$ enables **$O(1)$ per-token runtime advancement** and **full ahead-of-time mask precomputation** (`state_id -> allowed_token_ids`).
+* Sufficient for enums, dates, phone numbers, identifiers, and **non-recursive (or depth-bounded) JSON Schemas**.
+
+**Fundamental Limitation (Pumping Lemma):**
+A DFA has fixed finite memory ($|Q|$ states). It **cannot** match arbitrary-depth balanced delimiters such as nested JSON objects `{"a": {"b": ...}}`, nested arrays `[[[1]]]`, arithmetic expressions `((1+2)*3)`, or recursive ASTs (`$ref` in JSON Schema), because tracking unbounded nesting depth requires an unbounded counter/stack.
+
+### 2.2 Context-Free Languages (Type 2): CFG / EBNF $\to$ PDA / Earley Parser
+
+A **Context-Free Grammar (CFG)**—typically expressed in **Extended Backus-Naur Form (EBNF)**—is a 4-tuple $G = (V_{\text{nt}}, \Sigma, R, S)$ where production rules $A \to \alpha$ allow self-embedding recursion ($A \Rightarrow^* \dots A \dots$).
+
+Recognizing arbitrary CFGs requires a **Pushdown Automaton (PDA)** (a finite state machine augmented with an explicit **stack** of grammar symbols) or general CFG chart/parsing algorithms:
+* **Earley Parser (e.g., Lark, `llguidance`):** Maintains a dynamic set of Earley items `(rule, dot_pos, origin)` at each input position. Handles **all** CFGs—including ambiguous grammars and left-recursion—in $O(n^3)$ worst-case and $O(n)$ for unambiguous deterministic grammars.
+* **Persistent Stack PDA (e.g., XGrammar):** Maintains an explicit call stack of active non-terminals with copy-on-push persistent stack nodes so branching token hypotheses share stack prefixes without copying the entire stack.
+
+| Property | Regex / DFA | CFG (EBNF) / PDA / Earley |
+| :--- | :--- | :--- |
+| **Expressive Power** | Regular languages (flat / bounded-depth JSON) | Arbitrary recursive nesting (full JSON, SQL, Python, XML) |
+| **State Representation** | Single integer `state_id` $\in Q$ | Unbounded stack / Earley chart state |
+| **Per-Character Step Cost** | $O(1)$ table lookup | $O(1)$ amortized (LL/LR/PDA) to $O(|R|)$ (Earley) |
+| **Full Mask Precomputation** | Feasible for moderate $|Q|$ ($|Q| \times |V|$) | Impossible in general (infinite reachable stack states) |
+
+---
+
+## 3. Compiling JSON / Pydantic Schemas into Grammars
+
+When a user supplies a Pydantic model or OpenAPI JSON Schema, the constrained-decoding compiler translates schema constraints into production rules (either an EBNF CFG or an unrolled Regex).
+
+### 3.1 Concrete Schema-to-EBNF Translation Example
+
+Consider this Pydantic model:
+
+```python
+from typing import Literal
+from pydantic import BaseModel
+
+class UserAction(BaseModel):
+    user_id: int
+    role: Literal["admin", "viewer"]
+    tags: list[str]
+```
+
+Its corresponding JSON Schema enforces:
+* `type: "object"` with exact required key order (canonical ordering eliminates combinatorial $k!$ key-permutation state blowup!),
+* `user_id`: integer matching `-?(0|[1-9][0-9]*)`,
+* `role`: closed enum `"admin"` or `"viewer"`,
+* `tags`: recursive JSON array of escaped JSON strings.
+
+The compiler emits an EBNF CFG:
+
+```ebnf
+root      ::= "{" ws "\"user_id\"" ws ":" ws integer "," ws
+              "\"role\"" ws ":" ws role_enum "," ws
+              "\"tags\"" ws ":" ws string_array ws "}"
+role_enum ::= "\"admin\"" | "\"viewer\""
+integer   ::= "-"? ("0" | [1-9] [0-9]*)
+string_array ::= "[" ws (string (ws "," ws string)*)? ws "]"
+string    ::= "\"" ([^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4}))* "\""
+ws        ::= [ \t\n\r]*
+```
+
+**Engineering Optimization — Fixed Key Ordering:**
+Because JSON objects formally allow keys in any order, supporting arbitrary permutations of $K$ keys creates $K!$ states in a DFA (for $K=10$, $10! = 3{,}628{,}800$ states!). Production compilers (Outlines, XGrammar, OpenAI Structured Outputs) enforce the schema's declared property order (with optional presence flags for non-required fields), keeping state growth $O(K)$ linear instead of $O(K!)$.
+
+---
+
+## 4. The Token-Boundary Alignment Problem (The Core Systems Hazard)
+
+A naïve developer implementing constrained decoding asks: *"At grammar state $q$, which characters are valid? Allow all tokens starting with those characters."* **This is fatally broken.**
+
+### 4.1 Why Character Grammars and BPE Tokens Mismatch
+
+Formal grammars define transitions over **single characters or UTF-8 bytes** ($c \in \Sigma_{\text{char}}$), whereas LLMs generate **variable-length subword tokens** $t \in V$ ($|V| \approx 32{,}000\text{–}152{,}000$) produced by Byte-Pair Encoding (BPE) or SentencePiece. A single token $t$ maps to a multi-character string $s_t = c_1 c_2 \dots c_m$ ($m \ge 1$).
+
+Three concrete failure modes occur when tokens cross grammar state boundaries:
+
+1. **Multi-Character Structural Tokens Spanning Multiple States:**
+   Suppose the JSON output so far is `{"role` and the grammar next expects `"`, then `:`, then whitespace, then `"`.
+   In Llama-3 / GPT-4o BPE vocabularies, `": "` is a **single token** (`m = 3` characters).
+   * If you only checked single-character transitions, `"` is valid, so `"` alone would pass—but `": "` advances across **three grammar states** at once (`expect_quote` $\to$ `expect_colon` $\to$ `expect_ws` $\to$ `expect_value`).
+   * Conversely, a token like `": null` starts with valid `": `, yet violates the schema because `role` must be `"admin"` or `"viewer"`, not `null`! You must validate the **entire string $s_t$** sequentially through the automaton: $\delta^*(q, s_t) = \delta(\dots\delta(\delta(q, c_1), c_2)\dots, c_m)$.
+2. **Literal Boundary Splits:**
+   If the schema expects `"admin"`, the model might choose to emit `"` + `admin` + `"` (3 tokens), OR `"` + `adm` + `in"` (where `in"` crosses the string-literal end and closing quote!), OR `"` + `admin",` (crossing into the comma separating the next field!).
+   Every single one of these tokenizations must remain valid so the model isn't forced onto unnatural, low-probability token splits that corrupt output quality.
+3. **Partial UTF-8 Byte Sequences (Byte-Fallback BPE):**
+   Multi-byte UTF-8 characters (e.g., `é` = `0xC3 0xA9`, or emojis = 4 bytes) can be split across 2–4 byte-level tokens (`<0xC3>`, `<0xA9>`). A character-level regex fails if fed `<0xC3>` alone; modern engines (XGrammar, `llguidance`, Outlines) compile automata over **raw UTF-8 bytes** (`0x00..0xFF`), ensuring intermediate UTF-8 continuation states are cleanly represented inside the DFA/PDA.
+
+---
+
+## 5. Precomputing Token Index Tables & Engine Implementations
+
+Checking all $|V| = 128{,}256$ token strings sequentially against a parser at every single decode step would take $5\text{–}50\text{ ms}$ on CPU—completely destroying GPU decode latency! Modern constrained-decoding engines solve this using **vocabulary tries** and **precomputed state-to-token index tables**.
+
+### 5.1 Outlines (FSM / DFA Full Index Precomputation)
+
+Introduced by Willard & Louf (2023), **Outlines** converts a Regex (or bounded JSON schema) into a minimal DFA $M = (Q, \Sigma_{\text{byte}}, \delta, q_0, F)$ and precomputes the **Token Transition Index** once per schema:
+
+```python
+# Conceptual Outlines Index Construction (Accelerated via Vocabulary Prefix Trie)
+# state_to_allowed_tokens[q] -> List[int] (or uint32 bitmask)
+# transition_map[(q, token_id)] -> next_state q'
+
+for q in dfa.states:
+    allowed = []
+    for token_id, token_bytes in vocab.items():
+        curr_q = q
+        valid = True
+        for b in token_bytes:
+            if (curr_q, b) not in dfa.transitions:
+                valid = False
+                break
+            curr_q = dfa.transitions[(curr_q, b)]
+        if valid and curr_q in dfa.states_reaching_accept:
+            allowed.append(token_id)
+            transition_map[(q, token_id)] = curr_q
+    if q in dfa.accepting_states:
+        allowed.append(EOS_TOKEN_ID)
+    state_to_allowed_tokens[q] = pack_bitmask(allowed)
+```
+
+* **Trie Acceleration:** Walking each of $|V| = 128\text{k}$ tokens independently repeats shared prefixes (e.g., `"a"`, `"ab"`, `"abc"`). Outlines organizes $V$ into a **byte-level Prefix Trie** so shared prefixes are traversed only once per state $q$, cutting index compilation time by $5\text{–}10\times$.
+* **Runtime Cost:** **$O(1)$ per step!** At decode step $t$, the CPU looks up `state_to_allowed_tokens[q_curr]` (a pre-packed 16 KB bitmask), copies it to GPU, and after sampling $t^*$, updates `q_curr = transition_map[(q_curr, t*)]`.
+* **Limitation:** Does not natively handle unbounded recursion (full CFGs), and for massive schemas ($|Q| > 10^4$), precomputing $|Q| \times |V|$ consumes hundreds of milliseconds to seconds of compilation latency and large RAM.
+
+### 5.2 XGrammar (Context-Independent vs. Context-Dependent Split for CFGs)
+
+**XGrammar** (Dong et al., 2024—default engine in vLLM and SGLang) generalizes fast precomputation to **arbitrary Context-Free Grammars (PDAs)** without paying $O(|V|)$ runtime parsing cost:
+
+1. **Key Insight — Vocabulary Partitioning:**
+   For any PDA grammar state $s$ (defined by the current top-of-stack rule position, ignoring deeper stack frames), XGrammar classifies every token $t \in V$ into two disjoint sets:
+   * **Context-Independent Tokens (~99% of $V$):** Whether $t$ is valid depends **only** on the local rule state $s$ (never pops past the current stack frame). Example: inside the `string` rule, `"hello"` or `"123"` stays purely inside `string` without touching the closing `"`!
+   * **Context-Dependent Tokens (<1% of $V$, typically a few hundred tokens):** Tokens whose string crosses out of the current rule (e.g., `"` or `", "` which pop the `string` rule and inspect the parent PDA stack to decide if `,` or `}` or `]` is valid next!).
+2. **Adaptive Token Mask Cache:**
+   * At grammar compile time, XGrammar precomputes a compact **Adaptive Token Mask** over the ~99% context-independent tokens for each local PDA rule state $s$.
+   * At decode step $t$, XGrammar fetches the precomputed mask in $O(1)$ and **only simulates the PDA stack for the ~100–500 context-dependent tokens** (using a persistent zero-copy stack with fast rollback), ORs their validity bits into the bitmask, and emits the complete 16 KB bitmask in **$< 40\,\mu\text{s}$** per request!
+
+### 5.3 `llguidance` (Earley Parser + Lexer DFA + Token Trie Pruning)
+
+**`llguidance`** (Microsoft Guidance) targets ultra-fast compilation (~$1\text{–}5\text{ ms}$ schema startup) and full CFG/regex support:
+* Separates **Lexing** (tokens/terminals via byte-level DFAs) from **Parsing** (structural CFG rules via an optimized **Earley parser**).
+* Instead of precomputing a giant $|Q| \times |V|$ matrix upfront, `llguidance` walks the **Vocabulary Byte Trie** on demand at runtime, querying the lexer DFA/Earley state at each trie node:
+  * The moment a byte prefix (e.g., `"{` when an integer is expected) fails the Earley/DFA check, **the entire trie subtree beneath that prefix** (thousands of tokens!) is pruned immediately without ever inspecting its leaves!
+* Caches computed bitmasks by `(parser_state_hash)` in an LRU cache across requests and steps, achieving $< 50\,\mu\text{s}$ per-token mask generation with negligible compile-time latency.
+
+---
+
+## 6. Compilation & Execution Diagrams
+
+### 6.1 Compilation Pipeline: Schema $\to$ Automaton $\to$ Vocabulary Bitmask
+
+```mermaid
+flowchart TD
+    Schema["JSON Schema / Pydantic Model\n(or Raw EBNF / Regex)"] --> Compile{"Language Class?"}
+    Compile -->|"Regular / Bounded Depth"| Regex["Unrolled Regex\n(Fixed Key Order)"]
+    Compile -->|"Arbitrary Recursion ($ref)"| CFG["Context-Free Grammar\n(EBNF Productions)"]
+
+    Regex --> DFA["Byte-Level DFA\n(Thompson + Subset + Minimize)"]
+    CFG --> PDA["PDA / Earley Parser\n+ Lexer Byte DFAs"]
+
+    Trie["Model Vocabulary Byte Trie\n(|V| = 128k BPE Tokens)"] --> Walk
+
+    DFA --> Walk["Trie-Guided Automaton Walk\n(Prune Invalid Prefixes Early)"]
+    PDA --> Walk
+
+    Walk --> Cache["Precomputed / Adaptive Index\nstate -> Allowed Token Bitmask (16 KB)\n+ (state, token_id) -> next_state"]
+```
+
+### 6.2 Runtime Sequence: Incremental Parser Advancement Across BPE Boundaries
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Caller / Schema
+    participant Comp as Grammar Compiler
+    participant Parser as Runtime Parser State
+    participant GPU as GPU Sampler
+
+    App->>Comp: Compile UserAction JSON Schema
+    Comp-->>Parser: Grammar Index (DFA/PDA + Adaptive Masks)
+    Note over Parser: Initial state q0 (expects opening brace)
+
+    Note over Parser,GPU: Decode Step 1 (Cross-Boundary BPE Token)
+    Parser->>GPU: Lookup bitmask[q0] -> Copy 16 KB uint32 mask (H2D)
+    GPU->>GPU: Apply -inf logit mask & sample multi-char token t1
+    GPU-->>Parser: Return sampled token_id t1 (user_id key + colon + quote)
+    Parser->>Parser: Walk bytes of t1 through DFA/PDA (q0 -> q_key -> q_colon -> q_int)
+
+    Note over Parser,GPU: Decode Step 2 (Value State q_int)
+    Parser->>GPU: Lookup bitmask[q_int] (digits & minus allowed, letters masked)
+    GPU->>GPU: Sample token t2 (42 followed by comma)
+    GPU-->>Parser: Return sampled token_id t2
+    Parser->>Parser: Walk bytes of t2 -> advance past integer & comma to q_role_key
+```
+
+---
+
+## Navigation
+
+* **Previous:** [03 — Engine Architectures](./03-engine-architectures.md)
+* [Stage 4 Overview](./README.md)
+* **Next:** [05 — Logit Masking & Jump-Forward Decoding](./05-logit-masking-and-jump-forward-decoding.md)

@@ -1,0 +1,232 @@
+# 01 — High-Speed Network Fabrics
+
+> **Navigation:** [Stage 9 Index](./README.md) | **Next:** [02 — Disaggregated Prefill/Decode Architecture](./02-disaggregated-prefill-decode-architecture.md)
+
+Distributed LLM inference transforms memory-bound and compute-bound GPU execution into a **communication-bound systems problem**. When Tensor Parallelism (TP) performs two `AllReduce` collectives per Transformer layer (80 layers = 160 synchronization barriers per token), when Mixture-of-Experts (MoE) executes two `AllToAll` collectives per layer, or when a disaggregated Prefill node transfers 10+ GB of KV Cache to a Decode node in milliseconds, the interconnect—not the Tensor Core—dictates Time to First Token (TTFT) and Inter-Token Latency (ITL).
+
+This document examines the hardware physics, flow-control protocols, and zero-copy software stacks powering modern intra-node and inter-node AI fabrics.
+
+---
+
+## 1. Interconnect Physics & LLM Sensitivity
+
+Every network transfer across a fabric incurs three additive latency components:
+
+$$T_{\text{transfer}}(B) = T_{\text{sw\_ctrl}} + T_{\text{wire}} + T_{\text{serialization}} = T_{\text{sw\_ctrl}} + \sum_{\text{hops}} t_{\text{hop}} + \frac{B}{\text{BW}_{\text{effective}}}$$
+
+Where:
+* $T_{\text{sw\_ctrl}}$: Software stack, kernel driver, and doorbell submission overhead (~10–40 µs for Linux TCP/IP sockets; ~0.8–2.0 µs for user-space RDMA verbs; ~0.1–0.5 µs for GPU-initiated load/store or IBGDA).
+* $t_{\text{hop}}$: Physical propagation delay (~5 ns/meter in fiber/copper) plus switch ASIC cut-through latency (~100–250 ns per InfiniBand switch hop; ~300–600 ns per Ethernet switch hop).
+* $\text{BW}_{\text{effective}}$: Line rate multiplied by protocol efficiency (after FEC, framing headers, and PCIe overhead).
+
+### Why Standard TCP/IP Fails for Distributed Inference
+
+Consider an autoregressive Decode step on an 80-layer model with hidden dimension $H = 8192$ at batch size $B = 32$ in FP16 ($2\text{ bytes}$). Each `AllReduce` exchanges an activation tensor of size $32 \times 8192 \times 2 = 524,288\text{ bytes} = 512\text{ KB}$. With 160 `AllReduce` barriers per token:
+* Over **NVLink 4.0** (450 GB/s unidirectional, <1 µs latency): $160 \times (\sim 1.5\,\mu\text{s} + \frac{2 \times 512\text{ KB}}{450\text{ GB/s}}) \approx 0.6\text{ ms}$ total communication per generated token.
+* Over **TCP/IP 100GbE** (~12 GB/s, ~25 µs kernel socket latency, CPU copy jitter): $160 \times (\sim 25\,\mu\text{s} + 85\,\mu\text{s}) \approx 17.6\text{ ms}$—and with P99 TCP congestion/retransmission jitter, communication alone exceeds an entire 30 ms ITL SLO.
+
+---
+
+## 2. Intra-Node Fabrics: NVLink & NVSwitch
+
+Inside a single GPU server (or rack-scale coherent domain), NVIDIA NVLink and NVSwitch replace PCIe for GPU-to-GPU communication.
+
+### Link-Level Architecture & Generations
+
+| Fabric Generation | GPU Architecture | Links per GPU | Per-Link Bandwidth (Bidirectional) | Aggregate Unidirectional BW / GPU | Aggregate Bidirectional BW / GPU | Switching Silicon & Domain Scale |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **PCIe Gen5 x16** *(Baseline)* | H100 / B200 host link | 1 slot (16 lanes) | 128 GB/s (64 GB/s each way) | 64 GB/s | 128 GB/s | PCIe Switch / CPU Root Complex |
+| **NVLink 4.0** | Hopper (H100 / H200) | 18 links | 50 GB/s (25 GB/s each way) | **450 GB/s** | **900 GB/s** | **NVSwitch Gen3** (8 GPUs/node, 7.2 TB/s agg.) |
+| **NVLink 5.0** | Blackwell (B200 / GB200) | 18 links | 100 GB/s (50 GB/s each way) | **900 GB/s** | **1,800 GB/s** | **NVSwitch Gen4** (up to 72 GPUs in GB200 NVL72, 130 TB/s agg.) |
+
+### NVSwitch All-to-All Topology & SHARP
+
+In an HGX H100 8-GPU baseboard, GPUs are **not** connected directly in a point-to-point mesh (which would split the 18 links unevenly across 7 peers). Instead, all 18 NVLink 4.0 links from each GPU connect into **4 NVSwitch Gen3 ASICs** (4–5 links per GPU to each switch):
+1. **Non-Blocking Bisection Bandwidth:** Any GPU can communicate with any other GPU at full **450 GB/s unidirectional (900 GB/s bidirectional)** simultaneously—yielding 3.6 TB/s unidirectional (7.2 TB/s bidirectional) bisection bandwidth across the 8-GPU domain.
+2. **In-Network Reduction (SHARP — Scalable Hierarchical Aggregation and Reduction Protocol):** NVSwitch Gen3 and Gen4 embed ALU reduction engines directly inside the switch silicon. For Tensor Parallelism `AllReduce`, each GPU sends its partial tensor once to the NVSwitch; the switch sums the vectors in-flight and multicasts the result back—cutting traffic across the links in half compared to ring-based `ReduceScatter + AllGather` and reducing latency by ~30–40%.
+3. **NVLink 5.0 & Rack-Scale Coherent Domains (GB200 NVL72):** Blackwell doubles per-lane SerDes signaling to 200G PAM4 (100 GB/s bidirectional per NVLink 5.0 port, **1,800 GB/s** per GPU). In an NVL72 rack, 18 compute trays (72 B200 GPUs) connect via passive copper backplane cartridges to 9 NVSwitch trays. Every GPU shares a unified memory address space (`NVLink C2C` + GPU-to-GPU load/store semantics), enabling **TP=72 or EP=72** completely inside the NVLink fabric without touching an InfiniBand/Ethernet NIC.
+
+---
+
+## 3. Inter-Node Lossless Fabrics: InfiniBand (NDR & XDR)
+
+Once model parallelism, MoE Expert Parallelism, or Disaggregated KV Cache transport crosses server boundaries, traffic moves onto an external switched fabric. **InfiniBand (IB)** is built from the ground up as a lossless, hardware-offloaded fabric.
+
+### Line Rates & Multi-Rail Server Topologies
+
+| InfiniBand Generation | Modulation & Lane Width | Raw Line Rate | Effective Goodput (after 256b/257b & headers) | Typical NIC | 8-GPU Node Aggregate (1 NIC/GPU) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **HDR** | 4x 50G PAM4 | 200 Gbps (25 GB/s) | ~23.5 GB/s | ConnectX-6 | 1.6 Tbps (200 GB/s) |
+| **NDR** | 4x 100G PAM4 | **400 Gbps (50 GB/s)** | **~46–48 GB/s** | ConnectX-7 | **3.2 Tbps (~380 GB/s)** |
+| **XDR** | 4x 200G PAM4 | **800 Gbps (100 GB/s)** | **~93–96 GB/s** | ConnectX-8 | **6.4 Tbps (~760 GB/s)** |
+
+**Rail-Optimized Topology:** In multi-node GPU clusters, an 8-GPU server has 8 NICs, where NIC $i$ shares a local PCIe Gen5 switch with GPU $i$. Rather than wiring all 8 NICs to one switch, NIC $i$ of every server connects to **Leaf Switch $i$ (Rail $i$)**. All-to-All or KV transfers between GPU $i$ on Node A and GPU $i$ on Node B traverse **only a single Leaf switch** (1 hop, ~200 ns switch latency, zero spine oversubscription), while cross-rank traffic ($i \to j$) traverses Spine switches.
+
+### Credit-Based Flow Control (Lossless Guarantee)
+
+InfiniBand **never drops packets due to buffer overflow**. Instead, every physical link (split into independent **Virtual Lanes, VLs**, e.g., VL0–VL7) runs hardware **credit-based flow control** at the Data Link Layer:
+
+1. **Buffer Credit Allocation:** The downstream switch port or NIC divides its ingress RX buffer for a given VL into 64-byte **credit units**. Suppose the RX buffer holds $C_{\text{max}} = 2048$ credits ($128\text{ KB}$).
+2. **FCCL Advertisement:** The receiver continuously sends tiny link-layer **Flow Control Packets (`FCP`)** containing `FCCL` (Flow Control Credit Limit = cumulative credits processed + available buffer).
+3. **Transmission Gating:** The upstream sender maintains `CT` (Credits Transmitted). Before transmitting a packet of $k$ 64-byte units, the hardware checks:
+   $$CT + k \le FCCL$$
+   If the check fails, the upstream link layer **pauses transmission** on that VL for microseconds until new `FCCL` updates arrive.
+4. **Why This Matters for Inference:** Zero buffer drops mean zero timeout-based retransmissions. In RoCEv2 or TCP, a single dropped 4 KB RDMA packet triggers a Go-Back-N recovery stall (typically 50–500 µs, or milliseconds if a hardware timer fires), causing catastrophic P99 ITL spikes across synchronized GPUs.
+
+---
+
+## 4. Converged Ethernet Fabrics: RoCEv2 & Congestion Tuning
+
+**RoCEv2 (RDMA over Converged Ethernet v2)** encapsulates the InfiniBand transport layer inside standard UDP/IP packets (`UDP destination port 4791`), allowing RDMA over commodity L3 spine-leaf Ethernet switches:
+
+```text
++-------------+-----------+-----------+----------------------+-------------+------+-----+
+| Ethernet L2 |  IPv4/L3  | UDP (L4)  |  IB BTH / RETH / Imm |  Payload    | ICRC | FCS |
+|  (14-18 B)  |  (20 B)   |  (8 B)    |     (12 - 28 B)      | (up to 4KB) |(4 B) |(4 B)|
++-------------+-----------+-----------+----------------------+-------------+------+-----+
+```
+
+Because standard Ethernet is inherently **lossy** (switches drop packets when egress queues fill), running RoCEv2 without tuning collapses performance: ConnectX NICs default to **Go-Back-N** retransmission on packet loss, discarding entire in-flight windows. Achieving InfiniBand-like tail latency on RoCEv2 requires tightly coordinated **PFC + ECN + DCQCN** tuning.
+
+### 1. PFC (Priority Flow Control — IEEE 802.1Qbb)
+
+PFC provides link-level losslessness per Traffic Class (CoS queue, typically Queue 3 or 4 reserved for RDMA):
+* Each switch ingress port maintains an `XOFF` watermark and an `XON` watermark inside its shared buffer pool.
+* When queue depth exceeds `XOFF`, the switch transmits an Ethernet **PFC PAUSE** frame upstream specifying the pause quanta (up to 65,535 bit-times) for that specific CoS priority only—leaving TCP/SSH/control queues unpaused.
+* **Headroom Sizing Requirement:** `Buffer_Size - XOFF` must exceed the **Bandwidth-Delay Product (BDP)** of the link plus switch/NIC pipeline reaction time so in-flight bytes arriving after `PAUSE` transmission do not overflow the buffer. At 400 Gbps across a 100 m fiber link (~500 ns RTT + ~300 ns ASIC reaction = ~800 ns), in-flight bytes are $50\text{ GB/s} \times 800\text{ ns} = 40\text{ KB}$, requiring ~100–150 KB headroom per port.
+* **Failure Modes of PFC:**
+  * **Head-of-Line (HoL) Blocking / Congestion Spreading:** A slow receiver (e.g., a stalled Decode GPU) pauses its leaf switch port; the leaf switch fills and pauses the spine port; the spine pauses unrelated healthy Prefill nodes sharing that CoS queue.
+  * **PFC Deadlock:** Cyclic buffer dependencies across spine-leaf loops permanently freeze all traffic on that priority class.
+
+### 2. ECN (Explicit Congestion Notification) & DCQCN
+
+To prevent PFC from ever firing during normal operation, **DCQCN (Data Center Quantized Congestion Notification)** throttles senders *proactively* using ECN:
+
+```text
+Ingress/Egress Switch Queue Depth:
+0 --------[ K_min ]--------[ K_max ]--------[ PFC_XOFF ]--------[ Buffer Drop ]
+             |                |                   |
+        Probabilistic     100% ECN           Hard PAUSE
+         ECN Marking       Marking           (Last Resort)
+```
+
+1. **Switch Marking (WRED + ECN):** When egress queue occupancy sits between `K_min` and `K_max`, the switch randomly marks the IP header's ECN field to `CE = 11` (Congestion Experienced) with probability scaling linearly up to `P_max` (typically 10–20%); above `K_max`, 100% of packets are marked. Crucially, `K_max < PFC_XOFF`!
+2. **Receiver Notification (CNP):** When the destination NIC sees `CE = 11`, it generates a **CNP (Congestion Notification Packet)** back to the source NIC (rate-limited to one CNP per flow every e.g. 50 µs to avoid control storms).
+3. **Sender NIC Hardware Rate Limiting:** The source NIC hardware immediately cuts the Queue Pair's injection rate multiplicatively ($\alpha$-weighted reduction) and gradually recovers rate via an internal timer + byte counter (Additive Increase).
+4. **Tuning Imperative for LLM Inference:** Disaggregated KV cache transfers are *elephant flows* (100 MB–10 GB bursts at 400 Gbps), while MoE `AllToAll` and control metadata are *mice flows*. Proper RoCEv2 deployment separates RDMA control/small collectives onto a distinct DSCP/TC from bulk KV transfers, or configures aggressive `K_min`/`K_max` thresholds (~5–15% of buffer) so DCQCN converges before PFC pauses cascade.
+
+---
+
+## 5. RDMA Verbs & Zero-Copy Kernel-Bypass (`libibverbs`)
+
+Standard POSIX sockets (`send`/`recv`) trap into the OS kernel via syscalls, copy buffers across kernel `sk_buff` structures, traverse the TCP/IP stack, acquire socket locks, and trigger interrupts. **RDMA** splits the **Control Plane** (slow setup, kernel-mediated) from the **Data Plane** (fast execution, 100% user-space hardware access).
+
+### Control Path (Setup Once, Not Per Request)
+
+1. **`ibv_open_device` / `ibv_alloc_pd`:** Opens the ConnectX NIC and allocates a Protection Domain (`PD`) isolating resources.
+2. **`ibv_reg_mr` (Memory Registration):** Pins virtual memory pages (`mlock` / `pin_user_pages`) so the OS cannot swap or relocate them, programs the virtual-to-physical translation into the NIC's **MTT (Memory Translation Table)**, and returns:
+   * `lkey` (Local Key): Authorizes the local NIC to DMA read/write this buffer.
+   * `rkey` (Remote Key): Shared out-of-band with remote peers to authorize one-sided RDMA access.
+3. **`ibv_create_cq` & `ibv_create_qp`:** Allocates memory-mapped ring buffers in user-space RAM (or GPU memory):
+   * **SQ (Send Queue)** & **RQ (Receive Queue)** forming a **Queue Pair (`QP`)**.
+   * **CQ (Completion Queue)** where the NIC writes completion status entries.
+
+### Data Path (Zero-Copy Kernel Bypass)
+
+Once the `QP` is transitioned to `IBV_QPS_RTS` (Ready to Send), the OS kernel is **never invoked** during data transfers:
+
+1. User-space application (or GPU thread via IBGDA) constructs a **WQE (Work Queue Element)** specifying `[opcode, local_addr, length, lkey, remote_addr, rkey]` directly in the SQ ring buffer.
+2. Application calls `ibv_post_send()`, which writes the WQE and rings the NIC **Doorbell** via a single uncached PCIe MMIO write to the NIC's `UAR` (User Access Region) BAR page.
+3. NIC's hardware DMA engine reads the WQE, fetches payload directly from memory via `lkey`, packetizes it, and transmits it onto the wire.
+4. Upon receiving the hardware `ACK`, the NIC DMAs a 64-byte **CQE (Completion Queue Element)** into the `CQ`. The application polls `ibv_poll_cq()` in user space with zero interrupts.
+
+### One-Sided vs. Two-Sided Verbs
+
+| Verb Opcode (`ibv_post_send`) | Semantics | Target CPU Involvement | Primary Inference Use Case |
+| :--- | :--- | :--- | :--- |
+| **`IBV_WR_SEND`** | Two-sided: consumes a pre-posted WQE from target's `RQ`. | Target must pre-post `ibv_post_recv` and poll `CQ`. | Control messages, metadata exchange (`rkey` / block lists). |
+| **`IBV_WR_RDMA_WRITE`** | One-sided: writes directly into target virtual address using `rkey`. | **Zero** (target CPU/GPU completely unaware until polled via flag). | Streaming KV cache blocks; DeepEP/NVSHMEM token dispatch. |
+| **`IBV_WR_RDMA_WRITE_WITH_IMM`** | One-sided write + delivers a 32-bit `imm_data` value into target's `CQ` (consumes 1 `RQ` entry). | Minimal (target polls `CQ` to learn *which* layer/request completed). | Layer-wise KV transfer completion notifications. |
+| **`IBV_WR_RDMA_READ`** | One-sided: pulls data from remote address using `rkey` into local buffer. | **Zero** on remote side. | Pull-based KV cache retrieval from Mooncake / Prefill staging. |
+
+---
+
+## 6. GPUDirect RDMA (GDR)
+
+Without GPUDirect RDMA, sending tensor data from GPU 0 on Node A to GPU 0 on Node B requires **host-staged bouncing**:
+1. `cudaMemcpyDeviceToHost` copies GPU HBM across PCIe into pinned Host DRAM.
+2. NIC DMAs from Host DRAM across PCIe out to the wire.
+3. Remote NIC DMAs across PCIe into Node B Host DRAM.
+4. `cudaMemcpyHostToDevice` copies from Node B Host DRAM across PCIe into Node B GPU HBM.
+
+This wastes **2x PCIe round-trips**, consumes scarce host DDR5 memory bandwidth (which is ~200–400 GB/s shared across 8 GPUs), and injects host CPU cache coherency & `cudaMemcpy` synchronization latency.
+
+### Hardware Mechanics of GPUDirect RDMA
+
+**GPUDirect RDMA** allows the ConnectX NIC's PCIe DMA engine to read from and write directly to **GPU HBM** via the GPU's PCIe **BAR1 (Base Address Register 1)** aperture:
+
+1. **Memory Mapping (`nvidia-peermem` or Linux `dma-buf`):** When `ibv_reg_mr` (or `ibv_reg_dmabuf_mr` on modern kernels $\ge 5.12$ without out-of-tree `nvidia-peermem`) is called on a `cudaMalloc` pointer, the NVIDIA kernel driver exposes the physical PCIe BAR1 bus addresses backing those GPU HBM pages to the InfiniBand core driver, which programs them into the NIC's MTT.
+2. **PCIe Peer-to-Peer (P2P) Topology (Critical Hardware Detail):**
+   * **Optimal (Single PCIe Switch):** GPU $i$ and NIC $i$ sit beneath the **same PCIe Gen5 Switch** (e.g., Broadcom PEX89000). When NIC $i$ issues a PCIe Memory Read/Write TLP targeting GPU $i$'s BAR1 address, the PCIe Switch routes the TLP directly between downstream ports—**never touching the CPU Root Complex or Host DRAM**. Full ~55–60 GB/s PCIe Gen5 P2P bandwidth is achieved at ~1.5 µs latency.
+   * **Sub-Optimal (Root Complex / Cross-Socket):** If NIC and GPU sit on different CPU PCIe Root Complexes (or different NUMA sockets), P2P TLPs must traverse the CPU Root Complex and inter-socket UPI/xGMI fabric. Many server CPUs degrade P2P throughput by 30–70% across Root Complexes, and **PCIe ACS (Access Control Services)** must be disabled in BIOS/kernel (`pci=realloc`, `setpci`)—otherwise ACS forces every P2P TLP upstream to the Root Complex for IOMMU translation, crippling bandwidth.
+
+```mermaid
+flowchart TD
+    subgraph HostStaged["Host-Staged TCP/IP Path (4 PCIe/Memory Hops + Kernel)"]
+        direction TB
+        HA_GPU["Node A: GPU 0 HBM"] -->|"1. cudaMemcpy D2H (PCIe)"| HA_RAM["Node A: Host DRAM + Kernel sk_buff"]
+        HA_RAM -->|"2. CPU TCP Stack + NIC DMA (PCIe)"| HA_NIC["Node A: NIC"]
+        HA_NIC -->|"3. Ethernet / TCP Wire"| HB_NIC["Node B: NIC"]
+        HB_NIC -->|"4. NIC DMA + Kernel sk_buff (PCIe)"| HB_RAM["Node B: Host DRAM"]
+        HB_RAM -->|"5. cudaMemcpy H2D (PCIe)"| HB_GPU["Node B: GPU 0 HBM"]
+    end
+
+    subgraph GDRPath["GPUDirect RDMA Path (Direct PCIe Switch P2P, Zero Host Copy)"]
+        direction TB
+        GA_GPU["Node A: GPU 0 HBM (BAR1 Mapped)"] <-->|"1. Direct PCIe P2P DMA Read via PCIe Switch"| GA_NIC["Node A: ConnectX NIC (MTT -> BAR1)"]
+        GA_NIC -->|"2. Lossless IB / RoCEv2 Wire (RDMA Write)"| GB_NIC["Node B: ConnectX NIC (MTT -> BAR1)"]
+        GB_NIC <-->|"3. Direct PCIe P2P DMA Write via PCIe Switch"| GB_GPU["Node B: GPU 0 HBM (BAR1 Mapped)"]
+    end
+```
+
+### End-to-End GPUDirect RDMA Write Trace
+
+The following sequence traces a zero-copy `IBV_WR_RDMA_WRITE_WITH_IMM` transferring a KV cache tensor directly from GPU 0 HBM on Node A to GPU 0 HBM on Node B:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GPUA as "Node A GPU 0 HBM"
+    participant CPUA as "Node A User-Space Process"
+    participant NICA as "Node A ConnectX NIC"
+    participant Fabric as "IB / RoCEv2 Switch"
+    participant NICB as "Node B ConnectX NIC"
+    participant CPUB as "Node B User-Space Process"
+    participant GPUB as "Node B GPU 0 HBM"
+
+    Note over GPUA,GPUB: Control Plane Setup (Executed Once at Engine Startup)
+    CPUB->>GPUB: cudaMalloc(kv_arena)
+    CPUB->>NICB: ibv_reg_dmabuf_mr(kv_arena) -> returns rkey and BAR1 MTT mapping
+    CPUB->>CPUA: Exchange metadata (remote_va, rkey, qpn) via TCP/gRPC
+    CPUA->>GPUA: cudaMalloc(kv_src)
+    CPUA->>NICA: ibv_reg_dmabuf_mr(kv_src) -> returns lkey and BAR1 MTT mapping
+    CPUB->>NICB: ibv_post_recv() to catch 32-bit immediate notification
+
+    Note over GPUA,GPUB: Hot Data Path (Zero Kernel Calls, Zero Host DRAM Copies)
+    CPUA->>NICA: ibv_post_send(IBV_WR_RDMA_WRITE_WITH_IMM, lkey, remote_va, rkey, imm=layer_id)
+    CPUA->>NICA: Write WQE to SQ + Ring Doorbell via PCIe MMIO BAR
+    NICA->>GPUA: PCIe Switch P2P DMA Read directly from BAR1 HBM aperture
+    GPUA-->>NICA: Return tensor payload TLPs
+    NICA->>Fabric: Transmit RDMA Write packets (IB BTH + RETH + Payload)
+    Fabric->>NICB: Cut-through forward (credit-based or ECN-marked)
+    NICB->>GPUB: PCIe Switch P2P DMA Write directly to Node B BAR1 HBM
+    NICB->>CPUB: Write CQE with imm_data=layer_id to Node B CQ
+    NICB->>Fabric: Send Hardware RDMA ACK packet
+    Fabric->>NICA: Deliver ACK
+    NICA->>CPUA: Write Send CQE to Node A CQ
+    CPUB->>NICB: ibv_poll_cq() detects layer_id complete -> unblock Decode kernel
+```
+
+---
+
+> **Navigation:** [Stage 9 Index](./README.md) | **Next:** [02 — Disaggregated Prefill/Decode Architecture](./02-disaggregated-prefill-decode-architecture.md)
