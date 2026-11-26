@@ -68,7 +68,7 @@ Standard corpora like **WikiText-2 test split** (~280K–340K tokens concatenate
 
 #### The Exact Sliding-Window Protocol (`stride = S`, Label Masking)
 
-For every window starting at `begin_loc`, feed `input_ids[:, begin_loc : end_loc]` (up to length $L$), **mask the prefix context tokens (`target_ids[:, :-trg_len] = -100`)** so PyTorch `CrossEntropyLoss` ignores them, and accumulate the exact negative log-likelihood **only over the final `trg_len` newly revealed tokens**:
+For every window starting at `begin_loc`, feed `input_ids[:, begin_loc : end_loc]` (up to length $L$) in a single teacher-forced forward pass, **mask the prefix context tokens (`target_ids[:, :-trg_len] = -100`)** so PyTorch's `nn.CrossEntropyLoss(ignore_index=-100)` excludes them from both the numerator and denominator, and accumulate the exact negative log-likelihood **only over the final `trg_len` newly revealed tokens** (ensuring every token in the corpus is scored once with at least $L - S$ tokens of preceding context):
 
 ```python
 import math, torch
@@ -117,11 +117,11 @@ At each token position $t$, capture the full pre-softmax logits $z^{(P)}_t, z^{(
 
 $$P(v \mid x_{<t}) = \text{softmax}(z^{(P)}_t)_v, \qquad Q(v \mid x_{<t}) = \text{softmax}(z^{(Q)}_t)_v$$
 
-The **forward Kullback–Leibler (KL) Divergence** from baseline $P$ to quantized $Q$ is:
+The **forward Kullback–Leibler (KL) Divergence** from baseline $P$ to quantized $Q$ measures the expected extra information (in `nats`) lost when approximating $P$ with $Q$:
 
 $$D_{\text{KL}}\!\left(P_{\text{fp16}} \,\|\, Q_{\text{quant}}\right) = \sum_{v \in V} P_{\text{fp16}}(v \mid x_{<t}) \log \frac{P_{\text{fp16}}(v \mid x_{<t})}{Q_{\text{quant}}(v \mid x_{<t})}$$
 
-*(Computed numerically stably in `FP32` via `F.kl_div(log_probs_Q, log_probs_P, log_target=True, reduction="batchmean")`.)*
+In PyTorch, this is computed numerically stably in `FP32` via `F.kl_div(log_probs_Q, log_probs_P, log_target=True, reduction="batchmean")`, where both tensors are `F.log_softmax(logits.float(), dim=-1)` so tiny tail probabilities never underflow to `0.0` before taking logarithms.
 
 ### 3.2 What KL Divergence Catches That `argmax` & Aggregate PPL Miss
 

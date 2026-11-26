@@ -57,7 +57,7 @@ A **Regular Expression (Regex)** defines a regular language, convertible via Tho
 * Sufficient for enums, dates, phone numbers, identifiers, and **non-recursive (or depth-bounded) JSON Schemas**.
 
 **Fundamental Limitation (Pumping Lemma):**
-A DFA has fixed finite memory ($|Q|$ states). It **cannot** match arbitrary-depth balanced delimiters such as nested JSON objects `{"a": {"b": ...}}`, nested arrays `[[[1]]]`, arithmetic expressions `((1+2)*3)`, or recursive ASTs (`$ref` in JSON Schema), because tracking unbounded nesting depth requires an unbounded counter/stack.
+A DFA has fixed finite memory—at runtime it tracks only a single integer `state_id` from a fixed set of $|Q|$ states. To match arbitrary-depth balanced delimiters such as nested JSON objects `{"a": {"b": ...}}`, nested arrays `[[[1]]]`, arithmetic expressions `((1+2)*3)`, or recursive ASTs (`$ref` in JSON Schema), a recognizer would need a distinct state for every possible nesting depth (`depth_1`, `depth_2`, ..., `depth_N`). Because $|Q|$ is finite, a DFA **cannot** track unbounded nesting depth; doing so requires an explicit counter or stack.
 
 ### 2.2 Context-Free Languages (Type 2): CFG / EBNF $\to$ PDA / Earley Parser
 
@@ -124,7 +124,7 @@ A naïve developer implementing constrained decoding asks: *"At grammar state $q
 
 ### 4.1 Why Character Grammars and BPE Tokens Mismatch
 
-Formal grammars define transitions over **single characters or UTF-8 bytes** ($c \in \Sigma_{\text{char}}$), whereas LLMs generate **variable-length subword tokens** $t \in V$ ($|V| \approx 32{,}000\text{–}152{,}000$) produced by Byte-Pair Encoding (BPE) or SentencePiece. A single token $t$ maps to a multi-character string $s_t = c_1 c_2 \dots c_m$ ($m \ge 1$).
+Formal grammars define transitions over **single characters or UTF-8 bytes** ($c \in \Sigma_{\text{char}}$), whereas LLMs generate **variable-length subword tokens** $t \in V$ ($|V| \approx 32{,}000\text{–}152{,}000$) produced by Byte-Pair Encoding (BPE) or SentencePiece. In PyTorch, the `LM Head` scores integer token IDs `0..|V|-1`, and each token ID $t$ decodes (`tokenizer.decode([t])`) to a multi-character string $s_t = c_1 c_2 \dots c_m$ ($m \ge 1$).
 
 Three concrete failure modes occur when tokens cross grammar state boundaries:
 
@@ -172,7 +172,7 @@ for q in dfa.states:
     state_to_allowed_tokens[q] = pack_bitmask(allowed)
 ```
 
-* **Trie Acceleration:** Walking each of $|V| = 128\text{k}$ tokens independently repeats shared prefixes (e.g., `"a"`, `"ab"`, `"abc"`). Outlines organizes $V$ into a **byte-level Prefix Trie** so shared prefixes are traversed only once per state $q$, cutting index compilation time by $5\text{–}10\times$.
+* **Trie Acceleration:** Walking each of $|V| = 128\text{k}$ tokens independently repeats shared prefixes (e.g., `"a"`, `"ab"`, `"abc"`). Outlines organizes $V$ into a **byte-level Prefix Trie** so shared prefixes are traversed only once per state $q$—the moment a prefix byte like `"a"` fails a transition, the entire subtree beneath it is pruned in one step, cutting index compilation time by $5\text{–}10\times$.
 * **Runtime Cost:** **$O(1)$ per step!** At decode step $t$, the CPU looks up `state_to_allowed_tokens[q_curr]` (a pre-packed 16 KB bitmask), copies it to GPU, and after sampling $t^*$, updates `q_curr = transition_map[(q_curr, t*)]`.
 * **Limitation:** Does not natively handle unbounded recursion (full CFGs), and for massive schemas ($|Q| > 10^4$), precomputing $|Q| \times |V|$ consumes hundreds of milliseconds to seconds of compilation latency and large RAM.
 

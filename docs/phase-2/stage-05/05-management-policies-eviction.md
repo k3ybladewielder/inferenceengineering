@@ -53,12 +53,14 @@ struct BlockMeta {
 
 ### Pinning Invariants
 
+Think of `ref_count` like Python's internal object reference counter: as long as at least one active request or background DMA copy holds a reference to a physical KV block, the memory manager is forbidden from reclaiming or overwriting that slice of GPU memory.
+
 * **Sequence Execution Pin (`ref_count >= 1`):**
   When a request matches 500 cached prefix blocks and allocates 10 new blocks, all 510 blocks have `ref_count += 1`. Even if a sequence takes 15 seconds to stream 500 output tokens, its blocks are **strictly pinned** (`ref_count > 0`) and excluded from the eviction queue.
 * **Async DMA Pin (`dma_fence` / `dma_pin`):**
-  While `d2h_stream` is copying a block from VRAM to Pinned RAM—or while `h2d_stream` is prefetching into a VRAM slot—the block's `ref_count` remains $\ge 1$ (or `dma_in_flight = true`). Only after `cudaEventQuery(dma_fence) == cudaSuccess` does the background manager decrement the pin and transition the block to `Evictable` (or `Offloaded`).
+  While `d2h_stream` is copying a block from VRAM to Pinned RAM—or while `h2d_stream` is prefetching into a VRAM slot—the block's `ref_count` remains $\ge 1$ (or `dma_in_flight = true`). Only after `cudaEventQuery(dma_fence) == cudaSuccess` confirms the hardware copy has finished does the background manager decrement the pin and transition the block to `Evictable` (or `Offloaded`).
 * **Preemption Exception:**
-  If VRAM becomes 100% pinned by active running sequences (e.g., all sequences grew longer via decode and hit `free_blocks == 0`), **eviction cannot free any `ref_count == 0` blocks**. The scheduler must trigger **sequence preemption** (swapping out or recomputing the lowest-priority *running* request, releasing its `ref_count`, and returning its blocks to the free pool).
+  If VRAM becomes 100% pinned by active running sequences (e.g., all active requests grew longer via decode and hit `free_blocks == 0`), **eviction cannot free any `ref_count == 0` blocks**. The scheduler must trigger **sequence preemption** (pausing and swapping out or discarding-to-recompute the lowest-priority *running* request, releasing its `ref_count`, and returning its blocks to the free pool).
 
 ---
 
@@ -127,7 +129,7 @@ Eviction decides *what leaves*; **admission control** decides *whether a newly c
 
 1. **Two-Hit / Probationary Admission (Bloom Filter / Ghost Cache):**
    * Do **not** spill newly computed single-turn blocks to NVMe (or even Tier 2 RAM) on first sight.
-   * Maintain a tiny in-memory **Ghost Cache** (storing only 64-bit `prefix_hash` + timestamp, $\sim 8\text{ B}$ per block instead of $32\text{ KiB}$–$2.5\text{ MiB}$ of KV tensors!).
+   * Maintain a tiny in-memory **Ghost Cache** (essentially a lightweight Python `dict` or ring buffer storing only the 64-bit `prefix_hash` + timestamp—just $\sim 8\text{ B}$ per block instead of $32\text{ KiB}$–$2.5\text{ MiB}$ of actual KV tensors, a $4{,}000\times$–$300{,}000\times$ smaller metadata footprint!).
    * Only when a prefix hash is seen a **second time** (a "ghost hit", proving reuse!) is it admitted into the persistent NVMe SSD tier (**Write-on-Second-Hit**). This cuts NVMe write traffic by **$50\%\text{–}80\%$**, preserving SSD endurance (DWPD) and PCIe bandwidth for hot prefetches.
 2. **Decode-Tail Filtering:**
    * During decode, generated output tokens are rarely shared across different users unless it's a multi-turn session continuing the exact transcript. Batch/stateless completions (`n_turns == 1`, `stream_complete`) can mark generated output blocks as **non-cacheable (`no_admit`)** or bypass Tier 3 persistence unless a multi-turn `session_id` is declared.

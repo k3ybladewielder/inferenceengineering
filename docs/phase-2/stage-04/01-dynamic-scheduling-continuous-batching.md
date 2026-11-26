@@ -48,6 +48,8 @@ Batching $B$ independent decode requests together loads the model weights from H
 
 $$I_{\text{decode}}(B) \approx \frac{2PB}{2P + 2 \cdot B \cdot d_{\text{act}} + S_{\text{KV\_read}}} \approx B \text{ FLOPs/byte (for small } B\text{)}$$
 
+In PyTorch terms, a single-request decode linear layer computes `y = x @ W.T` where `x` has shape `[1, d_model]` and `W` has shape `[d_out, d_model]`. Because `x` contains only one row, every weight in `W` must be streamed out of HBM just to perform a single multiply-add, leaving Tensor Cores idle over 99% of the step. When we batch $B$ requests into `X` of shape `[B, d_model]`, `X @ W.T` still reads `W` from HBM **once**, but reuses each loaded weight across $B$ rows—multiplying arithmetic intensity by $B$ while barely changing weight-transfer time.
+
 Up to the memory-capacity wall (KV Cache exhaustion) or the compute ridge point, increasing effective batch size $B_{\text{eff}}$ increases total system throughput ($\text{tokens/sec}$) almost linearly while barely changing per-step latency ($\text{ITL}$).
 
 The central systems challenge of LLM serving is **maintaining high effective batch size $B_{\text{eff}}$ when requests arrive stochastically and have wildly heterogeneous prompt lengths ($L_{\text{in}}$) and unpredictable output lengths ($L_{\text{out}}$)**.
@@ -58,7 +60,7 @@ The central systems challenge of LLM serving is **maintaining high effective bat
 
 ### 2.1 Static Batching (Request-Level Scheduling)
 
-In classical deep-learning inference (e.g., ResNet image classification or early FasterTransformer/Triton static batching), the scheduler groups $B$ requests into a fixed rectangular tensor `[B, L_max]` and **cannot admit new requests or release finished requests until every request in the batch has emitted `<EOS>` or reached `max_tokens`**.
+In classical deep-learning inference (e.g., ResNet image classification or early FasterTransformer/Triton static batching), the scheduler groups $B$ requests into a fixed rectangular tensor `[B, L_max]` (just as `torch.stack` requires uniform shapes across a batch) and **cannot admit new requests or release finished requests until every request in the batch has emitted `<EOS>` or reached `max_tokens`**.
 
 This creates two severe sources of hardware waste:
 
@@ -67,7 +69,7 @@ Because a dense batched prefill tensor requires a uniform sequence dimension, sh
 
 $$\text{Padding Tokens} = B \cdot \max_{i=1..B} L_i^{\text{in}} - \sum_{i=1}^{B} L_i^{\text{in}}$$
 
-Every `<PAD>` token participates in QKV projections, Attention matrix multiplications (masked out post-score), MLP projections, and consumes KV Cache slots unless explicitly stripped.
+Every `<PAD>` token participates in QKV projections, Attention matrix multiplications (where `attention_mask` only zeros out padding scores *after* `Q @ K.T` is already computed), MLP projections, and consumes KV Cache slots unless explicitly stripped.
 
 #### B. EOS Bubble Waste (Straggler Problem)
 During decode, requests finish at completely different steps. Suppose $B = 4$ requests enter together, and their true output lengths are $L_{\text{out}} = [12, 25, 40, 512]$.
@@ -96,8 +98,8 @@ Introduced by **Orca** (Yu et al., OSDI 2022) and refined by **vLLM** and **SGLa
 3. **Zero Padding via Selective Batching & Ragged Tensors:**
    Why can requests at completely different sequence positions (e.g., Req A at decode step 42, Req B at decode step 310, Req C prefilling 128 tokens) run in a **single forward pass**?
    Because of a structural property of the Transformer architecture:
-   * **Token-Independent Operators (95%+ of FLOPs & weights):** `Embedding`, `RMSNorm`, `QKV Projection`, `RoPE` (using an explicit per-token `position_ids` vector), `Output Projection`, `SwiGLU MLP`, and `LM Head` treat every token independently. They operate on a **flattened, zero-padding 2D ragged tensor** of shape `[total_scheduled_tokens, d_model]`, where `total_scheduled_tokens` is simply the sum of tokens across all active requests in this iteration!
-   * **Sequence-Dependent Operator (Attention only):** Only Attention needs to know which tokens belong to which request and where each request's KV Cache resides. Modern attention kernels (FlashAttention `varlen`, PagedAttention, FlashInfer) accept ragged metadata (`cu_seqlens_q`, `seq_lens`, `block_tables`) so they execute attention per sequence without rectangular padding.
+   * **Token-Independent Operators (95%+ of FLOPs & weights):** `Embedding`, `RMSNorm`, `QKV Projection`, `RoPE` (using an explicit per-token `position_ids` vector), `Output Projection`, `SwiGLU MLP`, and `LM Head` treat every token independently. Instead of a padded 3D tensor `[3, 128, d_model]`, the engine concatenates all active tokens along the sequence axis into a **flattened, zero-padding 2D ragged tensor** of shape `[total_scheduled_tokens, d_model]` (here `1 + 1 + 128 = 130` rows), accompanied by `position_ids = [42, 310, 0, 1, ..., 127]` so `RoPE` applies the exact positional rotation to each token.
+   * **Sequence-Dependent Operator (Attention only):** Only Attention needs to know which tokens belong to which request and where each request's KV Cache resides. Modern attention kernels (FlashAttention `varlen`, PagedAttention, FlashInfer) accept ragged metadata—such as `cu_seqlens_q = [0, 1, 2, 130]` (cumulative query lengths marking sequence boundaries inside the flat 2D tensor), `seq_lens`, and `block_tables`—so they execute attention per sequence without rectangular padding.
 
 In our earlier example, once Req 1 finishes at step 10, a new request enters at step 11. Effective slot utilization $\eta_{\text{continuous}}$ approaches **95%–100%** whenever the queue has pending work, typically yielding **2x to 10x higher throughput** under realistic ShareGPT/chat length distributions (which follow heavy-tailed log-normal or Pareto distributions).
 
@@ -167,12 +169,12 @@ flowchart TD
 
 ## 4. Step-by-Step Iteration Scheduling Loop
 
-Unlike static batching, the scheduler executes a deterministic decision loop **before every single GPU forward pass** (typically taking $50\text{–}500\,\mu\text{s}$ on the CPU, or overlapped asynchronously with GPU step $t-1$).
+Unlike static batching, the scheduler executes a deterministic decision loop on the CPU **before every single GPU forward pass** (typically taking $50\text{–}500\,\mu\text{s}$, or overlapped asynchronously with GPU step $t-1$). The CPU acts as the orchestrator: it decides which token IDs to pack into the `[total_scheduled_tokens, d_model]` ragged tensor and which KV block pointers to pass to the GPU kernels.
 
 Let the engine enforce three hard capacity limits:
 1. $B_{\max}$ (`max_num_seqs`): Maximum concurrent sequences in `running` (caps KV block-table metadata and CUDA kernel grid limits).
-2. $T_{\max}$ (`max_num_batched_tokens`): Maximum total tokens (prefill + decode) packed into one forward pass (bounds peak activation VRAM and per-step latency).
-3. $N_{\text{free}}$ (`num_free_gpu_blocks`): Available physical KV blocks in the GPU block pool.
+2. $T_{\max}$ (`max_num_batched_tokens`): Maximum total tokens (prefill + decode) packed into one forward pass (bounds peak activation VRAM of the `[total_scheduled_tokens, d_model]` tensors and caps per-step latency).
+3. $N_{\text{free}}$ (`num_free_gpu_blocks`): Available physical KV blocks in the GPU block pool. Because KV blocks hold a fixed number of tokens (e.g., 16), a running decode request only consumes a new block when its length crosses a block boundary (`pos % 16 == 0`); if `N_free == 0` at that boundary, the scheduler must preempt the newest request (`running.pop()`, LIFO) because it has accumulated the least sunk work.
 
 ### 4.1 Exact Per-Iteration `schedule()` Algorithm
 
@@ -265,8 +267,8 @@ When a running request needs a new KV block and none are free, the scheduler mus
 4. When re-admitted, the engine runs a single parallel **prefill** over all $L_{\text{in}} + t$ tokens to regenerate the KV Cache, then continues decoding token $y_{t+1}$.
 
 ### 5.2 CPU Swapping (Offload & Reload)
-1. Allocate matching pinned-RAM blocks in Host CPU memory.
-2. Issue asynchronous GPU $\rightarrow$ CPU DMA copies (`cudaMemcpyAsync(..., cudaMemcpyDeviceToHost)`) on a dedicated copy stream for every KV block of the victim.
+1. Allocate matching **pinned-RAM** blocks in Host CPU memory. In PyTorch terms, this is analogous to `tensor.pin_memory()` followed by `.to("cuda", non_blocking=True)`: normal OS memory is *pageable* (the OS can move or swap it to disk), which prevents the GPU's Direct Memory Access (DMA) engine from copying it directly. Locking pages in physical RAM enables asynchronous DMA transfers over the PCIe bus without stalling the CPU.
+2. Issue asynchronous GPU $\rightarrow$ CPU DMA copies (`cudaMemcpyAsync(..., cudaMemcpyDeviceToHost)`) on a dedicated CUDA copy stream for every KV block of the victim, overlapping the transfer with active GPU compute.
 3. Free the GPU physical blocks and move the request to `swapped`.
 4. When GPU blocks free up later, issue `cudaMemcpyAsync(..., cudaMemcpyHostToDevice)` to restore the KV blocks and resume decoding from token $t+1$ without re-running the Transformer layers.
 
