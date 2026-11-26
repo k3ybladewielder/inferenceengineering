@@ -4,6 +4,43 @@
 
 ---
 
+Simply rounding a large language model's numbers to 8 bits or 4 bits often ruins its accuracy because a tiny fraction of internal signals spike far above the rest. Calibration algorithms solve this offline using a small sample of text to rescale or adjust weights before deployment, preserving accuracy without slowing down GPU execution.
+
+## Core Concepts & Terminology
+
+Every technical term, numerical format, hardware concept, and calibration algorithm used in this document is defined below in dependency order:
+
+1. **Transformer & Linear Layer Foundations:**
+   * **Weights ($W$), Activations ($X$), & Hidden States:** Weights are the learned parameters of a linear layer $Y = XW$ ($W \in \mathbb{R}^{K \times N}$); activations (or hidden states) are the intermediate tensors ($X \in \mathbb{R}^{M \times K}$) flowing between layers for $M$ tokens across $K$ input channels and $N$ output neurons.
+   * **Residual Stream, `LayerNorm`, & `RMSNorm`:** The residual stream is the running vector sum passed across Transformer blocks; `LayerNorm` and `RMSNorm` are normalization layers that rescale activations to stabilize magnitudes.
+   * **`QKV`, `Out_proj` (`O_proj`), `V_proj`, `Gate/Up`, `Down_proj`, `SwiGLU`, & `SiLU`:** Standard projections inside each Transformer block. `QKV` creates Query, Key, and Value vectors; `V_proj` and `O_proj` project Value and attention outputs; `Gate/Up` and `Down_proj` form the feed-forward MLP using the `SwiGLU` gated activation (`SiLU` nonlinearity).
+   * **Perplexity (PPL) & Out-of-Distribution (OOD) Domains:** Perplexity measures language modeling uncertainty (lower is better). OOD domains are text types (such as code, math, or non-English text) not heavily represented in the calibration sample.
+
+2. **Quantization & Outlier Concepts:**
+   * **`RTN` (Round-to-Nearest):** Naive quantization that rounds every number to its nearest representable grid value without calibration adjustments.
+   * **`FP16`, `BF16`, `INT8`, `INT4`, `UINT4`, `FP8`, & `MXFP8`:** 16-bit (`FP16`, `BF16`), 8-bit (`INT8`, `FP8`, `MXFP8` with 32-element block scales), and 4-bit (`INT4` signed, `UINT4` unsigned) formats.
+   * **`W8A8`, `W4A16`, `W3A16`, & `W2A16`:** Bit-width shorthand where `W` is weight bits and `A` is activation bits (e.g., `W4A16` = 4-bit weights, 16-bit activations).
+   * **Scale ($s$, $\Delta$), Per-Token, Per-Channel, & Group-Wise ($g=128$) Scaling:** Step sizes shared per token row, per output column, or per $g$-element contiguous slice along $K$.
+   * **Activation Outliers & `LLM.int8()`:** Activation outliers are fixed feature channels ($\le 0.1\%$ of $K$) whose magnitudes reach $20\times$–$100\times$ normal values across every token. `LLM.int8()` isolated those outlier columns in `FP16` while keeping normal columns in `INT8`.
+   * **Attention Sink:** Early/anchor tokens that accumulate disproportionately large attention or activation magnitudes.
+   * **Calibration Dataset (Pile, C4, WikiText-2):** A small set of 128–512 representative text sequences run through the model forward pass to gather activation statistics without backpropagation.
+
+3. **GPU Hardware & Kernel Execution:**
+   * **GEMM, Reduction Dimension ($K$), & BLAS `GEMM`:** General Matrix Multiply ($Y = XW$) summing along the shared inner dimension $K$; BLAS `GEMM` is a standard high-performance dense matrix-multiply routine.
+   * **Tensor Core (`IMMA`), GPU Warps, & FLOPs:** `IMMA` is the integer Tensor Core matrix-multiply unit; a warp is 32 GPU threads executing in lockstep; FLOPs count floating-point arithmetic operations.
+   * **HBM Bandwidth, Coalesced Reads, & Kernel Fusion / Epilogue:** HBM is off-chip GPU memory. Coalesced reads occur when adjacent threads read contiguous memory addresses (scattered gathers stall HBM). Kernel fusion merges elementwise math into the end (epilogue) of a preceding GPU kernel to avoid extra memory passes.
+   * **Marlin Kernel & `g_idx`:** A fast fused `W4A16` GPU kernel; `g_idx` is a group-index lookup table used when weight columns are reordered.
+
+4. **Calibration Algorithms & Mathematical Tools:**
+   * **`SmoothQuant` ($\alpha$, $\text{diag}(s)$):** A `W8A8` algorithm that migrates quantization difficulty from activations to weights via $Y = (X\text{diag}(s)^{-1})(\text{diag}(s)W)$, folding $s^{-1}$ into the preceding normalization layer.
+   * **`AWQ` (Activation-Aware Weight Quantization) & Frobenius Norm ($\|\cdot\|_F$):** A `W4A16` algorithm that protects the top 0.1%–1% salient weight channels (selected by mean activation magnitude $\mathbf{s}_X$) by scaling them up before quantization, using a 20-point grid search on $\alpha$ to minimize the Frobenius norm (matrix $\ell_2$ reconstruction error).
+   * **`GPTQ` & `OBQ` (Optimal Brain Quantization):** Second-order quantization methods that actively adjust remaining unquantized weights to compensate for the rounding error of already-quantized weights.
+   * **Hessian ($H = 2XX^\top$), Inverse Hessian ($H^{-1}$), & Lagrange Multipliers:** $H$ is the second-order curvature matrix of layer-wise squared output error; $H^{-1}$ encodes cross-channel correlations used to solve constrained quadratic error minimization (via Lagrange multipliers) for optimal weight updates.
+   * **Cholesky Decomposition & Dampening ($\lambda I$, $\text{Tr}(H)$):** Cholesky decomposition factors a positive-definite matrix into triangular factors ($L L^\top$) for numerical stability; dampening adds $\lambda I$ (proportional to the trace $\text{Tr}(H)$, the sum of diagonal entries) so eigenvalues stay positive.
+   * **`actorder` (`desc_act`):** A GPTQ option that quantizes columns in descending order of $\text{diag}(H)$ (highest activation energy first) so remaining columns can compensate them.
+
+---
+
 ## 1. The Activation Outliers Phenomenon in Large Transformers
 
 If Transformer weights and activations were clean, isotropic Gaussian tensors, naive round-to-nearest (`RTN`) quantization to `INT8` or `FP8` would preserve accuracy effortlessly. In reality, once autoregressive Transformers scale beyond **~6.7 billion parameters**, a sharp phase transition occurs in their internal hidden states—first characterized systematically by Dettmers et al. (`LLM.int8()`, 2022).

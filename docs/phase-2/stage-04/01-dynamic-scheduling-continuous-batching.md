@@ -4,6 +4,37 @@
 
 ---
 
+Modern language model servers handle thousands of user requests that arrive unpredictably and produce responses of wildly different lengths. This module explains how serving systems group those requests together on graphics hardware without wasting memory or leaving fast processors sitting idle.
+
+## Core Concepts & Terminology
+
+Every technical term, hardware unit, and scheduling mechanism used in this module is defined below in dependency order:
+
+* **Token & Vocabulary:** A **token** is the basic unit of text (a word, subword, or punctuation mark) mapped to an integer ID in the model's dictionary (**vocabulary**).
+* **Forward Pass & Autoregressive Generation:** A **forward pass** is one complete execution of the neural network's layers from input tokens to output probabilities. **Autoregressive** Transformer inference generates text one token at a time, feeding each newly produced token back in to predict the next.
+* **Tensor:** A multi-dimensional array of numbers (e.g., a 1D vector, 2D matrix, or 3D `[batch, sequence, hidden_dim]` array) processed by the GPU.
+* **FP16 / BF16:** 16-bit floating-point number formats (*Half Precision* and *Brain Float 16*). Each number takes **2 bytes** of memory and is standard for storing model weights and activations.
+* **FLOP, FLOPs, & TFLOP/s:** A **FLOP** is a single floating-point arithmetic operation (such as multiplying or adding two decimal numbers). **FLOPs** is the total operation count, and **TFLOP/s** is trillions of operations per second.
+* **HBM (High Bandwidth Memory) / VRAM:** High-speed memory (Video RAM, e.g., HBM3 on an NVIDIA H100 SXM) mounted directly on the GPU package to store model weights, intermediate activations, and cached attention state.
+* **Tensor Cores:** Specialized matrix-math hardware units inside modern GPUs that execute matrix multiplications far faster than general-purpose cores.
+* **GEMM vs. GEMV:** **GEMM** (*General Matrix-Matrix Multiplication*) multiplies two 2D matrices; **GEMV** (*General Matrix-Vector Multiplication*) multiplies a 2D matrix by a single 1D vector.
+* **Arithmetic Intensity ($I$), Ridge Point, & Memory-Bound vs. Compute-Bound:** **Arithmetic intensity** is the ratio of math operations performed to bytes moved from HBM ($\text{FLOPs/byte}$). A workload is **memory-bandwidth-bound** if HBM transfer speed limits performance, and **compute-bound** if Tensor Core math speed limits performance. The **ridge point** is the exact arithmetic intensity where compute speed and HBM bandwidth balance.
+* **MFU (Model FLOPs Utilization):** The fraction of a GPU's peak theoretical FLOP/s actually spent on useful model math rather than waiting on memory or overhead.
+* **KV Cache (Key-Value Cache):** Stored intermediate **Key** and **Value** vectors from earlier tokens in Attention layers, preventing the model from recomputing them at every new token step.
+* **Prefill vs. Decode:** **Prefill** is the first phase of a request, processing all $L_{\text{in}}$ prompt tokens in parallel via compute-bound GEMMs. **Decode** is the second phase, generating 1 output token per step via memory-bandwidth-bound GEMVs.
+* **Transformer Linear & Normalization Layers:** Standard operations inside each layer—**`Embedding`** (token ID $\to$ vector), **`RMSNorm`** (vector magnitude normalization), **`QKV` / `O`** (Query, Key, Value, and Output Attention projections), **`RoPE`** (*Rotary Position Embedding*, encoding token order), **`SwiGLU` MLP** (gated feed-forward network), and **`LM Head`** (final projection scoring every vocabulary token).
+* **Batch Size ($B$) & Effective Batch Size ($B_{\text{eff}}$):** The number of independent requests processed together in a single GPU forward pass.
+* **Throughput & SLOs (TTFT, ITL / TPOT, Tail Latency):** **Throughput** is total generated tokens per second across all users. A **Service Level Objective (SLO)** is a performance target: **TTFT** (*Time To First Token*) is the wait from request arrival to the first output token; **ITL** (*Inter-Token Latency*) or **TPOT** (*Time Per Output Token*) is the gap between consecutive output tokens; **$P95$/$P99$ tail latency** measures the slowest 5% or 1% of requests.
+* **`<EOS>`, `<PAD>`, `max_tokens`, & `max_model_len`:** **`<EOS>`** (*End-of-Sequence*) is a special token signaling generation is complete; **`<PAD>`** is a dummy filler token used to equalize tensor lengths; **`max_tokens`** caps a request's output length; **`max_model_len`** is the model's maximum total context window.
+* **Static Batching vs. Continuous Batching (Orca-Style):** **Static batching** groups requests into a fixed rectangular tensor and waits until *every* request finishes before admitting new ones. **Continuous (iteration-level) batching** re-evaluates the batch before every single forward pass, immediately freeing finished requests and admitting waiting ones.
+* **Selective Batching & Ragged Tensors:** Packing active tokens from requests at different lengths/phases into a single zero-padding 2D **ragged tensor** (`[total_scheduled_tokens, d_model]`) for token-independent layers, while passing sequence boundary metadata (`cu_seqlens_q`, `seq_lens`, `block_tables`) only to sequence-aware Attention kernels (**FlashAttention `varlen`**, **PagedAttention**, **FlashInfer**).
+* **Physical KV Blocks, Chunked Prefill, & Watermark:** Fixed-size chunks of HBM (e.g., 16 tokens/block) allocated on demand to hold KV Cache data. **Chunked prefill** splits long prompts into smaller token budgets ($C$ tokens/step) so decodes are not stalled. A **watermark** keeps a small percentage of blocks free so running requests can grow without immediate eviction.
+* **Host CPU RAM, Pinned Memory, PCIe, & DMA (`cudaMemcpyAsync`):** Main system memory attached to the CPU; **pinned memory** is locked in physical RAM so the OS cannot swap it to disk, enabling **DMA** (*Direct Memory Access*) to copy data asynchronously over the **PCIe** bus between CPU Host and GPU Device (**H2D** / **D2H**) via `cudaMemcpyAsync`.
+* **Preemption (LIFO, Recomputation vs. CPU Swap, Thrashing):** Evicting an active request when free GPU KV blocks hit zero—typically picking the newest (**LIFO**, *Last-In, First-Out*) request—either by discarding its KV cache and re-running prefill later (**recomputation**) or copying its blocks to CPU RAM (**CPU swap**). **Thrashing** occurs when requests repeatedly evict and re-admit each other without making progress.
+* **GQA, MLA, TP, & OOM:** **GQA** (*Grouped-Query Attention*) and **MLA** (*Multi-Head Latent Attention*) compress Key/Value representations to shrink per-token KV size. **TP** (*Tensor Parallelism*) splits model layers across multiple GPUs. **OOM** (*Out-of-Memory*) is a crash caused by exhausting GPU HBM.
+
+---
+
 ## 1. First-Principles Motivation: Why Batching Governs Decode Economics
 
 Recall from Phase 1 (Stage 3) that autoregressive Transformer inference has two physically distinct phases:

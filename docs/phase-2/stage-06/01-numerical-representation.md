@@ -4,6 +4,53 @@
 
 ---
 
+Large language models store billions of numbers and move them repeatedly from slow off-chip memory into fast compute units every time they generate a word. Choosing how each number is encoded in bits—and how groups of numbers share scaling factors—determines both how much memory a model needs and how accurately it preserves its behavior.
+
+## Core Concepts & Terminology
+
+Every technical term, numerical format, and hardware concept used in this document is defined below in dependency order:
+
+1. **Model Building Blocks & Inference Terms:**
+   * **Weights ($W$) and Activations ($X$):** Weights are the fixed, learned numbers stored inside a neural network; activations are the temporary numbers computed as input text passes through each layer.
+   * **Dense Transformer:** A Transformer neural network in which every weight parameter participates in every forward pass (as opposed to sparsely activated Mixture-of-Experts models).
+   * **Autoregressive Decode & Batch-1 Decode:** Generating output text one token (word piece) at a time, where each new token depends on all prior tokens. "Batch-1" means serving a single user request at a time.
+   * **KV Cache (Key-Value Cache):** GPU memory that stores intermediate Key and Value vectors from earlier tokens so they do not need to be recomputed on every decode step.
+   * **Logits & Perplexity (PPL):** Logits are the raw, unnormalized scores a model outputs for every token in its vocabulary before converting them into probabilities. Perplexity is a standard metric measuring how uncertain a language model is when predicting text (lower is better).
+   * **Quantization & Dequantization:** Quantization maps high-precision numbers (such as 16-bit) onto compact lower-precision representations (such as 8-bit or 4-bit) to save memory and bandwidth; dequantization converts them back into higher-precision numbers before arithmetic.
+   * **Quantization Noise:** The small rounding error introduced between an original number and its quantized-then-dequantized value.
+   * **Activation Outliers, `LayerNorm`, & `RMSNorm`:** Activation outliers are a tiny fraction of feature channels whose magnitudes are $10\times$–$100\times$ larger than typical channels. `LayerNorm` and `RMSNorm` are normalization layers that rescale activations between Transformer blocks to keep magnitudes stable.
+
+2. **GPU Memory & Compute Hardware:**
+   * **VRAM & HBM (High Bandwidth Memory):** The GPU's main off-chip memory (e.g., 80 GB on an NVIDIA A100 or H100) where model weights and the KV Cache reside.
+   * **On-Chip SRAM, Shared Memory (`SMEM`), & Registers:** Small, ultra-fast memory pools located directly inside the GPU's compute cores, used to stage data immediately before math execution.
+   * **CUDA Core:** A general-purpose programmable arithmetic unit on an NVIDIA GPU used for elementwise math, bit manipulation, and control flow.
+   * **Tensor Core (`HMMA`, `IMMA`, `wgmma`) & `TMA`:** Specialized matrix-multiply-accumulate hardware units on NVIDIA GPUs. `HMMA` executes 16-bit floating-point matrix math; `IMMA` executes integer matrix math; `wgmma` (Warp Group Matrix Multiply-Accumulate) is the Hopper-generation asynchronous Tensor Core instruction; `TMA` (Tensor Memory Accelerator) is Hopper hardware that copies multi-dimensional data tiles asynchronously between HBM and Shared Memory.
+   * **Ampere, Hopper, & Blackwell:** Successive NVIDIA data-center GPU architectures (A100 = Ampere, H100 = Hopper, B200 = Blackwell).
+   * **MAC, `FMA` (`fma.rn.f16`), & `LOP3`:** A Multiply-Accumulate (MAC) computes $a \times b + c$. `FMA` (Fused Multiply-Add) performs this in one hardware instruction (`rn` = round-to-nearest-even). `LOP3` is a 3-input bitwise lookup instruction used to unpack 4-bit integers inside registers.
+   * **GEMM, Reduction Dimension ($K$), & Epilogue:** General Matrix Multiply ($Y = XW$), where $X \in \mathbb{R}^{M \times K}$ and $W \in \mathbb{R}^{K \times N}$ are summed along their shared inner dimension $K$ (the reduction dimension). The epilogue is the final step after the $K$-sum finishes, where scaling factors are applied and results are written out.
+   * **`W4A16`, `W8A8`, & `W4A4`:** Precision shorthand specifying Weight bit-width (`W`) and Activation bit-width (`A`)—for example, `W4A16` uses 4-bit weights and 16-bit activations.
+
+3. **Floating-Point & Bit-Level Numerical Formats:**
+   * **IEEE-754, Sign ($S$), Exponent ($E$), Mantissa ($M$), & Bias ($B$):** IEEE-754 is the standard specification for binary floating-point numbers. A float splits its bits into 1 sign bit $S$ (positive/negative), $E$ exponent bits (power-of-two scale, shifted by a constant bias $B = 2^{E-1}-1$), and $M$ mantissa/significand bits (fractional precision within that power of two).
+   * **Binade & ULP (Unit in the Last Place):** A binade is the interval between two consecutive powers of two, $[2^k, 2^{k+1})$. ULP is the spacing between two adjacent representable floating-point numbers in that binade.
+   * **Normal vs. Subnormal Numbers & Gradual Underflow:** Normal numbers have an implicit leading `1.` before the mantissa; subnormal numbers (when exponent bits are all zeros) replace it with `0.` so values near zero shrink smoothly ("gradual underflow") instead of dropping straight to zero.
+   * **`Inf` & `NaN`:** Special floating-point bit patterns representing Infinity ($\pm\infty$) and Not-a-Number (invalid results).
+   * **`FP32`, `FP16`, & `BF16`:** Standard 32-bit (`1|8|23`) and 16-bit floating-point formats. `FP16` (`1|5|10`) prioritizes precision; `BF16` (`1|8|7`, Brain Float 16) matches `FP32`'s 8-bit exponent for wide dynamic range.
+   * **`FP8` (`E4M3` & `E5M2`) & OCP:** 8-bit floating-point formats standardized by NVIDIA, ARM, Intel, and the Open Compute Project (OCP). `E4M3` (4 exponent, 3 mantissa bits) favors precision for forward-pass weights and activations; `E5M2` (5 exponent, 2 mantissa bits) matches `FP16`'s exponent range for high-dynamic-range tensors or training gradients.
+   * **`FP4` (`E2M1`):** A 4-bit floating-point format (1 sign, 2 exponent, 1 mantissa bit) encoding 16 finite values in $[-6.0, +6.0]$.
+   * **`NF4` (NormalFloat4), QLoRA, `bitsandbytes`, & Double Quantization:** A 4-bit non-uniform lookup-table format introduced in QLoRA (Quantized Low-Rank Adaptation, implemented in the `bitsandbytes` library). Its 16 values are placed at equal-probability quantiles of a standard normal distribution $\mathcal{N}(0,1)$ using its cumulative distribution function (CDF $\Phi$) and inverse CDF ($Q_X$). Double Quantization further compresses the group scale factors themselves into `FP8` to reduce metadata memory.
+   * **OCP Microscaling (`MXFP4`, `MXFP8`, `E8M0`) & `NVFP4`:** Block-scaled formats standardized by OCP (v1.0) and accelerated natively on Blackwell. Every 32 elements along $K$ share one 8-bit power-of-two scale in `E8M0` format (0 sign, 8 exponent, 0 mantissa bits). `NVFP4` is NVIDIA's 16-element block variant using `FP8 E4M3` scales.
+
+4. **Integer Formats, Scaling Granularities, & Algorithms:**
+   * **`INT8`, `INT4`, `UINT8`, `UINT4`:** Signed (`INT`, centered near zero via two's complement) and unsigned (`UINT`, non-negative) 8-bit and 4-bit integer formats.
+   * **`DP4A` & `TensorRT`:** `DP4A` is an NVIDIA instruction performing a 4-element 8-bit integer dot product; `TensorRT` is NVIDIA's high-performance inference compiler.
+   * **Scale ($s$) & Zero-Point ($z$):** Parameters mapping integers $q$ to real values $\hat{x} = s \cdot (q - z)$, where $s$ sets the step size and $z$ is the integer code representing real `0.0`.
+   * **Symmetric vs. Asymmetric (Affine) Quantization:** Symmetric quantization fixes $z = 0$ over $[-\alpha, +\alpha]$; asymmetric quantization allows $z \neq 0$ so skewed ranges $[x_{\min}, x_{\max}]$ use all integer codes efficiently.
+   * **Per-Tensor, Per-Channel, Per-Token, & Group-Wise Scaling:** Granularities at which scales $s$ are shared: one scale per matrix (per-tensor), one per output column (per-channel), one per input token row (per-token), or one per $g$-element contiguous slice along $K$ (group-wise, e.g., $g = 128, 64, 32$).
+   * **`SmoothQuant`, `AWQ`, `GPTQ`, & `DeepSeek-V3`:** `SmoothQuant`, `AWQ`, and `GPTQ` are post-training calibration algorithms (detailed in Doc 02) that preserve accuracy under low-bit quantization; `DeepSeek-V3` is a frontier Mixture-of-Experts LLM that uses `1x128` block-wise `FP8` GEMMs.
+
+---
+
 ## 1. Why Bit-Level Representation Governs LLM Inference
 
 Every parameter stored in `BF16` or `FP16` consumes **2 bytes**. A 70B-parameter dense Transformer requires $70 \times 10^9 \times 2 = 140\text{ GB}$ just for static weights—exceeding a single 80 GB H100/A100 GPU before allocating a single byte of KV Cache or activations. Furthermore, during batch-1 autoregressive decode, every generated token forces the GPU to stream nearly the entire weight matrix from HBM into on-chip SRAM/registers.

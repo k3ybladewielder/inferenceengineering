@@ -4,6 +4,35 @@
 
 ---
 
+Pruning shrinks a neural network by setting redundant weights to exact zero, but GPUs can only turn those zeros into real speedups when they follow a rigid, hardware-friendly pattern. This document explains how NVIDIA's `2:4` structured sparsity works in silicon, why it must be paired with quantization to speed up token generation, and how modern algorithms prune 70B-parameter models in minutes.
+
+## Core Concepts & Terminology
+
+Every technical term, hardware mechanism, numerical format, and pruning algorithm used in this document is defined below in dependency order:
+
+1. **GPU Execution & Sparsity Taxonomy:**
+   * **Pruning & Sparsity:** Pruning sets selected model weights $W \in \mathbb{R}^{K \times N}$ to exact `0.0`; sparsity is the fraction of zeroed entries.
+   * **Warp, `SIMT`, & Warp Divergence:** A warp is 32 GPU threads executing the same instruction in lockstep (`SIMT`: Single Instruction, Multiple Threads). Warp divergence occurs when threads take different `if/else` branches, forcing serialized execution.
+   * **Uncoalesced Reads & `CSR` / `CSC` / `COO`:** Uncoalesced reads occur when threads fetch scattered memory addresses. `CSR` (Compressed Sparse Row), `CSC` (Compressed Sparse Column), and `COO` (Coordinate list) are general sparse formats storing 16- to 32-bit coordinate indices per nonzero value.
+   * **Coarse Structured Pruning:** Removing entire attention heads, MLP channels, or Transformer layers to produce a smaller dense matrix.
+   * **Semi-Structured (`2:4`) Sparsity:** A hardware-enforced pattern where every contiguous 4-element block along the reduction dimension $K$ contains at most 2 nonzero values (at least 2 zeros).
+   * **2-Bit Metadata Indices (`E`) & Nibble:** In `2:4` compression, each of the 2 surviving nonzeros in a 4-element block is tagged by a 2-bit position index (`00`, `01`, `10`, `11`), forming one 4-bit nibble per 4-element block.
+
+2. **GPU Hardware, Memory, & Precision Formats:**
+   * **HBM / HBM3, `SMEM`, Registers, & SM Occupancy:** Off-chip main GPU memory (HBM/HBM3), on-chip Shared Memory (`SMEM`), per-thread registers, and SM occupancy (how fully active warps keep Streaming Multiprocessors busy).
+   * **MAC, FLOPs, TFLOPS, & ISA:** Multiply-Accumulate (`a * b + c`), floating-point operations (FLOPs), trillions of FLOPs/sec (TFLOPS), and Instruction Set Architecture (ISA, the GPU's native instruction set).
+   * **Tensor Cores, Sparse Tensor Cores (`mma.sp.sync`, `wgmma.mma_async.sp`), `MUX`, & `cusparseLt`:** Hardware matrix-multiply units operating on fixed tiles. Sparse Tensor Cores (exposed via NVIDIA's `cusparseLt` library) use hardware 2:1 multiplexers (`MUX`) driven by the 2-bit metadata indices to skip zeroed activations and double logical $K$-throughput.
+   * **`FP16`, `BF16`, `FP8`, `INT8`, `INT4`, `FP4`, `FP32`, `W4A16`, & `W8A8`:** 16-bit, 8-bit, 4-bit, and 32-bit numerical formats and weight/activation precision schemes (`W4A16` = 4-bit weights, 16-bit activations; `W8A8` = 8-bit weights, 8-bit activations).
+   * **Prefill, Decode, TTFT, & `Marlin` / `Sparse-Marlin`:** Prefill processes prompt tokens in parallel (compute-bound, governing Time to First Token or `TTFT`); decode generates output tokens one step at a time (memory-bound). `Marlin` is a fast fused `W4A16` kernel; `Sparse-Marlin` extends it to `2:4` compressed `INT4` weights.
+
+3. **Pruning & Recovery Algorithms:**
+   * **Post-Training Pruning (PTP) vs. `LoRA` / `Sparse-QAT`:** PTP prunes a trained model in minutes/hours using ~128 calibration sequences without full retraining; `LoRA` (Low-Rank Adaptation) and `Sparse-QAT` (Sparse Quantization-Aware Training) perform lightweight recovery fine-tuning on surviving weights.
+   * **Naive Magnitude Pruning, `RTN`, & Activation Outliers:** Zeroing the smallest $|W_{ij}|$ (like naive Round-to-Nearest `RTN` quantization) fails because tiny weights multiplied by huge activation outliers ($X_j$) still strongly affect outputs.
+   * **`Wanda` & $\ell_2$ Norm ($\|X_j\|_2$):** A zero-update pruning method scoring each weight by $S_{j,n} = |W_{j,n}| \cdot \|X_j\|_2$, where $\|X_j\|_2$ is the Euclidean ($\ell_2$) norm of input channel $j$ across calibration tokens.
+   * **`SparseGPT`, `OBS` (Optimal Brain Surgeon), `GPTQ`, Hessian ($H$), $H^{-1}$, & Cholesky Decomposition:** `SparseGPT` adapts OBS/GPTQ second-order curvature compensation (using a dampened input Hessian $H = 2XX^\top + \lambda I$, Cholesky-inverted $H^{-1}$, and lazy $B=128$ block updates) to analytically adjust surviving weights so they absorb the signal lost from zeroed weights—and can jointly prune and quantize.
+
+---
+
 ## 1. Taxonomy of Sparsity on GPU Silicon
 
 Pruning removes redundant parameters from weight matrices $W \in \mathbb{R}^{K \times N}$ by setting selected entries to exact zero (`0.0`). On CPUs, even irregular sparsity can sometimes save FLOPs via branchy loops. On massively parallel GPUs—where 32 threads in a warp execute in lockstep (`SIMT`) and Tensor Cores operate strictly on rigid matrix tiles (`16×8×16`, `64×N×32`)—the **geometric structure** of zeros determines whether pruning speeds up inference or actually *slows it down*:

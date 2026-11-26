@@ -4,6 +4,30 @@
 
 ---
 
+Prompting a language model to "output only valid JSON" always leaves a small chance of syntax errors that break downstream software pipelines. This module explains how serving engines embed formal grammar recognizers directly into token generation to guarantee 100% valid structured outputs.
+
+## Core Concepts & Terminology
+
+Every formal-language, tokenization, and constrained-decoding term used in this module is defined below in dependency order:
+
+* **Vocabulary ($V$) & Token ($t \in V$):** The **vocabulary** is the fixed dictionary of all text pieces (**tokens**, typically $|V| \approx 32{,}000\text{–}152{,}000$) a model can output.
+* **BPE (Byte-Pair Encoding), SentencePiece, & Byte-Fallback UTF-8:** **BPE** and **SentencePiece** are subword tokenization methods that merge frequent character sequences into single multi-character tokens ($s_t = c_1 \dots c_m$). **Byte-fallback BPE** represents rare or multi-byte **UTF-8** characters (e.g., `é` = `0xC3 0xA9`) as individual raw byte tokens (`0x00..0xFF`).
+* **TTFT, KV Cache, & `<EOS>` (`EOS_TOKEN_ID`):** **TTFT** (*Time To First Token*) is the wait until the first output token; the **KV Cache** stores attention history; **`<EOS>`** (*End-of-Sequence*) is the stop token ending generation.
+* **Structured Contracts (Pydantic, JSON Schema, `$ref`, SQL, XML, DSL, AST):** **Pydantic** and **JSON Schema** define exact data types and fields (with **`$ref`** enabling recursive nested objects). **SQL**, **XML**, and **DSLs** (*Domain-Specific Languages*) are formal syntax languages; an **AST** (*Abstract Syntax Tree*) is the hierarchical tree structure of parsed code/data.
+* **Constrained Decoding & Logit Masking ($-\infty$):** **Constrained decoding** restricts which tokens $V_{\text{valid}} \subseteq V$ the model is allowed to pick at each step by setting invalid tokens' raw scores (**logits**) to $-\infty$ before sampling.
+* **Chomsky Hierarchy (Type 3 Regular vs. Type 2 Context-Free):** A formal classification of languages by the memory required to recognize them. **Type 3 (Regular)** needs only finite memory; **Type 2 (Context-Free)** allows unbounded nested recursion.
+* **Regex, Thompson's Construction, NFA, Subset Construction, & DFA ($M = (Q, \Sigma, \delta, q_0, F)$):** A **Regex** (*Regular Expression*) defines a regular pattern. **Thompson's Construction** converts a Regex into an **NFA** (*Nondeterministic Finite Automaton*), and **Subset Construction** converts that into a **DFA** (*Deterministic Finite Automaton*): a finite state machine with states $Q$, alphabet $\Sigma$, deterministic transition function $\delta: Q \times \Sigma \to Q$, start state $q_0$, and accepting states $F$ (where `<EOS>` is allowed).
+* **Pumping Lemma:** A mathematical theorem proving that finite-state DFAs cannot track unbounded nesting depth (such as arbitrary `{{{...}}}` JSON objects).
+* **CFG, EBNF, Production Rules, Non-Terminals, & Left-Recursion:** A **CFG** (*Context-Free Grammar*, often written in **EBNF**, *Extended Backus-Naur Form*) is a tuple $G = (V_{\text{nt}}, \Sigma, R, S)$ of **non-terminal** placeholders ($V_{\text{nt}}$), terminal characters ($\Sigma$), **production rules** ($A \to \alpha$), and start symbol ($S$). **Left-recursion** is a rule whose leftmost symbol is itself ($A \to A b$).
+* **PDA (Pushdown Automaton) & Persistent Stack:** A **PDA** is a finite state machine augmented with an unbounded **stack** of active grammar rules to handle recursion. A **persistent (copy-on-push) stack** shares parent stack frames across branching hypotheses without full copies.
+* **Lexing vs. Parsing & Earley Parser:** **Lexing** groups raw bytes into terminal tokens via DFAs; **parsing** checks structural CFG rules. An **Earley parser** is a general CFG chart parser tracking `(rule, dot_pos, origin)` items in $O(n^3)$ worst-case ($O(n)$ on unambiguous grammars).
+* **Token-Boundary Alignment Problem:** The hazard where a single multi-character BPE token spans across multiple byte-level grammar states (or crosses a rule boundary), requiring full multi-byte validation $\delta^*(q, s_t)$ rather than checking only the first character.
+* **Vocabulary Prefix Trie & Pruning:** A tree organizing all $|V|$ token byte strings by shared prefix so rejecting an invalid byte prefix immediately prunes entire subtrees of thousands of tokens.
+* **Bitmask (`uint32`) & H2D Copy:** A compact array of 1-bit validity flags (`1` = allowed, `0` = masked) packed into 32-bit unsigned integers (`uint32`) and copied from CPU Host to GPU Device (**H2D**).
+* **Outlines, XGrammar (Context-Independent vs. Context-Dependent Tokens), & `llguidance` (LRU Cache):** **Outlines** precomputes full DFA bitmasks; **XGrammar** precomputes masks for ~99% **context-independent** tokens (staying inside the current PDA rule) and simulates the stack only for <1% **context-dependent** tokens (crossing rule boundaries); **`llguidance`** walks the token trie on demand with an Earley parser and caches bitmasks in an **LRU** (*Least-Recently-Used*) cache.
+
+---
+
 ## 1. Why Prompt Engineering Fails for Deterministic Contracts
 
 In agentic pipelines, function calling, and structured data extraction, an LLM must emit machine-parseable syntax (JSON conforming to a Pydantic schema, SQL, XML, or a custom DSL). Relying solely on prompting ("Return ONLY valid JSON") fails mathematically at scale:

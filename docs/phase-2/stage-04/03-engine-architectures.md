@@ -4,6 +4,27 @@
 
 ---
 
+Fast GPU math kernels alone do not guarantee a fast language model server. Because the CPU must parse network requests, manage memory tables, and launch GPU work before every single token step, **how a serving engine structures its CPU control plane** often determines real-world throughput and latency.
+
+## Core Concepts & Terminology
+
+Every runtime, systems, and serving-engine term used in this module is defined below in dependency order:
+
+* **CPU Control Plane vs. GPU Hot Path:** The **CPU control plane** handles HTTP networking, tokenization, scheduling decisions, and kernel launches; the **GPU hot path** is the sequence of matrix and attention kernels executing on the GPU.
+* **CUDA Kernels & Libraries (`FlashAttention`, `FlashInfer`, `Triton`, `CUTLASS`, `cuBLASLt`, `Marlin`, `EETQ`, `ContextFMHA`, `XQA`, `SASS`):** **CUDA kernels** are parallel GPU functions. `FlashAttention`, `FlashInfer`, and `ContextFMHA` are fused attention kernels; `Triton` compiles Python-like kernel code to GPU instructions; `CUTLASS` and `cuBLASLt` are NVIDIA matrix-math libraries; `Marlin` and `EETQ` are quantized weight kernels; **`XQA`** is NVIDIA's warp-specialized decode attention kernel written in **`SASS`** (raw GPU machine assembly).
+* **Quantization & Weight Formats (`Safetensors`, `mmap`, `FP8`, `INT4-AWQ`, `W4A8`):** **`Safetensors`** is a safe binary weight format often loaded via **`mmap`** (memory-mapping files directly from disk into virtual memory). **`FP8`**, **`INT4-AWQ`**, and **`W4A8`** compress weights/activations to 8-bit or 4-bit numbers to reduce HBM traffic.
+* **Multi-GPU Parallelism (`TP`, `PP`, `NCCL`, `MPI`, `torch.distributed`):** **TP** (*Tensor Parallelism*) splits each layer's matrices across GPUs; **PP** (*Pipeline Parallelism*) places different layers on different GPUs. **`NCCL`** (*NVIDIA Collective Communications Library*, e.g., `AllReduce`), **`MPI`**, and **`torch.distributed`** synchronize tensors across GPUs.
+* **Python GIL, `asyncio`, HTTP/JSON, & SSE:** The **GIL** (*Global Interpreter Lock*) is Python's mutex allowing only one thread to run Python bytecode at a time. **`asyncio`** is Python's cooperative event loop. **SSE** (*Server-Sent Events*) streams generated tokens incrementally over an open HTTP connection.
+* **Tokenization, Detokenization, & UTF-8 Delta:** **Tokenization** converts prompt text into integer token IDs; **detokenization** converts output token IDs back into incremental **UTF-8** text chunks.
+* **Compilation Models (Eager, JIT, `torch.compile`, CUDA Graphs, AoT):** **Eager** mode runs PyTorch ops one by one; **JIT** (*Just-in-Time*, e.g., `torch.compile`) fuses ops dynamically at runtime; **CUDA Graphs** record a fixed sequence of GPU kernel launches so the CPU can replay them in one call. **AoT** (*Ahead-of-Time*) compiles and auto-tunes an entire static binary plan (`.engine`) before serving begins.
+* **IPC, ZeroMQ (`ZMQ`), gRPC (`tonic`/`grpcio`), & UDS:** **IPC** (*Inter-Process Communication*) exchanges data between OS processes using **ZeroMQ (`ZMQ`)** message sockets, shared memory, or **gRPC** (a binary remote-procedure-call protocol) over **UDS** (*Unix Domain Sockets*, fast local OS pipes).
+* **Rust, `tokio`, & `axum`:** **Rust** is a compiled systems language with no GIL; **`tokio`** is its async runtime and **`axum`** is its HTTP web framework.
+* **Automatic Prefix Caching (APC) vs. RadixAttention (Radix Tree, LPM, LRU):** **APC** caches KV blocks by hashing fixed-size block contents. **RadixAttention** stores all active and historical KV slots in a **Radix Tree** (a compressed prefix trie) for token-level reuse, using **LPM** (*Longest-Prefix-Match*) scheduling and **LRU** (*Least-Recently-Used*) eviction of unreferenced (`lock_ref == 0`) leaves.
+* **Overlap Scheduling & `FutureIndices`:** **Overlap scheduling** prepares step $t+1$'s batch on CPU while step $t$ executes on GPU, using **`FutureIndices`** (device-side GPU memory placeholders) so step $t+1$ can launch without waiting for a CPU-GPU sync (`cudaStreamSynchronize`).
+* **Inflight Batching, DSL, & Constrained Decoding (`XGrammar`, `Outlines`, `llguidance`, Jump-Forward):** **Inflight Batching** is TensorRT-LLM's term for continuous batching. A **DSL** (*Domain-Specific Language*) is an embedded programming interface for multi-step LLM workflows. **Constrained decoding** engines (`XGrammar`, `Outlines`, `llguidance`) enforce grammars on sampled tokens, and **Jump-Forward Decoding** fast-forwards deterministic schema boilerplate.
+
+---
+
 ## 1. Why Control-Plane Architecture Dictates GPU Efficiency
 
 A common misconception is that LLM serving speed is determined solely by GPU CUDA kernels (FlashAttention, FP8 GEMMs). In practice, **the CPU control plane often becomes the primary bottleneck** when running small-to-medium models (e.g., 8B on H100) or high-tensor-parallelism setups (e.g., 70B on TP=8).
