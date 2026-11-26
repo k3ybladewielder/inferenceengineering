@@ -49,10 +49,10 @@ Every processor has a fixed **transistor and power budget** (e.g., ~80–208 bil
 2. **On-Die SRAM / Caches:** L1/L2/L3 caches, register files, and scratchpad SRAMs.
 3. **Arithmetic Logic Units (ALUs):** Scalar integer/FP units, SIMD vector lanes, Tensor Cores, or Systolic Processing Elements (PEs).
 
-This single allocation choice produces three fundamentally distinct execution philosophies:
+This single allocation choice produces three fundamentally distinct execution philosophies, each matching a different part of an LLM serving stack:
 
-* **CPU (Latency-Optimized MIMD + SIMD):** Spends **~50–70%** of die area on giant L1/L2/L3 caches and complex OoO/speculative control logic, leaving **~15–25%** for ALUs. Goal: make *one* unpredictable, branch-heavy thread finish as fast as possible.
-* **GPU (Throughput-Optimized SIMT):** Strips out branch predictors and OoO schedulers, shrinks per-thread cache, and dedicates **~75–85%** of die area to thousands of ALUs/Tensor Cores and massive register files. Goal: maximize aggregate operations per second across *tens of thousands* of parallel threads.
+* **CPU (Latency-Optimized MIMD + SIMD):** Spends **~50–70%** of die area on giant L1/L2/L3 caches and complex OoO/speculative control logic, leaving **~15–25%** for ALUs. Goal: make *one* unpredictable, branch-heavy thread (like HTTP parsing, BPE tokenization, or continuous-batching scheduling) finish as fast as possible.
+* **GPU (Throughput-Optimized SIMT):** Strips out branch predictors and OoO schedulers, shrinks per-thread cache, and dedicates **~75–85%** of die area to thousands of ALUs/Tensor Cores and massive register files. Goal: maximize aggregate operations per second across *tens of thousands* of parallel threads (like `X @ W` projections and attention kernels).
 * **NPU / TPU (Dataflow / Systolic Array):** Eliminates per-operation instruction fetch/decode and general-purpose register-file traffic for dense linear algebra, wiring ALUs into a spatial grid backed by software-managed SRAM. Goal: achieve maximum **FLOP/s per Watt** and **FLOP/s per $\text{mm}^2$** on static tensor shapes.
 
 ```mermaid
@@ -98,14 +98,16 @@ A multi-core server CPU implements **MIMD (Multiple Instruction, Multiple Data)*
 
 ### 2.2 Out-of-Order (OoO) Execution Engine
 
-To extract **Instruction-Level Parallelism (ILP)** from a single sequential thread:
-* **Register Renaming (RAT $\rightarrow$ Physical Register File):** Eliminates false Write-After-Read (WAR) and Write-After-Write (WAW) hazards by mapping e.g. 16 architectural GPRs onto **200–300+ physical registers**.
-* **Reorder Buffer (ROB) & Reservation Stations (Scheduler):** Holds **250–600+ in-flight $\mu$ops**. Even if instruction `i` stalls for 300 cycles waiting on an L3/DDR5 load, independent instructions `i+1 ... i+200` execute out of order as soon as their operands are ready, retiring strictly in program order to preserve precise exceptions.
-* **Memory Disambiguation (Load/Store Queue):** Tracks speculative loads/stores so later loads can bypass earlier stores to non-overlapping addresses.
+In sequential code, one slow memory read does not mean the next 50 instructions depend on it. For example, if your code computes `a = x[0] + 1` and then `b = y[0] * 2`, `b` has zero data dependency on `a`—if `x[0]` misses L1 cache and takes 85 ns to arrive from DDR5, a naive in-order core would sit idle for ~300 cycles even if `y[0]` is already sitting in L1.
+
+To extract **Instruction-Level Parallelism (ILP)** from a single sequential thread, modern CPUs run an **Out-of-Order (OoO)** engine:
+* **Register Renaming (RAT $\rightarrow$ Physical Register File):** Software only has ~16 architectural register names (like `rax`, `rbx`), so compilers constantly reuse the same names for unrelated variables. If instruction 2 writes to `rax` while instruction 1 is still waiting to read an older value of `rax`, a naive core would have to wait. Hardware eliminates these false **WAR (Write-After-Read)** and **WAW (Write-After-Write)** name conflicts by mapping the 16 software names onto **200–300+ physical registers** via the **Register Alias Table (RAT)**.
+* **Reorder Buffer (ROB) & Reservation Stations (Scheduler):** Holds **250–600+ in-flight $\mu$ops**. Even if instruction `i` stalls for 300 cycles waiting on an L3/DDR5 load, independent instructions `i+1 ... i+200` execute out of order as soon as their inputs are ready. The ROB holds their results and **retires** them strictly in original program order so exceptions (like a segfault or divide-by-zero) always appear at the exact line that caused them.
+* **Memory Disambiguation (Load/Store Queue):** Tracks speculative loads and stores in flight so later reads can safely execute ahead of earlier writes to different memory addresses.
 
 ### 2.3 SIMD Vector Lanes (AVX-512 / AMX / NEON)
 
-Within a single core, **SIMD** executes one instruction across multiple contiguous data elements packed into wide vector registers:
+Within a single core, **SIMD** executes one instruction across multiple contiguous data elements packed into wide vector registers—this is the hardware engine behind vectorized NumPy and PyTorch CPU operations (`c = a + b` on contiguous arrays rather than a Python `for` loop):
 
 | Architecture | Vector Width | FP32 Lanes | BF16 / FP16 Lanes | INT8 Lanes | Key Inference Instructions |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -125,7 +127,7 @@ A GPU is organized into dozens or hundreds of **Streaming Multiprocessors (SMs)*
 
 ### 3.1 SIMT vs. SIMD: Warp Lockstep & Divergence Masking
 
-In CPU SIMD, the *programmer* explicitly packs 16 floats into one `__m512` register inside 1 thread. In GPU SIMT, the *programmer* writes scalar-looking code for **1 logical thread**, and the hardware groups **32 consecutive threads into a Warp** (NVIDIA) or **64 threads into a Wavefront** (AMD RDNA/CDNA):
+In CPU SIMD, the *programmer* or compiler explicitly packs 16 floats into one `__m512` register inside 1 thread. In GPU **SIMT**, the *programmer* writes scalar-looking code for **1 logical thread** (for example, computing a single output element `idx = threadIdx.x + blockIdx.x * blockDim.x` in a CUDA kernel), and the hardware automatically groups **32 consecutive threads into a Warp** (NVIDIA) or **64 threads into a Wavefront** (AMD RDNA/CDNA):
 
 * **Individual State, Shared Fetch:** Every thread in a warp has its own private 32-bit registers and predicate state, while all 32 threads share a single instruction fetch/decode unit and execute the **same instruction in lockstep** (or via Independent Thread Scheduling on Volta+ architectures, where each thread maintains its own PC and call stack, still scheduled at warp granularity).
 * **Active Execution Mask (32-bit):** Every warp maintains a 32-bit active mask. Suppose a kernel runs:
@@ -161,9 +163,9 @@ Because of **zero-cycle hardware context switching across oversubscribed warps**
 
 ## 4. NPU / TPU Execution Model: Systolic Arrays & Dedicated Dataflow
 
-Even on a GPU, every scalar/vector instruction still pays an **instruction fetch + decode + register-file read + register-file write** energy tax ("von Neumann bottleneck"). Reading two FP16 operands from a large SRAM register file and writing the result back costs **~10x–30x more energy** than the FP16 MAC itself!
+Even on a GPU, every scalar or vector instruction still pays an **instruction fetch + decode + register-file read + register-file write** energy tax ("von Neumann bottleneck"). Every time a CUDA core computes `c = a * b + c`, it must read `a`, `b`, and `c` from a large central SRAM register file and write the new `c` back—moving operands across register-file wires costs **~10x–30x more energy** than the FP16 MAC itself!
 
-**Neural Processing Units (NPUs)**—such as Google TPUs (MXU), AWS Inferentia/Trainium, Apple Neural Engine, or spatial accelerators like Groq TSP—attack this energy and area overhead using **2D Systolic Arrays** and **dedicated dataflow**.
+**Neural Processing Units (NPUs)**—such as Google TPUs (MXU), AWS Inferentia/Trainium, Apple Neural Engine, or spatial accelerators like Groq TSP—attack this energy and area overhead using **2D Systolic Arrays** and **dedicated dataflow**, passing operands directly from math unit to math unit like a bucket brigade without touching a central register file between every multiply-add.
 
 ### 4.1 Anatomy of a Systolic Array
 

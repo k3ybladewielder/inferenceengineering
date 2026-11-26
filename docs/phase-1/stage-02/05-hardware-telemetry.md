@@ -35,7 +35,7 @@ Every technical term, acronym, hardware counter, and inference concept used in t
 
 ## 1. Telemetry Tiers: NVML (`nvidia-smi`) vs. DCGM Profiling Counters
 
-Diagnosing LLM serving bottlenecks in production requires distinguishing **coarse OS/driver presence metrics** from **cycle-accurate silicon Performance Monitoring Counters (PMCs)**:
+When a PyTorch or vLLM service runs slowly, the first instinct is often to run `nvidia-smi`. However, `nvidia-smi` only queries high-level OS driver state—it cannot see inside the SMs, Tensor Cores, or HBM buses. Diagnosing LLM serving bottlenecks in production requires distinguishing **coarse OS/driver presence metrics** from **cycle-accurate silicon Performance Monitoring Counters (PMCs)**:
 
 | Tool / Layer | Underlying Mechanism | Overhead | Key Signals | Blind Spots |
 | :--- | :--- | :--- | :--- | :--- |
@@ -56,7 +56,7 @@ Running `nvidia-smi dmon -s pucvmet -d 1` produces a live table:
 ```
 
 **Why `sm = 100%` (`GPU-Util`) Is Dangerous for LLM Engineers:**
-In NVML, `GPU-Util` (`sm` column in `dmon`) is defined strictly as:
+In NVML, `GPU-Util` (`sm` column in `dmon`) does **not** measure how many of the GPU's 132 SMs or 528 Tensor Cores are doing useful work. It is defined strictly as a binary time-presence check:
 
 $$\text{GPU-Util} = \frac{\text{Time during sample window with } \ge 1 \text{ active kernel on GPU}}{\text{Total sample window duration}} \times 100\%$$
 
@@ -70,7 +70,7 @@ $$\text{GPU-Util} = \frac{\text{Time during sample window with } \ge 1 \text{ ac
 
 ## 3. Exact Definitions of DCGM Profiling Metrics (`dcgmi dmon`)
 
-Data Center GPU Manager (DCGM) exposes true silicon activity through **Profiling Field IDs** (`1001+`), sampled directly from GPU hardware performance counters via `dcgmi dmon -e 1001,1002,1003,1004,1005,1009,1010,1011,1012 -d 500`:
+To see what the silicon is actually doing, Data Center GPU Manager (DCGM) reads hardware **Performance Monitoring Counters (PMCs)**—dedicated cycle-counting circuits wired directly into the SMs, Tensor Cores, HBM memory controllers, and NVLink ports—via low-overhead OS driver IOCTL calls. DCGM exposes true silicon activity through **Profiling Field IDs** (`1001+`), sampled via `dcgmi dmon -e 1001,1002,1003,1004,1005,1009,1010,1011,1012 -d 500`:
 
 | Metric Name | DCGM Field ID & Symbol | Exact Hardware Formula | Physical Meaning & Diagnostic Range |
 | :--- | :--- | :--- | :--- |

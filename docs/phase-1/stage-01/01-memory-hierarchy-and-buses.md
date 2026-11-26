@@ -59,21 +59,25 @@ This document explains why moving data—not performing math—is the primary bo
 
 ## 1. First Principles: Why Memory Dominates Compute
 
-Modern silicon has evolved asymmetrically. Arithmetic Logic Units (ALUs) and Tensor Cores scale rapidly with transistor density (Moore's Law / Dennard post-scaling), whereas moving electrons off-die across package pins, PCB traces, and PCIe connectors is constrained by signal integrity, capacitance, pin count, and speed-of-light propagation (~$15\text{ cm/ns}$ in FR-4 PCB dielectric).
+In PyTorch, writing `y = x @ W` or calling `model.to("cuda")` looks like a single, uniform operation. Under the hood, however, modern server hardware is radically asymmetric: **performing arithmetic is extraordinarily cheap and fast, while moving numbers to the arithmetic units is slow and energy-intensive**.
+
+Arithmetic Logic Units (ALUs) and GPU Tensor Cores live directly inside the silicon die and scale with transistor density (Moore's Law). By contrast, moving electrical signals *off* the silicon die—through microscopic package pins, across copper traces on a fiberglass Printed Circuit Board (PCB), and through PCIe edge connectors—is constrained by electrical capacitance, signal integrity (high-frequency noise), limited pin counts, and the physical speed of electricity in copper (~$15\text{ cm/ns}$ in FR-4 PCB dielectric).
 
 Consequently, **data movement costs orders of magnitude more time and energy than arithmetic**:
 
-* A single FP16 Multiply-Accumulate (MAC) in 5nm–7nm silicon consumes **~0.2–0.9 pJ** and completes in **1 clock cycle** (~0.25–0.5 ns).
-* Reading that operand from off-chip DDR5 DRAM consumes **~300–600 pJ** and takes **70–100 ns** (equivalent to ~300–400 CPU clock cycles).
-* Fetching it from an NVMe SSD consumes **microjoules** and takes **10–80 $\mu$s** (~50,000–300,000 CPU clock cycles).
+* A single FP16 Multiply-Accumulate (MAC, $a \times b + c$) in 5nm–7nm silicon consumes **~0.2–0.9 pJ** and completes in **1 clock cycle** (~0.25–0.5 ns).
+* Reading that operand from off-chip DDR5 DRAM (system RAM) consumes **~300–600 pJ** and takes **70–100 ns** (equivalent to ~300–400 CPU clock cycles where the math unit would otherwise sit idle).
+* Fetching it from an NVMe SSD consumes **microjoules** (millions of picojoules) and takes **10–80 $\mu$s** (~50,000–300,000 CPU clock cycles).
 
-To bridge this 5-order-of-magnitude gap between compute speed and storage latency, computer architectures implement a strict **memory hierarchy** governed by the principles of **temporal locality** (recently accessed addresses are likely to be accessed again soon) and **spatial locality** (addresses adjacent to recently accessed addresses are likely to be accessed soon).
+To bridge this 5-order-of-magnitude gap between compute speed and storage latency, computer architectures implement a strict **memory hierarchy**: a pyramid of progressively larger, slower memory tiers. This hierarchy only works because real programs exhibit **temporal locality** (if your code reads a tensor element or loop counter now, it will likely read it again soon) and **spatial locality** (if your code reads `tensor[i]`, it will likely read `tensor[i+1]` next). Hardware exploits both patterns automatically by keeping recently used data and its neighbors in tiny, ultra-fast on-chip **SRAM caches** right next to the ALUs.
 
 ---
 
 ## 2. Quantitative Anatomy of the Memory Hierarchy
 
-The table below gives concrete hardware metrics representative of modern server platforms (e.g., dual-socket AMD EPYC Genoa/Turin or Intel Xeon Emerald/Granite Rapids paired with PCIe Gen4/Gen5 GPUs and NVMe drives):
+The table below gives concrete hardware metrics representative of modern server platforms (e.g., dual-socket AMD EPYC Genoa/Turin or Intel Xeon Emerald/Granite Rapids paired with PCIe Gen4/Gen5 GPUs and NVMe drives). As you read from top to bottom, notice the fundamental trade-off: **capacity grows by 9+ orders of magnitude (from kilobytes to terabytes), while latency worsens by 5 orders of magnitude (from sub-nanosecond to tens of microseconds) and bandwidth shrinks**.
+
+Notice also the rightmost column, **Management / Unit of Transfer**. In Python or PyTorch, you think in terms of a single `float32` (4 bytes) or an arbitrary tensor slice. Hardware never moves 4 bytes at a time across off-chip buses—it moves fixed-size blocks (64-byte cache lines, 4 KB OS pages, or 128 KB SSD bursts) to amortize control overhead.
 
 | Tier | Typical Capacity | Access Latency (Cycles / Wall Time) | Sustained Bandwidth | Management / Unit of Transfer |
 | :--- | :--- | :--- | :--- | :--- |
@@ -117,27 +121,29 @@ flowchart TD
 
 ## 3. CPU Caches & 64-Byte Cache Line Mechanics
 
-Caches do **not** track individual bytes or 4-byte floats; the tag overhead would dwarf the stored data. Instead, x86-64 and server ARM64 CPUs manage memory in **64-byte cache lines** (note: Apple Silicon M-series uses 128-byte cache lines).
+When your code reads a single 4-byte `float32` from a NumPy array or PyTorch CPU tensor, the CPU does **not** fetch 4 bytes from RAM. Tracking individual bytes in hardware caches would require more memory for address metadata ("tags") than for the actual numbers. Instead, x86-64 and server ARM64 CPUs manage cache memory in fixed **64-byte chunks** called **cache lines** (note: Apple Silicon M-series uses 128-byte cache lines). A 64-byte cache line holds 16 `float32` values or 32 `bf16` values at once—which is why iterating contiguously along the last dimension of a row-major tensor (`x[i, :]`) is dramatically faster than striding down a column (`x[:, j]`).
 
 ### 3.1 Physical Address Decomposition
 
-For a 64-byte cache line, the lowest 6 bits of every physical address specify the byte offset within the line ($2^6 = 64$):
+To find out whether a requested memory address is already sitting in L1d cache without scanning every slot one by one, the hardware splits every 64-bit physical address into three bit fields. For a 64-byte cache line, the lowest 6 bits specify the byte offset within the line ($2^6 = 64$):
 
 $$\text{Physical Address} = [\underbrace{\text{Tag}}_{\text{remaining upper bits}} \mid \underbrace{\text{Set Index}}_{\log_2(\text{Sets})\text{ bits}} \mid \underbrace{\text{Byte Offset}}_{6\text{ bits}}]$$
 
-Consider a classic **32 KB, 8-way set-associative L1d cache** with 64-byte lines:
+Consider a classic **32 KB, 8-way set-associative L1d cache** with 64-byte lines (meaning the cache is divided into "sets", and each set holds 8 candidate cache lines):
 * Total lines: $\frac{32,768}{64} = 512$ lines.
 * Number of sets: $\frac{512}{8\text{-way}} = 64$ sets $\implies 6$ bits for Set Index (bits 6–11).
 * Offset bits: 6 bits (bits 0–5).
-* Notice that bits 0–11 ($6 + 6 = 12$ bits = 4 KB) fit entirely inside a **4 KB virtual memory page**! This allows L1d to be **VIPT (Virtually Indexed, Physically Tagged)**: the hardware indexes the L1 sets using virtual address bits `[11:6]` *in parallel* with the TLB lookup for the physical tag `[47:12]`, hiding TLB latency on an L1 hit.
+* Notice that bits 0–11 ($6 + 6 = 12$ bits = 4 KB) fit entirely inside a **4 KB virtual memory page**! Because virtual-to-physical address translation only changes the upper page-number bits (bits 12 and above) and leaves bits `[11:0]` untouched, L1d can be **VIPT (Virtually Indexed, Physically Tagged)**: the hardware indexes the L1 sets using virtual address bits `[11:6]` *in parallel* with the TLB lookup for the physical tag `[47:12]`, hiding translation delay on an L1 hit.
 
 ### 3.2 What Happens on a Cache Miss
 
-1. **Coalesced Fill (Critical-Word-First):** If a core reads 4 bytes at offset 24 and misses L1/L2/L3, the memory controller fetches the **entire 64-byte aligned block** (`addr & ~0x3F`). DDR5 bursts 64 bytes per transaction (in DDR5, each sub-channel is 32 bits + 8 ECC bits wide with a burst length of 16, yielding $32\text{ bits} \times 16 / 8 = 64\text{ bytes}$ per independent sub-channel!). The requested 8-byte word is forwarded immediately to the core ("critical word first") while the remaining 56 bytes populate the Line Fill Buffer (LFB).
-2. **Spatial Utilization Penalty:** If a poorly structured scheduler scans an array of 128-byte structs only reading a single 4-byte `status` flag per struct, **96.875% of the fetched DRAM bandwidth is wasted** ($4 / 64$ bytes used, or $4 / 128$ if strided).
-3. **Hardware Prefetchers:** Stream and stride prefetchers monitor consecutive L1/L2 misses (e.g., `addr`, `addr+64`, `addr+128`) and speculatively issue reads ahead of execution. Linked-list / pointer-chasing data structures (such as naive Python object graphs or unbalanced trees) defeat hardware prefetchers, exposing the full ~80–100 ns DRAM latency on every hop.
-4. **Coherence Protocol (MESI / MOESI):** Every core's private L1/L2 caches maintain global coherence at **64-byte granularity**. A write to a single byte on Core 0 requires invalidating that entire 64-byte line in Core 1–63 via RFO (Read-For-Ownership), causing severe latency spikes if threads share adjacent variables (**false sharing**, detailed in [04 — C/C++ and Rust on the Hot Path](./04-c-cpp-and-rust-on-the-hot-path.md)).
-5. **Non-Temporal Stores:** When copying gigabytes of weights or zeroing large buffers that will not be read immediately by the CPU, standard stores pollute L1/L2/L3 caches (Read-For-Ownership pulls the old 64B line from RAM just to overwrite it). Non-temporal instructions (`MOVNTDQ` / `VMOVNTDQ`) write directly to Write-Combining (WC) buffers and flush full 64B lines to RAM without cache pollution.
+When the requested address's tag is not found in L1d, L2, or L3, a **cache miss** occurs and the hardware triggers a multi-step recovery sequence:
+
+1. **Coalesced Fill (Critical-Word-First):** If a core reads 4 bytes at offset 24 and misses L1/L2/L3, the memory controller fetches the **entire 64-byte aligned block** (`addr & ~0x3F`). DDR5 bursts 64 bytes per transaction (in DDR5, each sub-channel is 32 bits + 8 ECC bits wide with a burst length of 16, yielding $32\text{ bits} \times 16 / 8 = 64\text{ bytes}$ per independent sub-channel!). The requested 8-byte word is forwarded immediately to the core ("critical word first") so the stalled instruction can resume, while the remaining 56 bytes populate the Line Fill Buffer (LFB).
+2. **Spatial Utilization Penalty:** Because every miss transfers 64 bytes regardless of how many bytes you use, memory layout dictates effective bandwidth. If a poorly structured scheduler scans an array of 128-byte structs only reading a single 4-byte `status` flag per struct, **96.875% of the fetched DRAM bandwidth is wasted** ($4 / 64$ bytes used, or $4 / 128$ if strided). This is the hardware reason why **Structure-of-Arrays (SoA)** layouts—storing each field in its own contiguous array, just like columnar DataFrames or PyTorch tensors—outperform **Array-of-Structures (AoS)** layouts.
+3. **Hardware Prefetchers:** Stream and stride prefetchers inside each core watch consecutive L1/L2 misses (e.g., `addr`, `addr+64`, `addr+128`) and speculatively issue DRAM reads *ahead* of program execution, hiding the 80 ns latency. By contrast, **pointer chasing**—following memory addresses scattered across the heap, such as traversing a Python `list` of dicts, a linked list, or an unbalanced tree—is unpredictable and defeats hardware prefetchers, exposing the full ~80–100 ns DRAM latency on every single hop.
+4. **Coherence Protocol (MESI / MOESI):** Every core's private L1/L2 caches maintain a single consistent view of memory across all cores at **64-byte granularity**. A write to a single byte on Core 0 requires invalidating that entire 64-byte line in Cores 1–63 via **RFO (Read-For-Ownership)**, causing severe latency spikes if threads share adjacent variables (**false sharing**, detailed in [04 — C/C++ and Rust on the Hot Path](./04-c-cpp-and-rust-on-the-hot-path.md)).
+5. **Non-Temporal Stores:** When copying gigabytes of model weights or zeroing large buffers that the CPU will not read again soon, normal writes pollute L1/L2/L3 caches (an RFO first pulls the old 64B line from RAM into cache just to overwrite it, evicting hot data). Non-temporal instructions (`MOVNTDQ` / `VMOVNTDQ`) bypass caches completely, buffering writes in **Write-Combining (WC) buffers** and flushing full 64B lines straight to RAM.
 
 ---
 
@@ -158,19 +164,21 @@ Concrete server configurations:
 
 ### 4.2 DRAM Row-Buffer Mechanics (Why Random Access Is Slow)
 
-A DRAM chip is organized into **Channels $\rightarrow$ Ranks $\rightarrow$ Bank Groups $\rightarrow$ Banks $\rightarrow$ 2D Rows (Pages, typically 8–16 KB) $\times$ Columns**.
-1. **Row-Buffer Hit:** The target row is already open in the bank's sense amplifiers. Only `CAS` (Column Address Strobe, `tCL`) is needed: **~14–20 ns**.
-2. **Row-Buffer Miss (Closed/Conflict):** The active row must be written back (`PRECHARGE`, `tRP`), the new row opened (`ACTIVATE`, `tRCD`), and then column read (`tCL`): **~45–60 ns** DRAM-internal + memory controller queueing + PHY/uncore traversal = **70–100 ns** observed by a CPU core.
+Unlike SRAM (which acts like a flat lookup table), DRAM stores each bit in a microscopic capacitor that drains slightly when read. To read a single 64-byte cache line, the memory controller must first copy an entire **8–16 KB row** into a row of **sense amplifiers** (called the **row buffer**), which amplifies the tiny capacitor voltages into clean 0s and 1s.
+
+A DRAM chip is therefore organized hierarchically into **Channels $\rightarrow$ Ranks $\rightarrow$ Bank Groups $\rightarrow$ Banks $\rightarrow$ 2D Rows (Pages, typically 8–16 KB) $\times$ Columns**. Depending on whether the target row is already open in the sense amplifiers, a read takes two very different paths:
+1. **Row-Buffer Hit:** The target row is already open in the bank's sense amplifiers (typical during sequential tensor scans). Only `CAS` (Column Address Strobe, `tCL`) is needed to select the column: **~14–20 ns**.
+2. **Row-Buffer Miss (Closed/Conflict):** A different row is currently open. The memory controller must first write the old row back to its capacitors (`PRECHARGE`, `tRP`), open the new row into the sense amplifiers (`ACTIVATE`, `tRCD`), and then read the column (`tCL`): **~45–60 ns** DRAM-internal + memory controller queueing + PHY/uncore traversal = **70–100 ns** observed by a CPU core.
 
 ---
 
 ## 5. PCIe Gen4 / Gen5 Bandwidth & Protocol Overhead
 
-Peripheral Component Interconnect Express (PCIe) is a **point-to-point, full-duplex serial interconnect** composed of $N$ bidirectional differential pairs called **lanes** (x1, x4, x8, x16).
+When you call `tensor.to("cuda")` in PyTorch, the tensor travels from system DDR5 RAM, through the CPU's **Root Complex (RC)**, across the **PCIe (Peripheral Component Interconnect Express)** slot on the motherboard, and into the GPU's memory. PCIe is a **point-to-point, full-duplex serial interconnect**: instead of sending 64 bits side-by-side in parallel (which suffers from wire-to-wire timing skew at high speeds), PCIe sends bits serially at multi-gigahertz speeds over $N$ independent bidirectional wire pairs called **lanes** (x1, x4, x8, x16).
 
 ### 5.1 GT/s, Encoding Overhead (`128b/130b`), and Raw Link Bandwidth
 
-Raw signaling speed is expressed in **GT/s (Gigatransfers per second)**—the number of raw bits transmitted per lane per second, *including* physical-layer line-coding overhead.
+Raw signaling speed is expressed in **GT/s (Gigatransfers per second)**—the number of raw bits transmitted per lane per second, *including* physical-layer line-coding overhead. Because PCIe does not send a separate clock wire alongside the data wires, the receiver must extract the clock timing directly from voltage transitions in the data stream itself; long runs of identical `0`s or `1`s would cause the receiver's clock to drift. Line coding guarantees frequent transitions:
 
 * **PCIe Gen1 / Gen2** used `8b/10b` encoding (20% overhead: 10 bits sent for 8 bits of payload).
 * **PCIe Gen3, Gen4, and Gen5** use **`128b/130b` encoding**: every 128 payload bits are prefixed with a 2-bit sync header (`01` for Data Block, `10` for Ordered Set) to ensure clock recovery and DC balance.
@@ -217,13 +225,13 @@ NVMe (Non-Volatile Memory Express) attaches directly to PCIe lanes (typically **
 
 ## 7. Access Latency vs. Throughput & Little's Law
 
-Engineers frequently conflate **latency** (time for one operation to complete, $L$) and **throughput/bandwidth** (rate of bytes transferred per second, $B$). A system can have terrible latency and massive bandwidth simultaneously (a truck full of NVMe drives driving down the highway).
+Engineers frequently conflate **latency** (time for one operation to complete, $L$) and **throughput/bandwidth** (rate of bytes transferred per second, $B$). A system can have terrible latency and massive bandwidth simultaneously: a cargo truck full of NVMe drives driving down the highway has a 10-hour latency, yet delivers petabytes per day.
 
 **Little's Law** provides the exact mathematical bridge linking bandwidth, latency, and the **concurrency (bytes in flight)** required to saturate any hardware link:
 
 $$\text{Concurrency (Bytes in Flight)} = \text{Bandwidth (Bytes/s)} \times \text{Latency (s)}$$
 
-To achieve 100% of a bus or memory tier's bandwidth, the requester must keep at least $B \times L$ bytes simultaneously outstanding (pipelined) in hardware queues.
+To achieve 100% of a bus or memory tier's bandwidth, the requester must keep at least $B \times L$ bytes simultaneously outstanding (pipelined) in hardware queues. If your code issues one read, waits for it to finish, and only then issues the next read (synchronous execution), bandwidth collapses to $\frac{\text{Request Size}}{L}$ regardless of how wide the bus is—the same reason PyTorch `DataLoader(num_workers=0)` starves a GPU while `num_workers=8` with `pin_memory=True` keeps the pipeline full.
 
 ### Concrete Little's Law Calculations
 

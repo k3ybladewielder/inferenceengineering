@@ -38,7 +38,7 @@ Every technical term, acronym, hardware unit, and numeric format used in this gu
 
 ## 1. CUDA Cores vs. Tensor Cores: Architectural Divide
 
-Every Streaming Multiprocessor (SM) contains two fundamentally distinct classes of arithmetic hardware:
+In PyTorch, a Transformer layer runs two very different kinds of math: dense matrix multiplications (`nn.Linear` projections for `QKV`, `O`, and `FFN` blocks) and elementwise or reduction operations (`SiLU`, `RMSNorm`, `Softmax`, `RoPE`). Inside every Streaming Multiprocessor (SM), NVIDIA provides two fundamentally distinct classes of arithmetic hardware matched to those two workloads:
 
 1. **CUDA Cores (Scalar ALU Pipelines — FP32, INT32, FP64):**
    Execute one scalar instruction per thread lane per cycle—typically **FMA (Fused Multiply-Add)** `FFMA`:
@@ -56,7 +56,7 @@ Every Streaming Multiprocessor (SM) contains two fundamentally distinct classes 
 
 ### Why Tensor Cores Deliver $15\times$–$30\times+$ More FLOPs than CUDA Cores
 
-A naive scalar FP32 CUDA Core executing a $16 \times 16 \times 16$ GEMM ($2 \times 16^3 = 8192$ FLOPs) must issue $4096$ `FFMA` instructions, reading $3 \times 4096 = 12,288$ register operands and writing $4096$ results back to the register file—**saturating instruction issue bandwidth and register file read ports** before compute can scale.
+A natural question is why NVIDIA cannot simply add $16\times$ more scalar CUDA Cores instead of building specialized Tensor Cores. The answer is the **Von Neumann / Register-File Bottleneck**: a naive scalar FP32 CUDA Core executing a $16 \times 16 \times 16$ GEMM ($2 \times 16^3 = 8192$ FLOPs) must issue $4096$ `FFMA` instructions, reading $3 \times 4096 = 12,288$ register operands and writing $4096$ results back to the register file—**saturating instruction issue bandwidth and register file read ports** before compute can scale. Simply put, the wires feeding the scalar ALUs run out of bandwidth long before the silicon runs out of transistors.
 
 Tensor Cores break this **Von Neumann / Register-File Bottleneck** via spatial hardware dataflow (dot-product trees / systolic-style array datapaths):
 1. **Hardware Operand Reuse:** Matrix tiles $A_{M \times K}$ and $B_{K \times N}$ are loaded *once* into internal Tensor Core operand buffers and broadcast horizontally/vertically across an array of multiplier-adder trees. Reading $O(MK + KN)$ bytes triggers $O(MNK)$ MAC operations.
@@ -143,13 +143,13 @@ sequenceDiagram
 
 ## 3. Accumulation Precision & Hardware Rounding Subtleties
 
-In Transformer linear layers (`QKV`, `O`, `FFN`), inner dimensions $K$ range from $4096$ to $16384+$. Computing dot products of length $K$ entirely in low precision causes severe numerical failure:
+In Transformer linear layers (`QKV`, `O`, `FFN`), a single output neuron computes a dot product across hidden dimensions $K$ ranging from $4096$ to $16384+$. If you call `torch.matmul` on `float16` tensors, you might assume the entire dot product happens in 16-bit arithmetic. In reality, computing dot products of length $K$ entirely in low precision causes severe numerical failure:
 
-1. **Swamping (Absorption):** In FP16 (10 mantissa bits, unit roundoff $\epsilon \approx 2^{-11} \approx 4.88 \times 10^{-4}$), once a running partial sum reaches $S = 2048$, its ULP (Unit in the Last Place) becomes $2048 \times 2^{-10} = 2.0$. Any subsequent product $< 1.0$ rounds completely to zero and disappears!
+1. **Swamping (Absorption):** Floating-point numbers have a fixed number of precision bits (mantissa). As a running sum grows larger, the gap between adjacent representable numbers (**ULP**, Unit in the Last Place) widens. In FP16 (10 mantissa bits, unit roundoff $\epsilon \approx 2^{-11} \approx 4.88 \times 10^{-4}$), once a running partial sum reaches $S = 2048$, its ULP becomes $2048 \times 2^{-10} = 2.0$. Any subsequent product $< 1.0$ rounds completely to zero and disappears!
 2. **Overflow:** FP16 saturates at $\pm 65,504$; summing thousands of positive products easily overflows to `Inf`/`NaN`.
 
 **Hardware Solution — Mixed-Precision Accumulation:**
-Tensor Cores multiply low-precision inputs ($A_{\text{FP16/BF16/FP8}} \times B_{\text{FP16/BF16/FP8}}$) and accumulate into **FP32 accumulators** (24-bit significand, max $\sim 3.4 \times 10^{38}$), returning FP32 $D$ (which is only downcast to BF16/FP8 at the epilogue after bias/residual/activation fusion).
+Tensor Cores solve this by separating input storage precision from internal summation precision: they multiply low-precision inputs ($A_{\text{FP16/BF16/FP8}} \times B_{\text{FP16/BF16/FP8}}$) and accumulate into **FP32 accumulators** (24-bit significand, max $\sim 3.4 \times 10^{38}$), returning FP32 $D$ (which is only downcast to BF16/FP8 at the epilogue after bias/residual/activation fusion).
 
 > **Important Hopper FP8 Accumulation Caveat:** While Hopper's `wgmma` for FP8 exposes an `f32` accumulator output to software, hardware engineers (and empirical benchmarks such as DeepSeek-V3) discovered that Hopper's FP8 Tensor Core internal dot-product adder tree uses **reduced intermediate mantissa width (~14 bits / ~FP22-equivalent precision)** during the $K=32$ reduction step before promoting to FP32! Over very long $K$ accumulations, this introduces subtle ~14-bit rounding drift unless software periodically promotes intermediate partial sums to true FP32 CUDA-core registers every $K_{\text{block}} = 128$ elements. Blackwell's 5th-gen Tensor Cores restore full-precision accumulation paths.
 
@@ -177,7 +177,7 @@ $$\text{Normal Value} = (-1)^S \times 2^{\text{exp} - b} \times \left(1 + \frac{
 ### FP4 (E2M1) & Microscaling (MXFP4 / NVFP4)
 A raw 4-bit `E2M1` value has only $16$ bit patterns total—encoding strictly the $8$ positive magnitudes:
 $$\{0,\; 0.5,\; 1.0,\; 1.5,\; 2.0,\; 3.0,\; 4.0,\; 6.0\}$$
-and their negatives. Applying a single per-tensor scale to FP4 destroys model perplexity because outlier channels crush 99% of weights into `0` or `0.5`.
+and their negatives. In LLMs, weight matrices and activations frequently contain a few large "outlier" channels (e.g., magnitudes of $10$–$100$) alongside millions of small values (around $0.01$–$0.5$). Applying a single per-tensor scale factor to map an entire `[4096, 4096]` matrix into $[-6.0, +6.0]$ forces the scale to accommodate the outlier, crushing 99% of normal weights into `0` or `0.5` and destroying model perplexity.
 
 Modern silicon solves this in hardware via **Microscaling (Block-Scaled FP4)**:
 1. **MXFP4 (OCP Microscaling Standard, Blackwell 5th-Gen Tensor Core):**

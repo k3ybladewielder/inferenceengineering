@@ -28,7 +28,7 @@ Each concept below is ordered so later definitions build only on earlier ones:
 
 ## 1. Per-Layer Operation Anatomy: Exact FLOPs and HBM Bytes Moved
 
-A single Transformer decoder layer is not a uniform matrix multiply; it is a pipeline of five structurally distinct stages whose arithmetic intensities differ by **three orders of magnitude**. Let:
+A single Transformer decoder layer is not a uniform matrix multiply; it is a pipeline of five structurally distinct stages whose arithmetic intensities differ by **three orders of magnitude**. From a PyTorch perspective, even though `QKV`, `Attention`, `Out`, and `FFN` all execute inside the same `forward()` method, some stages perform heavy matrix multiplications that reuse loaded data hundreds of times, while others (like `RMSNorm`, `RoPE`, and Decode Attention) stream huge tensors from HBM just to perform a few arithmetic operations per element. Let:
 * $B$: Batch size; $S_p$: Prefill tokens per sequence; $S_{\text{ctx}}$: Cached KV context length per sequence during Decode.
 * $M$: Active tokens in the forward pass ($M = B \cdot S_p$ in Prefill; $M = B$ in Decode).
 * $d$: Model hidden dimension ($d_{\text{model}} = n_q \cdot d_h$).
@@ -72,7 +72,7 @@ A single Transformer decoder layer is not a uniform matrix multiply; it is a pip
 5. **Elementwise & Reduction Ops (RMSNorm, RoPE, Residual Adds, SiLU):**
    * **FLOPs:** $\sim 4\text{--}8$ ops per scalar element ($O(M d)$).
    * **Bytes Moved:** Reads and writes full activation tensors ($2 b M d$ per unfused kernel).
-   * **Arithmetic Intensity:** **$I \approx 0.5\text{ to }2.0\text{ FLOPs/B}$ in BOTH Prefill and Decode!** Even during massive Prefills, unfused RMSNorm/RoPE/Residual kernels hit the HBM bandwidth wall—which is why operator fusion (Stage 8) fuses them into adjacent kernels.
+   * **Arithmetic Intensity:** **$I \approx 0.5\text{ to }2.0\text{ FLOPs/B}$ in BOTH Prefill and Decode!** Even during massive Prefills, unfused RMSNorm/RoPE/Residual kernels hit the HBM bandwidth wall because they read an entire activation tensor from HBM, perform only a handful of elementwise operations on each number, and write it right back—which is why operator fusion (Stage 8) merges them into adjacent kernels so the data never leaves fast SRAM.
 
 ```mermaid
 flowchart LR
@@ -101,7 +101,7 @@ flowchart LR
 
 $$\text{MFU} = \frac{\text{Achieved Model FLOP/s}}{\text{Peak Hardware FLOP/s}} = \frac{\text{FLOPs}_{\text{model\_forward}}}{\Delta t_{\text{measured}} \times F_{\text{peak}}}$$
 
-* **Why "Model FLOPs" instead of "Hardware FLOPs" (HFU)?** If a kernel performs redundant work—such as recomputing $Q K^T$ tiles, zero-padding ragged batches, or executing un-masked upper-triangular attention entries—**Hardware FLOPs Utilization (HFU)** counts wasted math as "productive," whereas **MFU** credits strictly the minimum mathematical FLOPs required by the model architecture.
+* **Why "Model FLOPs" instead of "Hardware FLOPs" (HFU)?** If you pad a batch of unequal-length prompts to a uniform rectangular tensor (`torch.nn.utils.rnn.pad_sequence`), the GPU's Tensor Cores will dutifully multiply all those zero-padded tokens. Similarly, a naive attention kernel computes the entire $N \times N$ score matrix and only masks out the upper triangle afterward. **Hardware FLOPs Utilization (HFU)** counts all of that wasted math as "productive," whereas **MFU** credits strictly the minimum mathematical FLOPs required by the actual unpadded tokens and causal triangle.
 * **$F_{\text{peak}}$ Precision Matching:** Always match $F_{\text{peak}}$ to the active Tensor Core datatype (e.g., on H100 SXM5: $989.4\text{ TFLOP/s}$ for BF16/FP16; $1{,}978.9\text{ TFLOP/s}$ for FP8—excluding 2:4 structured sparsity unless sparsity is actually enabled).
 
 ### 2.2 Model Bandwidth Utilization (MBU)

@@ -36,7 +36,7 @@ During Prefill (or training), Self-Attention takes matrices $Q, K, V \in \mathbb
 
 $$S = \frac{Q K^T}{\sqrt{d_{\text{head}}}} \in \mathbb{R}^{N \times N}, \qquad P = \text{softmax}(S + M_{\text{causal}}) \in \mathbb{R}^{N \times N}, \qquad O = P V \in \mathbb{R}^{N \times d_{\text{head}}}$$
 
-This formulation creates **two distinct quadratic bottlenecks** as sequence length $N$ grows:
+In standard PyTorch (`scores = (Q @ K.transpose(-2, -1)) / math.sqrt(d_h); P = torch.softmax(scores + mask, dim=-1); O = P @ V`), each line launches a separate GPU kernel that reads inputs from **HBM** (off-chip VRAM) and writes the full intermediate tensor back to HBM. This creates **two distinct quadratic bottlenecks** as sequence length $N$ grows:
 
 1. **Quadratic Compute ($O(N^2 d)$ FLOPs):**
    * $Q K^T$ requires $2 N^2 d_{\text{head}}$ FLOPs per head.
@@ -46,7 +46,7 @@ This formulation creates **two distinct quadratic bottlenecks** as sequence leng
    * Even with $O(N)$ memory algorithms, exact attention **compute remains $O(N^2)$** (which is why Prefill TTFT scales quadratically once $N$ becomes very large, e.g., $128\text{k}\to 1\text{M}$).
 
 2. **Quadratic HBM Memory Materialization ($O(N^2)$ Bytes):**
-   * Standard ("naive") attention executes three separate kernels:
+   * Standard ("naive") attention executes three separate kernels, forcing the GPU to allocate and write two massive `[B, n_q, N, N]` score matrices in HBM even though the final output $O$ is only `[B, n_q, N, d_head]`:
      1. GEMM writes $S \in \mathbb{R}^{B \times n_q \times N \times N}$ to HBM.
      2. Softmax reads $S$ from HBM and writes $P \in \mathbb{R}^{B \times n_q \times N \times N}$ to HBM.
      3. GEMM reads $P$ and $V$ from HBM and writes $O$ to HBM.
@@ -60,9 +60,9 @@ This formulation creates **two distinct quadratic bottlenecks** as sequence leng
 
 **FlashAttention** (Dao et al., 2022/2023) eliminates the $O(N^2)$ HBM allocation completely, reducing HBM attention memory to **$O(N)$** while computing the **exact** mathematical attention output (zero approximation).
 
-It accomplishes this by fusing $QK^T$, masking, softmax, and $PV$ into a single kernel that partitions $Q$ into row blocks of size $B_r$ and $K, V$ into column blocks of size $B_c$ inside fast on-chip **SRAM (Shared Memory, ~228 KB/SM on H100)**—never writing $S$ or $P$ to HBM.
+It accomplishes this by fusing $QK^T$, masking, softmax, and $PV$ into a **single GPU kernel** that partitions $Q$ into row blocks of size $B_r$ and $K, V$ into column blocks of size $B_c$ inside fast on-chip **SRAM (Shared Memory, ~228 KB/SM on H100)**—never writing $S$ or $P$ to HBM.
 
-Standard softmax requires knowing the global row maximum $m = \max_j(s_j)$ and global denominator $\ell = \sum_j e^{s_j - m}$ across all $N$ columns before computing $P_{i,j} V_j$. **Online Softmax** (Milakov & Gimelshein, 2018) transforms softmax into a streaming one-pass recurrence over $K, V$ blocks $j = 1, \dots, T_c$:
+Why couldn't we just tile `torch.softmax` naively? Because standard softmax requires two passes over an entire row of length $N$: first to find the global row maximum $m = \max_j(s_j)$ (for numerical stability so `exp` never overflows) and the global denominator $\ell = \sum_j e^{s_j - m}$, and second to divide every $e^{s_j - m}$ by $\ell$ before multiplying by $V_j$. **Online Softmax** (Milakov & Gimelshein, 2018) solves this by turning softmax into a streaming one-pass recurrence over $K, V$ blocks $j = 1, \dots, T_c$: whenever a new tile produces a larger maximum $m_i^{(j)}$, we simply multiply our previously accumulated sum $\ell_i^{(j-1)}$ and output $O_i^{(j-1)}$ by the exact correction factor $\alpha = \exp(m_i^{(j-1)} - m_i^{(j)})$ to rescale them into the new maximum's frame.
 
 For a given $Q$-tile $Q_i \in \mathbb{R}^{B_r \times d_h}$, initialize running state in registers/SRAM:
 $$m_i^{(0)} = -\infty, \qquad \ell_i^{(0)} = 0, \qquad O_i^{(0)} = 0$$
@@ -111,8 +111,9 @@ $$R_{\Theta, m}^{(i)} \begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix} = \begin{
 where $i \in \{0, 1, \dots, d_{\text{head}}/2 - 1\}$ and $\theta_{\text{base}}$ is typically $10{,}000$ (Llama-2) or $500{,}000$ (Llama-3) or $1{,}000{,}000$ (Qwen2.5).
 
 ### Why Extrapolation Fails Beyond $L_{\text{train}}$
-* High-index dimensions ($i \approx d_{\text{head}}/2$) have very small frequencies $\theta_i$ (long wavelengths $\lambda_i = 2\pi / \theta_i \gg L_{\text{train}}$). During pretraining up to $L_{\text{train}}$ (e.g., $4{,}096$), those dimensions only rotated through a narrow arc $[0, L_{\text{train}} \theta_i]$—they never experienced full $2\pi$ cycles.
-* Evaluating at $m > L_{\text{train}}$ pushes low-frequency dimensions into unseen phase angles, causing attention scores to diverge and perplexity to explode immediately past $L_{\text{train}}$.
+Think of each 2D pair $(x_{2i}, x_{2i+1})$ in RoPE as a clock hand spinning at angular speed $\theta_i$. Low-index dimensions ($i = 0, 1, \dots$) spin rapidly like a second hand, completing many full $2\pi$ rotations within a short prompt so the model can tell adjacent tokens apart.
+* High-index dimensions ($i \approx d_{\text{head}}/2$) have very small frequencies $\theta_i$ (long wavelengths $\lambda_i = 2\pi / \theta_i \gg L_{\text{train}}$)—they spin like an hour hand. During pretraining up to $L_{\text{train}}$ (e.g., $4{,}096$), those dimensions only rotated through a narrow arc $[0, L_{\text{train}} \theta_i]$—they never experienced full $2\pi$ cycles.
+* Evaluating at $m > L_{\text{train}}$ pushes those slow-moving dimensions into unseen phase angles, causing attention dot products to diverge and perplexity to explode immediately past $L_{\text{train}}$.
 
 Three mathematical scaling methods extend context length by factor $s = L_{\text{target}} / L_{\text{train}}$:
 

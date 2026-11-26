@@ -28,9 +28,9 @@ Each concept below is ordered so later definitions build only on earlier ones:
 
 ## 1. Sparse Scaling: Total Parameters vs. Active Parameters per Token
 
-In a dense Transformer, every token traverses the entire parameter graph of every layer, coupling model capacity (knowledge stored in weights) rigidly to per-token compute FLOPs ($\text{FLOPs} \approx 2 \cdot P_{\text{total}}$ per token). **Mixture-of-Experts (MoE)** breaks this coupling by replacing the monolithic dense Feed-Forward Network (FFN) in each Transformer block with $E$ parallel FFN **experts** plus a lightweight **gating (router) network** that activates only $K \ll E$ experts per token.
+In a dense Transformer, every token passes through the exact same `nn.Linear` FFN layers, coupling model capacity (knowledge stored in weights) rigidly to per-token compute FLOPs ($\text{FLOPs} \approx 2 \cdot P_{\text{total}}$ per token). **Mixture-of-Experts (MoE)** breaks this coupling by replacing the single large Feed-Forward Network (FFN) in each Transformer block with an `nn.ModuleList` of $E$ smaller parallel FFN **experts** plus a lightweight **gating (router) network** (`nn.Linear(d_model, E)`) that activates only $K \ll E$ experts per token.
 
-This creates a sharp distinction between two parameter counts:
+Even though each token only runs $K$ experts, **all $E$ experts must remain resident in GPU VRAM** because different tokens in a batch—or consecutive tokens in a single sequence—will route to different experts. This creates a sharp distinction between two parameter counts:
 * **Total Parameters ($P_{\text{total}}$):** Every weight residing in HBM (embeddings, attention projections, norms, routers, shared experts, and all $E$ routed experts). Determines **static VRAM capacity** and minimum GPU count.
 * **Active Parameters per Token ($P_{\text{active}}$):** Parameters actually executed for a single token's forward pass (attention projections, shared experts, and the $K$ selected routed experts per layer). Determines **per-token FLOPs**.
 
@@ -130,15 +130,17 @@ Because GPUs achieve peak efficiency on uniform tensor shapes, early MoE framewo
 $$C = \left\lceil \frac{T \cdot K}{E} \cdot \text{CF} \right\rceil$$
 
 where $\text{CF} \ge 1.0$ is the **Capacity Factor** (typically $1.0\text{--}1.5$).
-* **Buffer Allocation:** Each expert receives a static input tensor of shape $[C, d_{\text{model}}]$.
-* **Token Dropping:** If more than $C$ tokens route to a popular ("hot") expert, the excess tokens beyond capacity $C$ are **dropped**—bypassing the expert FFN entirely and propagating only through the residual connection ($x_t + 0$). Conversely, underloaded experts waste compute on zero-padded slots.
-* **Dropless MoE Inference (MegaBlocks / Grouped GEMM):** Modern inference engines (vLLM, SGLang, TensorRT-LLM) avoid token dropping entirely during serving ($\text{CF} = \infty$) by permuting tokens into contiguous expert-grouped buckets in SRAM/HBM and launching a single **Grouped GEMM** (variable-$M_i$ batched matrix multiplication where each expert $i$ executes $M_i \times K \times N$ without padding zeros or discarding tokens).
+* **Buffer Allocation:** Each expert receives a static input tensor of shape `[C, d_model]`, allowing a single uniform batched matmul (`torch.bmm`) across all `E` experts: `[E, C, d_model] @ [E, d_model, d_ffn]`.
+* **Token Dropping:** If more than $C$ tokens route to a popular ("hot") expert, the excess tokens beyond capacity $C$ are **dropped**—bypassing the expert FFN entirely and propagating only through the residual connection ($x_t + 0$). Conversely, underloaded experts waste compute and HBM bandwidth multiplying zero-padded slots.
+* **Dropless MoE Inference (MegaBlocks / Grouped GEMM):** Modern inference engines (vLLM, SGLang, TensorRT-LLM) avoid token dropping entirely during serving ($\text{CF} = \infty$). Instead of padding every expert to a fixed length $C$ or running a slow Python `for` loop of $E$ separate kernel launches, the engine sorts/permutes tokens in memory so tokens assigned to the same expert sit contiguously, then launches a single **Grouped GEMM** kernel. This executes variable-$M_i$ matrix multiplications ($M_i \times K \times N$) across all active experts in one GPU launch without padding zeros or discarding tokens.
 
 ---
 
 ## 5. The HBM Weight-Reading Bottleneck During Decode
 
 A pervasive misconception is that an MoE model with $37\text{B}$ active parameters runs as fast as a $37\text{B}$ dense model during Decode. In reality, **at small-to-moderate batch sizes, MoE loses its active-parameter speedup to HBM weight-reading bandwidth.**
+
+The reason is simple: in a dense model, every token in a batch of $B$ requests uses the **same** weights, so the GPU reads those weights from HBM once and reuses them $B$ times. In an MoE model, different requests in the batch route to **different** experts—so even though each individual token only touches $K$ experts, the *union* of experts needed by the batch quickly approaches all $E$ experts, forcing the GPU to stream almost all $P_{\text{total}}$ weights from HBM while each expert gets only a handful of tokens.
 
 ### 5.1 Mathematical Proof: Expected Active Experts vs. Batch Size $B$
 

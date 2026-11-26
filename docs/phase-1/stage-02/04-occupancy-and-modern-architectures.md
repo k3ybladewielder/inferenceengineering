@@ -30,7 +30,7 @@ Every technical term, acronym, hardware unit, and inference concept used in this
 
 ## 1. SM Occupancy: Theory, Limiters, and Reality
 
-**SM Occupancy** is the ratio of active warps resident on an SM to the architectural maximum number of resident warps supported by that SM:
+An SM hides the ~400-cycle latency of reading from HBM by switching instantly to another resident warp whenever the current warp stalls. **SM Occupancy** measures how full that "waiting bench" of warps is—specifically, the ratio of active warps resident on an SM to the architectural maximum number of resident warps supported by that SM:
 
 $$\text{Theoretical Occupancy} = \frac{\text{Resident Warps per SM}}{\text{Max Warps per SM}}$$
 
@@ -65,7 +65,7 @@ Concrete Hopper (H100) limits per SM:
 
 ## 2. Why 100% Occupancy Is NOT Required: Little's Law for Latency Hiding
 
-A persistent myth in CUDA programming is that higher occupancy always equals higher performance. In reality, **occupancy is only a means to hide pipeline latency**, governed by **Little's Law**:
+A persistent myth in CUDA programming is that higher occupancy always equals higher performance. In reality, **occupancy is only a means to hide pipeline latency**, governed by **Little's Law**—the same queuing-theory principle used in networking and databases:
 
 $$L = \lambda \times W$$
 
@@ -73,6 +73,8 @@ Where:
 * $L$ = required **concurrency** (in-flight operations or bytes per SM) to keep the hardware pipeline 100% busy,
 * $\lambda$ = peak hardware **issue rate / throughput** per SM,
 * $W$ = hardware **pipeline latency** (cycles).
+
+Think of a highway with a 400-cycle round-trip: once enough cars ($L$) are on the road to keep the tollbooth ($\lambda$) busy every single cycle, adding more cars does not increase throughput—it just causes congestion. On an SM, pushing occupancy to $100\%$ shrinks the registers and Shared Memory available per thread, forcing smaller tiles or register spills. Instead, top-performing LLM kernels target the *minimum* occupancy needed to satisfy Little's Law, dedicating all remaining registers and SRAM to larger matrix tiles.
 
 ### Quantitative Proof 1: Compute-Bound Tensor Core GEMM (H100)
 * Latency of a `wgmma` pipe is $\sim 16$–$32$ cycles, and each sub-partition has $1$ Tensor Core capable of accepting $1$ macro-instruction every few cycles.
@@ -120,7 +122,7 @@ Hopper inserts a new level in the CUDA hierarchy between Grid and Block: the **T
 
 ## 4. NVIDIA Blackwell Architecture (B200 / GB200)
 
-Blackwell (Compute Capability `10.0`, TSMC 4NP, $208\text{B}$ transistors) moves past single-die reticle limits ($\sim 858\text{ mm}^2$) via a **coherent dual-die chiplet architecture**:
+Modern lithography machines can only print a single silicon chip up to the **reticle limit** ($\sim 858\text{ mm}^2$). Hopper H100 already sits right at that physical ceiling, meaning NVIDIA could no longer simply make a larger monolithic die to double compute and HBM stacks. Blackwell (Compute Capability `10.0`, TSMC 4NP, $208\text{B}$ transistors) moves past single-die reticle limits via a **coherent dual-die chiplet architecture**:
 
 ### 1. Dual-Die Chiplet & 10 TB/s NV-HBI
 * **Reticle-Limit Solution:** Blackwell bonds **two full-reticle compute dies** side-by-side over an ultra-dense silicon interposer bridge called **NV-HBI (NVIDIA High-Bandwidth Interface)**.

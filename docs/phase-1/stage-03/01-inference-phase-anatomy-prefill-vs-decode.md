@@ -48,20 +48,22 @@ An autoregressive decoder-only Transformer models the joint probability of a seq
 
 $$P(x_1, \dots, x_T) = \prod_{t=1}^{T} P(x_t \mid x_1, \dots, x_{t-1})$$
 
-Because every generated token $x_t$ depends strictly on the token sampled at step $t-1$, generation cannot be parallelized across future output positions. However, the user prompt $(x_1, \dots, x_{S_p})$ is already completely known at request arrival. This structural asymmetry splits every LLM request into two distinct execution phases with opposite hardware bottlenecks:
+In PyTorch, this means generating a response is inherently a sequential `for` loop: you cannot predict token $x_{t+1}$ until you have finished running the model on token $x_t$ and sampled it from the output logits. However, the user's input prompt $(x_1, \dots, x_{S_p})$ is already completely known the moment the request arrives. Because of **causal masking**—which ensures that token $i$ only reads Keys and Values from positions $1 \dots i$ and never peaks ahead at $j > i$—the model can compute the hidden states for all $S_p$ prompt tokens in a single batched matrix operation, just like during training.
+
+This structural asymmetry splits every LLM request into two distinct execution phases. Even though both phases execute the exact same `nn.Linear` layers and Transformer weights, their tensor shapes—and therefore their hardware bottlenecks—are complete opposites:
 
 1. **Prefill (Prompt Processing Phase):**
-   * All $S_p$ prompt tokens are processed simultaneously in a single forward pass.
-   * Causal masking guarantees that token $i$ only attends to tokens $1 \dots i$, allowing all $S_p$ positions to execute in parallel across the sequence dimension.
-   * **User-facing latency metric:** **TTFT (Time to First Token)** — elapsed time from request arrival (after queuing) until the first output token $x_{S_p+1}$ is produced.
-   * **Hardware regime:** Dominated by large Matrix-Matrix Multiplications (**GEMM**), yielding high arithmetic intensity and saturating Tensor Cores (**compute-bound**).
+   * **What happens:** All $S_p$ prompt tokens are stacked into one tensor of shape `[B, S_p, d_model]` (flattened to `[M, d_model]` where $M = B \cdot S_p$) and pushed through all Transformer layers in a single forward pass.
+   * **Why it works in parallel:** Causal masking guarantees that token $i$ only attends to tokens $1 \dots i$, allowing all $S_p$ positions to execute simultaneously across the sequence dimension. This single pass populates the initial **KV Cache** for the entire prompt and outputs the logits for the first generated token $x_{S_p+1}$.
+   * **User-facing latency metric:** **TTFT (Time to First Token)** — elapsed time from when a request begins executing (after any queue wait) until the first output token $x_{S_p+1}$ is produced.
+   * **Hardware regime:** Because $M = B \cdot S_p$ is large (hundreds or thousands of tokens), every linear projection is a large Matrix-Matrix Multiplication (**GEMM**). Each weight loaded from GPU memory is reused across all $M$ tokens, yielding high arithmetic intensity and saturating the GPU's Tensor Cores (**compute-bound**).
 
 2. **Decode (Autoregressive Token Generation Phase):**
-   * Each request generates **1 token per forward pass** ($x_{S_p+1}, x_{S_p+2}, \dots$), feeding the newly sampled token back as the sole input token for the next step while reading prior Keys and Values from the **KV Cache**.
+   * **What happens:** The model enters a sequential loop, generating **1 new token per forward pass** ($x_{S_p+1}, x_{S_p+2}, \dots$) per active request. The input tensor shrinks from `[B, S_p, d_model]` down to `[B, 1, d_model]` ($M = B$). Rather than recomputing Keys and Values for all previous tokens, each layer projects only the 1 new token, appends its Key and Value to the **KV Cache**, and attends over all prior cached Keys and Values.
    * **User-facing latency metric:** **ITL (Inter-Token Latency)** or **TPOT (Time Per Output Token)** — elapsed time between consecutive emitted tokens. Total request latency is:
      $$\text{E2E Latency} = \text{TTFT} + (S_g - 1) \times \text{TPOT}$$
      where $S_g$ is the number of generated tokens.
-   * **Hardware regime:** For a single request ($B=1$), linear projections degenerate into Matrix-Vector Multiplications (**GEMV**). Almost no data reuse occurs across weights, stalling Tensor Cores while waiting for HBM3/HBM3e reads (**memory-bandwidth-bound**).
+   * **Hardware regime:** For a single request ($B=1$), $M = 1$, so every `nn.Linear` projection degenerates into a Matrix-Vector Multiplication (**GEMV**). The GPU must stream the entire weight matrix from off-chip memory (**HBM3/HBM3e**) just to multiply it against a single vector, leaving Tensor Cores starved and idle (**memory-bandwidth-bound**).
 
 ```mermaid
 flowchart TD
@@ -87,7 +89,7 @@ flowchart TD
 
 ## 2. Exact Linear Layer Physics: FLOPs, Bytes Moved, and Arithmetic Intensity
 
-Over 90% of the parameters and operations in a standard Transformer reside in dense linear projections: $W_Q, W_K, W_V, W_O$ inside Attention, and $W_{\text{gate}}, W_{\text{up}}, W_{\text{down}}$ inside the Feed-Forward Network (SwiGLU MLP). Every linear layer computes:
+Over 90% of the parameters and operations in a standard Transformer reside in dense linear projections (`torch.nn.Linear` without bias): $W_Q, W_K, W_V, W_O$ inside Attention, and $W_{\text{gate}}, W_{\text{up}}, W_{\text{down}}$ inside the Feed-Forward Network (SwiGLU MLP). In PyTorch, you write `Y = X @ W`, where the batch and sequence dimensions are flattened into a single row dimension $M$:
 
 $$Y = X W, \quad X \in \mathbb{R}^{M \times K}, \quad W \in \mathbb{R}^{K \times N}, \quad Y \in \mathbb{R}^{M \times N}$$
 
@@ -98,7 +100,7 @@ where:
 
 ### 2.1 Exact FLOP Count
 
-Computing each scalar output entry $Y_{i,j} = \sum_{k=1}^{K} X_{i,k} W_{k,j}$ requires $K$ multiplications and $K-1 \approx K$ additions (fused as $K$ Multiply-Accumulate or FMA instructions, where $1\text{ FMA} = 2\text{ FLOPs}$). Across all $M \cdot N$ output elements:
+Computing each scalar output entry $Y_{i,j} = \sum_{k=1}^{K} X_{i,k} W_{k,j}$ requires $K$ multiplications and $K-1 \approx K$ additions (executed by the GPU's Tensor Cores as $K$ Fused Multiply-Add or FMA instructions, where $1\text{ FMA} = 2\text{ FLOPs}$). Across all $M \cdot N$ output elements:
 
 $$\text{FLOPs}(M, N, K) = 2 \cdot M \cdot N \cdot K$$
 
@@ -106,10 +108,14 @@ $$\text{FLOPs}(M, N, K) = 2 \cdot M \cdot N \cdot K$$
 
 ### 2.2 Exact HBM Bytes Transferred
 
+When you allocate a `torch.Tensor` with `.to("cuda")`, it resides in **HBM (High Bandwidth Memory)**—the large, off-chip VRAM (e.g., 80 GB on an H100). However, the GPU's Tensor Cores cannot perform math directly on HBM; data must first be fetched across the memory bus into tiny, ultra-fast on-chip **SRAM** (shared memory inside each compute block), multiplied, and written back to HBM.
+
+Because SRAM is tiny (hundreds of kilobytes per compute unit), GPU matrix-multiply kernels use **tiling**: they load a small rectangular block of $X$ and a small rectangular block of $W$ into SRAM, compute all products between those blocks while they sit in fast SRAM, and only write the finished block of $Y$ back to HBM.
+
 Assume activations and weights are stored in **BF16 or FP16** ($b = 2\text{ bytes/parameter}$), and ignore on-chip cache misses or split-$K$ writebacks (the theoretical minimum off-chip HBM traffic assuming perfect SRAM tiling):
-* Read input activation matrix $X$: $b \cdot M \cdot K$ bytes
-* Read weight matrix $W$: $b \cdot K \cdot N$ bytes
-* Write output matrix $Y$: $b \cdot M \cdot N$ bytes
+* Read input activation matrix $X$ (`[M, K]`): $b \cdot M \cdot K$ bytes
+* Read weight matrix $W$ (`[K, N]`): $b \cdot K \cdot N$ bytes
+* Write output matrix $Y$ (`[M, N]`): $b \cdot M \cdot N$ bytes
 
 Total minimum HBM traffic in general $b$-byte precision (and specifically for BF16/FP16 where $b = 2$):
 
@@ -117,11 +123,11 @@ $$\text{Bytes}_{\text{HBM}}(M, N, K) = b \cdot (M K + K N + M N)$$
 
 $$\text{Bytes}_{\text{HBM, BF16}}(M, N, K) = 2 \cdot (M K + K N + M N)$$
 
-*(Caveat for FP8/INT4 weight-only quantization: If weights $W$ use $b_W = 0.5\text{ B}$ or $1\text{ B}$ while activations $X, Y$ remain $b_A = 2\text{ B}$, total traffic becomes $b_A (MK + MN) + b_W KN$. This asymmetry is why weight-only quantization accelerates Decode without changing compute FLOPs.)*
+*(Caveat for FP8/INT4 weight-only quantization: If weights $W$ use $b_W = 0.5\text{ B}$ or $1\text{ B}$ while activations $X, Y$ remain $b_A = 2\text{ B}$, total traffic becomes $b_A (MK + MN) + b_W KN$. Notice that quantizing weights shrinks the $K \cdot N$ term without changing the $2MNK$ math operations—which is why weight-only quantization directly accelerates memory-bound Decode without changing compute FLOPs.)*
 
 ### 2.3 Exact Arithmetic Intensity Derivation
 
-Arithmetic Intensity $I$ (in $\text{FLOPs/Byte}$) is the ratio of floating-point operations performed to total bytes moved between HBM and the GPU's compute units:
+**Arithmetic Intensity** ($I$, measured in $\text{FLOPs/Byte}$) measures how much math the GPU performs for every byte it has to haul from HBM. Think of it as the "compute-to-data ratio":
 
 $$I(M, N, K) = \frac{\text{FLOPs}}{\text{Bytes}_{\text{HBM}}} = \frac{2 M N K}{b \cdot (M K + K N + M N)}$$
 
@@ -135,11 +141,17 @@ $$I_{\text{BF16}}(M, N, K) = \frac{1}{\frac{1}{N} + \frac{1}{M} + \frac{1}{K}}$$
 
 This single equation explains the entire physics of LLM inference phase behavior:
 * $I_{\text{BF16}}$ is bounded above by the **smallest** of the three matrix dimensions: $I_{\text{BF16}} < \min(M, N, K)$.
-* Because $N$ and $K$ are fixed architectural constants of the model (typically $4096$ to $32768$), **$M$ is the single runtime variable that determines whether the GPU runs at peak compute or starves on HBM bandwidth**.
+* Because $N$ and $K$ are fixed architectural constants of the model (typically $4096$ to $32768$), **$M$ is the single runtime variable that determines whether the GPU runs at peak compute or starves on HBM bandwidth**. When $M = 1$, $\frac{1}{M} = 1$ dominates the denominator, pinning $I_{\text{BF16}} \approx 1$. When $M = 2048$, $\frac{1}{M}$ becomes tiny, allowing $I_{\text{BF16}}$ to climb above $1{,}000$.
 
 ---
 
 ## 3. Why $M = 1$ Hits the Memory Wall (And How Batching Recovers Intensity)
+
+A GPU has two independent physical speed limits: how fast its **Tensor Cores** can execute math ($F_{\text{peak}}$ in FLOP/s), and how fast its **HBM memory bus** can deliver numbers to those Tensor Cores ($\text{BW}_{\text{peak}}$ in Bytes/s). The **Roofline Model** captures this with a simple ceiling:
+
+$$\text{Attainable Throughput} = \min\!\left(F_{\text{peak}},\;\; I \times \text{BW}_{\text{peak}}\right)$$
+
+If each byte delivered from HBM only fuels $I$ math operations, then the memory bus can at most sustain $I \times \text{BW}_{\text{peak}}$ FLOP/s. The **Ridge Point ($I^*$)** is the exact crossover arithmetic intensity where $I \times \text{BW}_{\text{peak}} = F_{\text{peak}}$—meaning the memory bus finally feeds data fast enough to keep 100% of the Tensor Cores busy.
 
 Consider an **NVIDIA H100 SXM5 (80 GB HBM3)** running a **Llama-3 8B** SwiGLU FFN layer ($K = 4096, N = 14336$) in BF16 ($b = 2$):
 * **H100 BF16 Tensor Core Peak:** $F_{\text{peak}} = 989.4\text{ TFLOP/s} = 9.894 \times 10^{14}\text{ FLOP/s}$ *(dense, non-sparse)*.
@@ -147,7 +159,7 @@ Consider an **NVIDIA H100 SXM5 (80 GB HBM3)** running a **Llama-3 8B** SwiGLU FF
 * **H100 BF16 Ridge Point ($I^*$):**
   $$I^*_{\text{H100, BF16}} = \frac{F_{\text{peak}}}{\text{BW}_{\text{peak}}} = \frac{989.4 \times 10^{12}\text{ FLOP/s}}{3.35 \times 10^{12}\text{ B/s}} \approx 295.3\text{ FLOPs/Byte}$$
 
-An operation must exhibit $I \ge 295.3\text{ FLOPs/Byte}$ to keep all Tensor Cores busy; anything below $295.3$ is strictly **memory-bandwidth-bound**.
+An operation must perform at least $295.3\text{ FLOPs}$ for every byte read from HBM ($I \ge 295.3$) to keep all Tensor Cores busy; anything below $295.3$ is strictly **memory-bandwidth-bound** because the math units finish their work and sit idle waiting for the next bytes to arrive from HBM.
 
 ### Case A: Single-Request Decode ($M = 1$, GEMV)
 
