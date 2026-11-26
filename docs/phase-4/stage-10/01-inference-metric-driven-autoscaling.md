@@ -4,6 +4,67 @@
 
 ---
 
+Autoscaling automatically adds or removes computing servers as user demand rises and falls so applications stay fast without wasting money. Standard web-server scaling rules fail for Large Language Models (LLMs) because AI servers become overloaded in ways that traditional CPU and memory monitors cannot see—requiring specialized, AI-aware signals and careful timing controls.
+
+## Core Concepts & Terminology
+
+Every technical term, metric, and system component used in this document is defined below in dependency order so that each concept builds only on plain English or previously defined terms:
+
+### A. LLM Inference & GPU Hardware Foundations
+* **Token:** The basic unit of text processed by an LLM (roughly 3–4 characters or 0.75 words in English). Text is converted into numeric token IDs (**tokenization**) before processing and converted back to readable text (**detokenization**) afterward.
+* **Weights ($P$ parameters):** The learned numerical values that make up a trained AI model. A "70B" model has 70 billion parameters.
+* **FP16 & FP8 (16-bit / 8-bit Floating Point):** Compact numerical formats used to store weights and perform math. FP16 uses 2 bytes per number; FP8 uses 1 byte per number, halving memory size and doubling math speed.
+* **GPU (Graphics Processing Unit), SM (Streaming Multiprocessor), & Tensor Core:** A specialized processor built for massive parallel math. An SM is a single compute block inside the GPU (an H100 has 132 SMs), and **Tensor Cores** are dedicated hardware circuits inside each SM that multiply matrices at very high speed.
+* **FLOP / GFLOPs / TFLOPS:** A **Floating-Point Operation** is one arithmetic step (such as multiplying or adding two decimal numbers). GFLOPs = billions ($10^9$) of operations; TFLOPS = trillions ($10^{12}$) of operations per second.
+* **CUDA & CUDA Kernel:** NVIDIA's programming platform for GPUs. A **CUDA kernel** is a single parallel function executed on the GPU's SMs. **CUDA Graph capture** records a fixed sequence of kernel launches at startup so the CPU can replay them in one call with minimal overhead.
+* **VRAM & HBM / HBM3 (High Bandwidth Memory):** **VRAM** (Video RAM) is the dedicated high-speed memory soldered onto the GPU package. **HBM3** is a high-speed stacked variant of VRAM (e.g., 80 GB at 3.35 TB/s on an H100 SXM).
+* **PCIe (Peripheral Component Interconnect Express):** The high-speed expansion bus connecting the host CPU and system RAM to GPUs, storage drives, and network cards.
+* **Prefill vs. Decode:** LLM generation happens in two distinct phases:
+  * **Prefill:** Processing the entire user input prompt in parallel to produce the very first output token. This phase is **compute-bound** (limited by Tensor Core FLOPs).
+  * **Decode:** Generating subsequent output tokens one at a time, sequentially. Each step reads all model weights from HBM, making decode **memory-bandwidth-bound** (limited by HBM transfer speed rather than math speed).
+* **Batch Size ($B$) & GEMV:** **Batch size** is the number of user requests processed together in a single GPU step. At `batch = 1`, decode performs **GEMV (General Matrix-Vector Multiplication)**, reading the entire model from HBM just to produce one token.
+* **MFU (Model FLOPs Utilization) & MBU (Model Bandwidth Utilization):** **MFU** is the percentage of the GPU's peak theoretical math speed (TFLOPS) actually used. **MBU** is the percentage of the GPU's peak HBM memory bandwidth (TB/s) actually used.
+* **KV Cache (Key-Value Cache):** A memory buffer in VRAM that stores intermediate attention data from earlier tokens so the model does not have to recompute the entire conversation history at every decode step.
+* **LLM Serving Engine (vLLM, SGLang, TensorRT-LLM):** Specialized server software that runs LLMs on GPUs. **Continuous Batching** is a scheduling technique inside these engines that adds new requests and removes finished ones at every single token step rather than waiting for an entire batch to finish.
+* **PagedAttention, RadixAttention, & Automatic Prefix Caching (APC):** Memory-management techniques inside serving engines. **PagedAttention** (vLLM) divides the KV cache into small fixed-size blocks (e.g., 16 tokens/block) to eliminate wasted VRAM. **RadixAttention** (SGLang) and **APC** store shared prompt prefixes (like long system instructions) in a reusable block tree so repeated prefixes do not have to be recomputed.
+* **Preemption, Recomputation, & Swapping:** When an engine runs out of free KV cache blocks mid-generation, **preemption** pauses active requests and frees their blocks—either discarding the KV data for later **recomputation** or **swapping** (copying) it over PCIe into slower host RAM.
+
+### B. GPU Telemetry & Why Naive Metrics Mislead
+* **NVML (`nvidia-smi`) & DCGM (Data Center GPU Manager):** NVIDIA tools that report GPU health and hardware counters.
+  * **`GPU-Util` (`DCGM_FI_DEV_GPU_UTIL`):** Measures only the *percentage of time at least one CUDA kernel was running*—not how busy the Tensor Cores are. A stalled memory-bound kernel still reports ~100%.
+  * **`DCGM_FI_DEV_SM_ACTIVE` & `DCGM_FI_DEV_PIPE_TENSOR_ACTIVE`:** Deeper hardware counters measuring the fraction of SMs active or Tensor Core pipe activity.
+  * **`DCGM_FI_DEV_FB_USED`:** Total VRAM framebuffer memory allocated on the GPU. Because serving engines pre-allocate a static `gpu_memory_utilization` slab (e.g., 90% of VRAM) at startup for the KV cache, `FB_USED` stays flat at 90% whether the server is idle or overloaded.
+* **ZMQ / Ray IPC:** Inter-Process Communication libraries used by Python/C++ serving engines to pass messages between the HTTP server and GPU worker processes.
+
+### C. Inference Latency, Throughput & SLO Metrics
+* **TTFT (Time to First Token):** The total time from when a request arrives until the first output token is produced.
+* **ITL (Inter-Token Latency) / TPOT (Time Per Output Token):** The time delay between each consecutive output token during streaming.
+* **SSE (Server-Sent Events):** An HTTP streaming protocol used to push output tokens to clients one by one as they are generated.
+* **QPS & P99:** **QPS** (Queries Per Second) is request arrival rate; **P99** is the 99th-percentile latency (the threshold below which 99% of requests finish).
+* **SLA / SLO, Error Budget, & Burn Rate:** An **SLA** (Service Level Agreement) or **SLO** (Service Level Objective) is a reliability target (e.g., "99% of requests have $\text{TTFT} \le 500\text{ ms}$"). The **error budget** is the allowed failure rate ($1 - 0.99 = 1\%$). **Burn rate** measures how fast that budget is being spent relative to the target (a burn rate of `6.0` means errors are occurring 6× faster than allowed).
+* **Engine `/metrics` Signals:** Application-level counters exposed by vLLM/SGLang:
+  * **`num_requests_waiting` (`vllm:num_requests_waiting` / `sglang:num_queue_reqs`):** Requests queued and waiting for KV cache blocks or prefill budget (`max_num_batched_tokens`).
+  * **`num_requests_running`:** Requests currently active in the decode batch.
+  * **`gpu_cache_usage_perc`:** Fraction of logical PagedAttention KV blocks currently occupied (unlike static `FB_USED`, this reflects true memory pressure).
+
+### D. Kubernetes, Monitoring & Autoscaling Control Theory
+* **Stateless Microservices (REST API, gRPC):** Traditional web services that do not retain per-request memory across calls and scale cleanly with CPU or RAM.
+* **Kubernetes Primitives:**
+  * **Pod, Deployment, & ReplicaSet:** A **Pod** is the smallest deployable unit in Kubernetes (one or more containers); a **ReplicaSet** maintains a target count of identical pods; a **Deployment** manages ReplicaSet updates.
+  * **kubelet, kube-scheduler, & cAdvisor:** `kubelet` is the node agent that runs pods; `kube-scheduler` assigns pending pods to nodes; `cAdvisor` collects container CPU/RAM usage (`cpu_usage_seconds_total / cpu_quota`, `container_memory_working_set_bytes`).
+  * **CRD (Custom Resource Definition):** An extension mechanism that adds new object types to the Kubernetes API.
+  * **Karpenter / Cluster Autoscaler & `nvidia.com/gpu` Device Plugin:** Node-level autoscalers that provision new cloud GPU virtual machines (e.g., AWS `g6e` or `p5`) whenever pods are stuck `Pending` waiting for GPUs registered by the NVIDIA device plugin.
+  * **AI Gateway / Envoy Load Balancer:** A smart reverse proxy that routes incoming requests to healthy pods using **least-queue** or **prefix-aware** strategies.
+* **Prometheus, VictoriaMetrics, PromQL, & Recording Rules:** Time-series monitoring databases that **scrape** (poll) `/metrics` endpoints at a fixed `scrape_interval` (e.g., 5 seconds). **PromQL** is the query language used to aggregate those metrics, and **recording rules** pre-compute complex PromQL expressions.
+* **Kubernetes HPA (Horizontal Pod Autoscaler):** The built-in controller that scales pod counts using native CPU/RAM (`metrics.k8s.io`) or external metrics (`external.metrics.k8s.io`).
+* **KEDA (Kubernetes Event-Driven Autoscaling):** An add-on (`keda-operator` + `keda-metrics-apiserver`) configured via a `ScaledObject` CRD that feeds PromQL queries into HPA and adds **scale-to-zero** (`0 <-> 1` replicas, optionally triggered by the **KEDA HTTP Add-on**).
+* **Control-Theory Safeguards:**
+  * **Dilution Trap:** When a newly booted pod joins at `0%` load, an `avg()` metric across pods suddenly drops, tricking HPA into thinking load subsided and scaling back down prematurely.
+  * **Stabilization Window (`stabilizationWindowSeconds`) & Hysteresis (Schmitt Trigger):** A waiting period and asymmetric threshold design (fast scale-out, slow scale-in) with a **deadband** (hold zone) to prevent rapid up/down **flapping** and KV-cache thrashing.
+  * **`pod-deletion-cost` & `preStop`:** A Kubernetes annotation (`controller.kubernetes.io/pod-deletion-cost`) that tells ReplicaSet which pod to delete first during scale-in (lowest cost first), paired with a **`preStop`** lifecycle hook to drain active streams gracefully.
+
+---
+
 ## 1. Why Traditional Infrastructure Metrics Fail Completely for LLMs
 
 In conventional stateless microservices (REST APIs, gRPC workers), Kubernetes Horizontal Pod Autoscaler (HPA) relies on host/container **CPU utilization** (`cpu_usage_seconds_total / cpu_quota`) or **memory working set** (`container_memory_working_set_bytes`) to infer saturation. Applying these signals—or naive GPU telemetry from `nvidia-smi` / DCGM—to LLM serving engines (vLLM, SGLang, TensorRT-LLM) causes catastrophic mis-scaling: pods either scale out permanently under trivial traffic or fail to scale out while requests time out in queues.

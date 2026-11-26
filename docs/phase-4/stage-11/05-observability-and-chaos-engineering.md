@@ -4,6 +4,22 @@
 
 ---
 
+Aggregate request timers cannot diagnose streaming LLM stalls or prove that failover mechanisms work under real GPU failures. This document explains phase-separated inference metrics, end-to-end distributed tracing, and controlled fault-injection experiments for production AI gateways.
+
+## Core Concepts & Terminology
+
+* **OpenTelemetry (OTel), OTLP, Prometheus, Tempo/Jaeger, & Grafana:** **OpenTelemetry** is a vendor-neutral standard for emitting metrics and traces over **OTLP** (OpenTelemetry Protocol, typically gRPC). **Prometheus** (or **Mimir**) scrapes and stores time-series metrics; **Tempo** and **Jaeger** store distributed traces; **Grafana** visualizes dashboards and routes alerts via **Alertmanager**.
+* **Phase-Separated Inference Metrics (`TTFT`, `ITL`, `TPOT`, `E2E`, `Goodput`):** **TTFT (Time to First Token)** measures wait time until token 1 arrives. **ITL (Inter-Token Latency)** measures every individual step gap between consecutive decode tokens, exposing mid-stream freezes. **TPOT (Time Per Output Token)** is the per-request average decode time (which hides single-step stalls). **E2E Latency** is total time until `EOS` (End-of-Sequence). **Goodput** counts only requests per second (`req/s`) meeting *both* TTFT and ITL **SLOs** (Service Level Objectives).
+* **Queue Wait, Prefill, KEDA, & Active KV Utilization:** **Queue Wait Time** is time spent waiting in the engine scheduler before GPU **Tensor Core** **prefill** starts, driving **KEDA** (Kubernetes Event-Driven Autoscaling) and bounded-load spillover. **Active KV Utilization** tracks allocated Key-Value cache blocks in GPU **HBM**; exceeding $85\%$ risks **KV eviction thrashing** (**preemption** of active requests) or **OOM** (Out of Memory).
+* **Non-Additive Percentiles, HDR Histograms, & Prometheus Native Histograms:** Percentiles (like **P99**) cannot be averaged across pods—raw histogram counts must be summed first. **HDR (High Dynamic Range) Histograms** and **Prometheus Native Histograms (DDSketch)** use logarithmic/exponential buckets to maintain $\le 1\%$ relative error from $1\text{ ms}$ to $100,000\text{ ms}$ without manual bucket tuning.
+* **Label Cardinality & WAL:** **Label cardinality** is the count of unique metric label combinations; unbounded IDs (`user_id`, `request_id`) exhaust Prometheus RAM and **WAL** (Write-Ahead Log) I/O.
+* **Distributed Tracing, W3C `traceparent`, Spans, & RDMA/NIXL:** **Distributed tracing** links timed operations (**spans** and **span events**) across the Gateway, Router, Prefill, **RDMA/NIXL** (zero-copy KV transfer), and Decode workers using the standardized **W3C `traceparent`** header and **OTel GenAI Semantic Conventions** (`gen_ai.*` attributes).
+* **Prometheus Exemplars:** Sampled `(trace_id, value, timestamp)` pointers attached to histogram buckets so clicking an outlier in Grafana jumps directly to its distributed trace.
+* **Chaos Engineering, Blast Radius, & Fault Injection Tools:** **Chaos Engineering** tests resilience in a bounded **blast radius** (e.g., canary traffic) with automated **error budget** aborts, using tools like **Chaos Mesh** (`HTTPChaos`), Linux **`tc netem`** (network latency/jitter injection), `SIGKILL` pod drops, and **`nvidia-smi`** (locking GPU **SM** / Streaming Multiprocessor clocks low to simulate **gray failures**).
+* **SSE, TCP RST, & EOF:** **SSE (Server-Sent Events)** is the HTTP token-streaming protocol; a mid-stream crash surfaces as an unexpected **TCP `RST`** (connection reset) or **EOF** (End-of-File).
+
+---
+
 ## 1. Granular LLM Inference Telemetry (OpenTelemetry & Prometheus)
 
 Traditional microservice observability tracks coarse `http_requests_total` and `http_request_duration_seconds`. For streaming LLM inference, aggregate request duration is largely useless: a $50\text{-token}$ reply taking $4\text{ s}$ feels broken, whereas a $1,000\text{-token}$ reply taking $10\text{ s}$ ($100\text{ tok/s}$) feels instantaneous. Production AI Gateways and inference engines must instrument **phase-separated physical metrics**.

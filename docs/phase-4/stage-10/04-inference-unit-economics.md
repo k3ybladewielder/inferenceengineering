@@ -4,6 +4,42 @@
 
 ---
 
+Running AI models in production is expensive, and pricing tokens correctly requires understanding the physical hardware limits of each GPU. This chapter derives the exact cost per million input and output tokens from first principles, explaining why output tokens cost 3×–10× more than input tokens and how batch size and GPU hardware choice govern profitability.
+
+## Core Concepts & Terminology
+
+Every financial, hardware, and mathematical term used in this document is defined below in dependency order:
+
+### A. Financial & Utilization Metrics (FinOps)
+* **FinOps & Unit Economics (`$/1M tokens`):** Cloud Financial Operations—the practice of measuring and optimizing the exact dollar cost to produce 1,000,000 input or output tokens.
+* **$C_{\text{gpu}}$ & $C_{\text{sec}}$ (GPU Cost & CapEx Depreciation):** $C_{\text{gpu}}$ is the fully loaded hourly cost per GPU (`$/hr`), whether rented from a cloud or calculated by spreading hardware purchase cost (**CapEx depreciation**), power, cooling, and networking over a 3-year lifespan. $C_{\text{sec}} = C_{\text{gpu}} / 3600$ is the cost per second.
+* **$U_{\text{avg}}$ (Average Fleet Occupancy / Diurnal Load Factor):** The fraction (0 to 1) of rented GPU-hours actually spent serving user requests rather than sitting idle during nighttime valleys (**diurnal troughs**), cold-start warmups, or safety headroom.
+
+### B. Model Architecture, Precisions & Silicon Physics
+* **Parameters ($P_{\text{active}}$ vs. $P_{\text{total}}$) & Sparse MoE:** A model's learned weights. In a **dense** model, all parameters run for every token ($P_{\text{active}} = P_{\text{total}}$). In a **Sparse Mixture-of-Experts (MoE)** model, only a subset of "expert" weights run per token ($P_{\text{active}} \ll P_{\text{total}}$), though all $P_{\text{total}}$ weights must still fit in VRAM.
+* **Precision & Bytes per Parameter ($b_w$):** Numerical formats trading precision for speed and memory savings: **FP16/BF16** ($b_w = 2\text{ bytes}$), **FP8/INT8** ($b_w = 1\text{ byte}$), and **FP4/INT4/NVFP4** ($b_w = 0.5\text{ bytes}$). **Sparsity** (2:4 structured sparsity) skips zero weights to double theoretical TFLOPS.
+* **Transformer Dimensions ($L, d_{\text{model}}, n_q, n_{\text{kv}}, d_h$):** $L$ is the number of layers; $d_{\text{model}}$ is the hidden vector width; $n_q$ and $n_{\text{kv}}$ are the number of query and Key/Value attention heads (**GQA**, Grouped-Query Attention, uses $n_{\text{kv}} < n_q$ to shrink KV cache); $d_h$ is the width per head.
+* **$\Phi_{\text{peak}}$ (Peak Compute) & $\beta_{\text{HBM}}$ (Peak Memory Bandwidth):** $\Phi_{\text{peak}}$ is a GPU's maximum Tensor Core math speed (TFLOPS = trillions of Floating-Point Operations per second). $\beta_{\text{HBM}}$ is how fast data moves from High Bandwidth Memory (HBM) to the compute cores (TB/s).
+* **Arithmetic Intensity & Ridge Point:** **Arithmetic intensity** is the ratio of math operations performed per byte of memory read (`FLOPs/byte`). The **ridge point** ($\Phi_{\text{peak}} / \beta_{\text{HBM}}$, roughly 300–600 FLOPs/byte in FP8 on modern GPUs) is the threshold where a workload transitions from **memory-bandwidth-bound** (limited by $\beta_{\text{HBM}}$) to **compute-bound** (limited by $\Phi_{\text{peak}}$).
+* **MFU ($\eta_{\text{MFU}}$) & MBU ($\eta_{\text{MBU}}$):** **Model FLOPs Utilization** is the fraction of $\Phi_{\text{peak}}$ actually achieved; **Model Bandwidth Utilization** is the fraction of $\beta_{\text{HBM}}$ actually achieved.
+
+### C. Inference Phases, Batching & Multi-GPU Scaling
+* **Prefill vs. Decode:** **Prefill** processes all input prompt tokens in parallel using large matrix-matrix multiplications (**GEMMs**) and **causal attention** ($QK^T$ and $PV$ matrices with **causal masking** so tokens only attend to earlier tokens, accelerated by **FlashAttention-3**). **Decode** generates output tokens one step at a time, reading all model weights and **KV Cache** ($K_{\text{seq}}(S)$ bytes per sequence of length $S$) from HBM at every step.
+* **Colocated vs. Disaggregated Serving & Chunked Prefill:** **Colocated** engines run prefill and decode on the same GPU; **chunked prefill** splits long prompts into smaller pieces interleaved with decode steps to limit latency interference. **Disaggregated** serving separates prefill and decode onto dedicated GPU pools.
+* **Continuous Batching, $B_{\max}$, & KV Residency ("VRAM Rent"):** **Continuous batching** groups $B$ active decode requests together so the expensive model weight read is shared across $B$ users in one step. Because each active stream pins its KV cache in HBM for seconds (**KV residency**), total VRAM limits the maximum batch size $B_{\max}$.
+* **Tensor Parallelism ($N_{\text{TP}}$) & `AllReduce` ($t_{\text{comm}}$):** Splitting a model across $N_{\text{TP}}$ GPUs. After each layer, GPUs must synchronize partial sums via an **`AllReduce`** collective operation (taking microseconds over **NVLink**, or milliseconds over **PCIe**).
+
+### D. Latency SLAs & Datacenter GPU SKUs
+* **TTFT, ITL, P99, SLA, & Pareto Frontier:** **TTFT** is Time to First Token; **ITL** is Inter-Token Latency ($t_{\text{step}}$ between output tokens); **P99** is 99th-percentile latency; **SLA** is the reliability contract. The **Pareto frontier** is the set of optimal configurations where you cannot lower unit cost further without worsening ITL.
+* **LoRA Adapters:** Lightweight fine-tuned weight patches served on top of a shared base model.
+* **GPU SKUs:**
+  * **NVIDIA L40S:** 48 GB slower **GDDR6** memory (0.864 TB/s), PCIe Gen4 only (no NVLink).
+  * **NVIDIA H100 SXM:** 80 GB HBM3 (3.35 TB/s), 900 GB/s NVLink 4.
+  * **NVIDIA H200 SXM:** 141 GB HBM3e (4.80 TB/s), 900 GB/s NVLink 4.
+  * **NVIDIA B200 SXM:** 192 GB HBM3e (8.00 TB/s), 1,800 GB/s NVLink 5, native **NVFP4** support.
+
+---
+
 ## 1. First-Principles Mathematical Derivation of Cost per 1M Tokens
 
 Every LLM serving platform converts **GPU-seconds rented ($C_{\text{gpu}} / 3600$)** into **tokens delivered**. Because LLM inference consists of two physically orthogonal phases—**compute-bound Prefill** (processing input tokens) and **memory-bandwidth-bound Decode** (generating output tokens)—a single blended token cost hides massive margin leaks. Rigorous FinOps models derive input and output unit costs separately from silicon physics.

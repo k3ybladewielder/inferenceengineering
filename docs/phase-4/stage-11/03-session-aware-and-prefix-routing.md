@@ -4,6 +4,25 @@
 
 ---
 
+Standard web load balancers spread requests evenly across servers, which accidentally destroys GPU prefix caches and forces every replica to recompute identical prompt prefixes. This document explains how inference-aware routers preserve Key-Value cache locality across replicas while preventing hot-prefix overload.
+
+## Core Concepts & Terminology
+
+* **KV Cache (Key-Value Cache):** Intermediate attention Key and Value tensors computed for prompt tokens and stored in GPU **HBM** (High-Bandwidth Memory) or CPU **DRAM** so subsequent steps or turns do not recompute them.
+* **Prefill, Decode, & FLOPs:** **Prefill** processes all input prompt tokens in parallel ($\approx 2 \cdot P \cdot L$ floating-point operations, or **FLOPs**, for a $P$-parameter model and $L$-token prompt). **Decode** generates output tokens sequentially one at a time.
+* **Tensor Parallelism (TP), FP8, & Tensor Cores:** **Tensor Parallelism** splits model layers across multiple GPUs (e.g., `TP=4`). **FP8** is an 8-bit floating-point format executed on specialized GPU matrix units (**Tensor Cores**) rated in **TFLOP/s** ($10^{12}$ FLOP/s) or **PFLOPs** ($10^{15}$ FLOPs).
+* **GQA (Grouped-Query Attention):** An attention design where multiple query heads share fewer Key/Value heads (e.g., 8 KV heads), shrinking per-token KV cache memory.
+* **Prefix Caching (`RadixAttention` / `APC` / `KV Cache Reuse`):** Engine-level reuse of stored KV blocks across requests sharing a leading token prefix. **SGLang `RadixAttention`** indexes prefixes in a **radix tree** (compressed prefix trie), while **vLLM `APC` (Automatic Prefix Caching)** indexes fixed-size token blocks by hash.
+* **TTFT & ITL:** **TTFT (Time to First Token)** is the wait until token 1 is emitted; **ITL (Inter-Token Latency)** is the time between consecutive output tokens.
+* **Round-Robin, Least-Connections, & LRU Eviction:** Standard proxies (`kube-proxy`, NGINX, Envoy) cycle requests sequentially (**Round-Robin**) or pick the fewest open sockets (**Least-Connections**). **LRU (Least Recently Used) eviction** discards the oldest unused KV blocks when HBM fills up.
+* **Consistent Hashing (`xxHash64`, `BLAKE3`, `Jump`, `HRW`, `Maglev`):** Deterministic mapping from a routing key (`session_id` or fast prefix hash via `xxHash64`/`BLAKE3`) to a replica so scaling by 1 node moves only $\sim 1/N$ of keys. **Jump Consistent Hash** is a zero-memory $O(\ln N)$ bucket mapper (tail-scaling only), whereas **Rendezvous Hashing (HRW)** and **Virtual-Node Hash Rings / Maglev** handle arbitrary crashed nodes cleanly.
+* **Hot-Prefix Overload & Bounded-Load Consistent Hashing:** **Hot-prefix overload** occurs when one popular prompt (Zipfian skew) overwhelms its single assigned GPU. **Bounded-load consistent hashing** enforces a per-replica load ceiling (`Cap`) using imbalance factor $\epsilon$, spilling excess traffic along a deterministic probe sequence to warm secondary replicas.
+* **KV Preemption & Head-of-Line Blocking:** **KV preemption** occurs when an overloaded GPU evicts or pauses active decode requests to free HBM. **Head-of-line blocking** occurs when requests queue behind heavy prefill work, spiking tail latency (**P95/P99**).
+* **Inference-Native Routers (SGLang Router, vLLM Production Stack / LMCache, NVIDIA Dynamo):** Routers that track live prefix placement and replica queue depth via **Prometheus**, **ZMQ** (ZeroMQ), or **NATS** messaging to balance cache affinity against queue wait time.
+* **Disaggregated Serving, RDMA, NIXL, & NVMe:** Separating **Prefill** GPUs from **Decode** GPUs and transferring computed KV blocks over **RDMA** (Remote Direct Memory Access) / **NIXL** zero-copy networking, or offloading cold KV blocks to CPU DRAM / **NVMe** SSDs.
+
+---
+
 ## 1. Why Naive Load Balancing Destroys Prefix Caching & RadixAttention
 
 Modern LLM serving engines—such as **SGLang** (`RadixAttention`), **vLLM** (`Automatic Prefix Caching / APC`), and **TensorRT-LLM** (`KV Cache Reuse`)—preserve computed Key-Value (KV) tensors across requests in GPU HBM (and CPU DRAM tiers) indexed by prefix token blocks or a radix tree. When an incoming request shares a prefix of $L_{\text{hit}}$ tokens with a resident KV cache entry, the engine skips prefilling those $L_{\text{hit}}$ tokens entirely.

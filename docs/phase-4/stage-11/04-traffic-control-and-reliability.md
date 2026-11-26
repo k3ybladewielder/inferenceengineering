@@ -4,6 +4,24 @@
 
 ---
 
+LLM requests vary by orders of magnitude in GPU cost and execution time, and streaming responses cannot be retried like ordinary web requests once tokens start flowing. This document explains token-aware rate limiting, SLO-aware circuit breakers, hedged requests, and mid-stream continuation failover for resilient AI gateways.
+
+## Core Concepts & Terminology
+
+* **RPM vs. TPM (ITPM & OTPM):** **RPM (Requests Per Minute)** counts HTTP calls regardless of size. **TPM (Tokens Per Minute)** governs admission by token volume, split into **ITPM (Input TPM)** for compute-bound **prefill** tokens and **OTPM (Output TPM)** for memory-bandwidth-bound **decode** tokens.
+* **KV Cache, HBM, FP8, `EOS`, & `max_tokens`:** **KV Cache** stores intermediate attention state in GPU **HBM** (High-Bandwidth Memory). **FP8** is 8-bit floating-point precision. Generation stops when the model emits an **`EOS` (End-of-Sequence)** token or hits the client's **`max_tokens`** limit.
+* **Token-Bucket vs. Sliding-Window Rate Limiting:** A **Token Bucket** tracks remaining quota and continuously refills at rate $R = \text{TPM}/60$ up to burst capacity $B$, often executed atomically via a **Redis Lua script**. A **Sliding-Window** (using a Redis Sorted Set `ZSET` or sub-window counters) tracks a rolling 60-second history to prevent double-spending bursts across minute boundaries.
+* **Two-Phase Reservation & Reconciliation (`RESERVE` / `REFUND`):** Because output length is unknown at admission, Phase 1 (`RESERVE`) counts input tokens (via fast tokenizers like `tiktoken`) and debits a conservative `max_tokens` estimate (returning **HTTP `429 Too Many Requests`** with `Retry-After` if exhausted). Phase 2 (`REFUND`) credits unused tokens back after stream completion (`[DONE]`, **EOF** / End-of-File, or error), while **orphaned lease protection** prevents leaked quotas if a pod crashes (`SIGKILL`).
+* **TTFT, ITL, & SLO:** **TTFT (Time to First Token)** is the wait until token 1 arrives; **ITL (Inter-Token Latency)** is the gap between consecutive output tokens. An **SLO (Service Level Objective)** defines acceptable latency/error thresholds.
+* **Gray Failure & KV-Block Swapping:** A **gray failure** occurs when a backend continues returning **`HTTP 200 OK`** while severely degraded (e.g., thermal throttling or CPU KV-block swapping), stalling TTFT and ITL.
+* **Circuit Breaker (`Closed`, `Open`, `Half-Open`) & Probe Semaphore:** A rolling health state machine per `(provider, region, model)` that isolates failing or SLO-breaching backends. **Closed** allows normal traffic; **Open** fails fast to a fallback for a cooldown period; **Half-Open** admits a few test probes guarded by an **atomic probe semaphore** to prevent a **thundering herd** of concurrent retries.
+* **SSE (Server-Sent Events):** An HTTP streaming protocol (`Content-Type: text/event-stream`) that pushes incremental `data:` token frames to the client.
+* **Exponential Backoff with Full Jitter & Retry Budget:** Randomizing retry delays uniformly within $[0, \min(T_{\max}, T_{\text{base}} \cdot 2^a)]$ eliminates synchronized **retry storms**. A **retry budget** caps total retry amplification (e.g., $\le 15\%$ of active **RPS** / Requests Per Second) bounded by `x-request-deadline-ms`.
+* **Hedged Requests & HTTP/2 `RST_STREAM`:** Dispatching a backup request to a secondary replica if the primary does not emit token #1 within a P95 TTFT timer, then cancelling the slower replica via **HTTP/2 `RST_STREAM` / `CANCEL`**.
+* **Mid-Stream Failure & Continuation Stitching:** Once `HTTP 200 OK` SSE headers and partial tokens are flushed, the gateway cannot replay from token 0. **Continuation stitching** buffers `partial_assistant_text` and resumes on a fallback model via assistant-prefill (`continue_final_message: true`).
+
+---
+
 ## 1. Why HTTP Request Rate Limiting (RPM) Fails for LLMs
 
 In conventional REST APIs, every request consumes roughly comparable CPU/DB work, making **Requests Per Minute (RPM)** an effective admission unit. In LLM inference, request cost spans **4 to 5 orders of magnitude**:

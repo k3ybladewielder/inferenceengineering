@@ -1,6 +1,34 @@
 # 05 — Engineering Technical Communication
 
-[← Pareto Frontier Analysis](./04-pareto-frontier-analysis.md) · [Stage 12 Overview](./README.md) · [Main Docs](../../README.md) · [Syllabus](../../syllabus.md)
+[← Pareto Frontier Analysis](./04-pareto-frontier-analysis.md) · [Stage 12 Overview](./README.md) · [Main Docs](../../README.md) · [Syllabus](../../syllabus.md) · [Next: Stage 12 Overview →](./README.md)
+
+---
+
+Writing a trustworthy systems teardown means connecting high-level application latency numbers all the way down to the exact instructions executing on GPU silicon, while packaging everything so another engineer can independently reproduce the result. This guide defines the structure, compiler-inspection workflow, and artifact standards for rigorous inference engineering reports.
+
+## Core Concepts & Terminology
+
+Every technical term, compiler representation, GPU hardware counter, and reproducibility concept used in this document is defined below in dependency order:
+
+* **Engineering Teardown, Falsifiable Hypothesis, & Ablation Toggles:** A **teardown** is an empirical systems report that proves *why* a performance change works. It begins with a **falsifiable hypothesis** (a specific quantitative prediction that data can disprove) and uses **ablation toggles** (enabling or disabling one optimization flag at a time) so every speedup is attributed to its exact cause.
+* **SLA, Pareto Knee, `TTFT`/`ITL`/`TPOT`/`E2E`, `P50`/`P95`/`P99`, & eCDF:** A **Service Level Agreement (SLA)** sets hard latency limits; the **Pareto knee** is the optimal throughput-versus-latency operating point on the SLA-compliant trade-off curve. **TTFT** (Time to First Token), **ITL** (Inter-Token Latency), **TPOT** (Time Per Output Token), and **E2E** (End-to-End) latency are reported at **P50/P95/P99** percentiles and plotted as **eCDFs** (Empirical Cumulative Distribution Functions) rather than averages.
+* **Open-Loop Poisson ($\lambda$), `ignore_eos`, & `client_dispatch_skew`:** **Open-loop Poisson ($\lambda$)** dispatches requests on an exponential schedule independent of server completion time. **`ignore_eos`** forces fixed output token counts for fair systems comparison. **`client_dispatch_skew`** measures how late the client event loop sent a request compared to its scheduled timestamp.
+* **Hardware/Software Invariants (`SKU`, `VBIOS`, `CUDA`/`cuBLAS`/`NCCL`, `NVLink`, `NUMA`, `DVFS`):** Fixed environment properties recorded before benchmarking: **GPU SKU** (exact chip model), **VBIOS** (GPU firmware), **CUDA/cuBLAS/NCCL** (NVIDIA compute, linear algebra, and multi-GPU communication libraries), **`nvidia-smi topo -m`** (PCIe vs. **NVLink** interconnect topology), **NUMA** (multi-socket CPU memory binding), and locked clocks to prevent **DVFS** (Dynamic Voltage and Frequency Scaling) boost drift.
+* **Roofline Bounds, Memory Bandwidth Utilization, & Warp:** **Roofline bounds** classify a kernel as limited by memory bandwidth or compute speed. On NVIDIA GPUs, a **warp** is a lockstep group of 32 threads executing together inside a **Streaming Multiprocessor (SM)**—a GPU's core compute block.
+* **GPU Memory Hierarchy (`HBM`, `L1/L2`, `Shared Memory / SMEM`, `Local Memory`, `TMA`, `cp.async`):** **HBM** is large, slower off-chip GPU memory; **L1/L2** are hardware caches; **Shared Memory (SMEM)** is fast on-chip scratchpad memory shared by a **CTA (Cooperative Thread Array / threadblock)** of warps. **`cp.async`** and Hopper's **TMA (Tensor Memory Accelerator, `UTMALDG`)** copy data from HBM to SMEM asynchronously in the background while **Tensor Cores** run matrix math (**`wgmma` / `QGMMA`**).
+* **GPU Compiler Lowering Stack (`DSL`, `MLIR`, `SSA`, `LLVM IR`, `TTIR`, `TTGIR`, `PTX`, `SASS`):** High-level **Triton** Python kernels (a **DSL**, Domain-Specific Language) pass through four lowering stages:
+  1. **TTIR (Triton IR, `.ttir`):** Target-independent **MLIR** (Multi-Level Intermediate Representation) in **SSA (Static Single Assignment)** form, where each variable is assigned once so algebraic fusion (e.g., merging **RMSNorm**, **FP8** scaling, and casting) can be verified.
+  2. **TTGIR (Triton GPU IR, `.ttgir`):** Target-aware layout assignment verifying **coalesced** 128-bit memory loads (combining adjacent thread reads into one transaction) and asynchronous pipelining (`num_stages`).
+  3. **PTX (Parallel Thread Execution, `.ptx`):** Virtual, portable NVIDIA assembly emitted from **LLVM IR** using infinite virtual registers.
+  4. **SASS (Streaming Assembler):** The actual native binary machine code for specific GPU architectures (`sm_80` Ampere, `sm_89` Ada, `sm_90a` Hopper, `sm_100a` Blackwell), compiled by **`ptxas`** into a **`.cubin`** binary and dumped via **`cuobjdump --dump-sass`**.
+* **SASS & Nsight Compute (`ncu`) Diagnostics:** **`ncu`** is NVIDIA's hardware-counter profiler. Key signals include:
+  * **Register Spilling (`STL`/`LDL`, `.local`):** Overflowing the 255-register-per-thread limit into slow off-chip HBM **`.local`** memory.
+  * **Occupancy:** Ratio of active warps on an SM to the hardware maximum, needed to hide HBM latency.
+  * **Scoreboard Barriers (`DEPBAR`) & `stall_long_scoreboard`:** Hardware wait instructions where warps pause until asynchronous memory loads finish.
+  * **Shared-Memory Bank Conflicts & XOR Swizzling:** Contention when threads hit the same SMEM memory bank simultaneously; eliminated by permuting tile indices (**XOR swizzling**).
+  * **Warp Divergence vs. Predication:** Serialization when threads in a warp take different `if/else` branches (`bra`), versus branchless conditional execution (**predication**, `selp`).
+  * **Pipe Saturation (`ALU` / `MIO` / Tensor):** Whether execution is bottlenecked on Tensor Core matrix math or vector **ALU** (Arithmetic Logic Unit) / **MIO** (Memory Input/Output, e.g., **RoPE** position encoding or softmax) pipes.
+* **OCI Container Digest (`@sha256`), `JSONL` (`.jsonl.zst`), `Makefile`, & `Polars`:** An **OCI container digest (`@sha256:...`)** is an immutable cryptographic fingerprint of a Docker/container image (unlike mutable `:latest` tags). **JSONL** (JSON Lines, compressed with Zstandard as **`.jsonl.zst`**) stores one raw request record per line. A **`Makefile`** automates reproduction (`make reproduce`), and **`Polars`** is a fast DataFrame library used to aggregate traces into charts.
 
 ---
 
