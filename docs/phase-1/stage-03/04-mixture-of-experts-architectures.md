@@ -2,6 +2,28 @@
 
 [← 03. Attention Memory & Long Contexts](./03-attention-memory-and-long-contexts.md) | [Stage 3 Overview](./README.md) | [Next: 05. Efficiency Metrics: MFU and MBU →](./05-efficiency-metrics-mfu-and-mbu.md)
 
+Mixture-of-Experts models pack hundreds of billions of parameters into memory while running only a small fraction of them on each word. This document explains how sparse routing works, why it slashes compute during prompt processing, and why it unexpectedly hits a memory-bandwidth wall during token-by-token generation.
+
+---
+
+## Core Concepts & Terminology
+
+Each concept below is ordered so later definitions build only on earlier ones:
+
+* **Token, Hidden State ($x_t$), and Transformer Block:** A **token** is the basic unit of text, represented inside a layer by a vector $x_t$ of length $d_{\text{model}}$. Each Transformer block applies **Attention**, **RMSNorm** (Root Mean Square Normalization), a **residual connection** (adding the input $x_t$ back to the sub-layer output), and a **Feed-Forward Network (FFN)**.
+* **Dense Transformer vs. Mixture-of-Experts (MoE):** In a **dense** Transformer, every token passes through 100% of every layer's weights. **MoE** replaces the single large FFN in each block with $E$ smaller parallel FFN sub-networks called **experts**, activating only $K \ll E$ experts per token.
+* **Total Parameters ($P_{\text{total}}$) vs. Active Parameters ($P_{\text{active}}$):** $P_{\text{total}}$ is every weight stored in GPU memory (embeddings, the final vocabulary **LM head**, attention layers, norms, routers, and all $E$ experts). $P_{\text{active}}$ is the subset of weights actually executed to process one token.
+* **Gating (Router) Network, Logits ($h_t$), and Top-$K$ Routing:** A small linear layer ($W_g$) that scores each expert for token $x_t$ (producing raw scores called **logits** $h_t$) and selects the **Top-$K$** highest-scoring experts.
+* **Softmax vs. Sigmoid Gating:** **Softmax** converts logits into probabilities summing to $1$ (forcing experts to compete); **Sigmoid** ($\sigma(h) = 1 / (1 + e^{-h})$) scores each expert independently between $0$ and $1$ before Top-$K$ selection and normalization.
+* **Routing Collapse, Load Balancing, and Perplexity:** **Routing collapse** occurs during training when a few experts capture almost all tokens while others go unused, creating **stragglers** (overloaded GPUs). **Auxiliary loss** ($\mathcal{L}_{\text{aux}}$) and **router z-loss** penalize uneven routing, whereas **auxiliary-loss-free bias balancing** adjusts a per-expert selection bias $b_i$ without hurting **perplexity** (text prediction error).
+* **Shared Experts ($N_s$) vs. Routed Experts ($N_r$ / $E$):** **Shared experts** execute unconditionally on every token to capture common language patterns; **routed experts** are fine-grained specialists selected conditionally by the router.
+* **Expert Capacity ($C$), Capacity Factor ($\text{CF}$), and Token Dropping:** Early MoE systems allocated fixed buffers of $C$ tokens per expert; if more than $C$ tokens picked an expert, excess tokens were **dropped** (skipped) while underfilled experts wasted work on zero-padding.
+* **Grouped GEMM (Dropless MoE):** A GPU matrix multiplication that groups tokens by expert ID and runs variable-sized matrix multiplies ($M_i \times K \times N$) in one launch without padding zeros or dropping tokens.
+* **HBM, SRAM, Numerical Precision (FP32, BF16, FP8, FP4), and FLOPs:** **HBM** is off-chip GPU memory (VRAM); **SRAM** is fast on-chip memory. **FP32** (4 B), **BF16** (2 B), **FP8** (1 B), and **FP4** (0.5 B) are number formats. **FLOPs** counts floating-point math operations.
+* **GEMV, Arithmetic Intensity ($I$), Ridge Point ($I^*$), and Memory-Bound vs. Compute-Bound:** **GEMM** multiplies two matrices ($M > 1$); **GEMV** multiplies a single vector by a matrix ($M = 1$). **Arithmetic intensity** ($I = \text{FLOPs} / \text{Bytes}_{\text{HBM}}$) below the GPU's **ridge point** ($I^*$) is **memory-bound** (compute units stall waiting for HBM reads); at or above $I^*$ is **compute-bound**.
+* **Prefill, Decode, ITL, and Prefill/Decode Disaggregation:** **Prefill** processes prompt tokens in parallel; **Decode** generates 1 token per request per step (measured by **ITL**, Inter-Token Latency). **Disaggregation** separates Prefill and Decode onto independent GPU pools.
+* **Data Parallelism (DP), Expert Parallelism (EP), and All-to-All Dispatch:** **DP** runs different request batches on separate GPUs; **EP** places different experts on different GPUs (ranks). **All-to-All** is a collective network exchange where every GPU routes tokens to whichever GPU holds their chosen expert.
+
 ---
 
 ## 1. Sparse Scaling: Total Parameters vs. Active Parameters per Token

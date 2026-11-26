@@ -2,6 +2,32 @@
 
 [← 02. KV Cache Mathematics](./02-kv-cache-mathematics.md) | [Stage 3 Overview](./README.md) | [Next: 04. Mixture-of-Experts Architectures →](./04-mixture-of-experts-architectures.md)
 
+Handling prompts of tens or hundreds of thousands of tokens hits two distinct memory walls: the temporary score tables created inside Attention during prompt processing, and the ever-growing history buffer during token generation. This document explains the exact math behind both bottlenecks and the algorithms—tiling, online softmax, position scaling, and sliding windows—that keep long-context inference feasible.
+
+---
+
+## Core Concepts & Terminology
+
+Each concept below is ordered so later definitions build only on earlier ones:
+
+* **Token, Sequence Length ($N$ or $S$), and Batch Size ($B$):** A **token** is the basic unit of text; $N$ (or $S$) is the number of tokens in a sequence; $B$ is the number of sequences processed together.
+* **Self-Attention ($Q, K, V$, $d_{\text{head}}$), Causal Mask ($M_{\text{causal}}$), and Softmax:** Each attention head multiplies Query ($Q$) and Key ($K$) matrices to get raw scores $S = QK^T / \sqrt{d_{\text{head}}}$, applies a **causal mask** $M_{\text{causal}}$ (setting future positions $j > i$ to $-\infty$), applies **softmax** (converting scores into positive weights summing to $1$), and multiplies by Value ($V$) to produce output $O = PV$.
+* **Asymptotic Notation ($O(\cdot)$, $\Theta(\cdot)$) & Quadratic ($O(N^2)$) Complexity:** $O(N^2)$ means memory or compute grows with the square of sequence length $N$ (doubling $N$ quadruples cost); $\Theta(\cdot)$ denotes tight upper and lower growth bounds.
+* **HBM (High Bandwidth Memory, e.g., HBM3), VRAM, and OOM:** **HBM** is the GPU's main off-chip memory (**VRAM**, e.g., 80 GB on an H100). Exceeding it causes an **OOM (Out-of-Memory)** crash.
+* **SRAM (On-Chip Shared Memory) & SM (Streaming Multiprocessor):** Tiny, ultra-fast memory built directly inside each GPU compute block (**SM**, e.g., ~228 KB per SM on H100).
+* **GPU Kernel, GEMM, and Kernel Fusion:** A **kernel** is a function launched on the GPU. **GEMM** is General Matrix-Matrix Multiplication. **Kernel fusion** merges multiple consecutive steps into one kernel so intermediate results stay in SRAM instead of traveling back and forth to HBM.
+* **Tiling & FlashAttention:** **Tiling** splits $Q, K, V$ into small blocks ($B_r, B_c$) that fit inside SRAM. **FlashAttention** uses tiling to compute exact attention using only $O(N)$ HBM memory instead of $O(N^2)$.
+* **Online Softmax:** A streaming method that computes exact softmax in one pass over $K, V$ blocks by tracking a running row maximum $m_i$ and rescaling earlier partial sums with $\alpha = \exp(m_i^{(j-1)} - m_i^{(j)})$.
+* **RoPE (Rotary Position Embedding), Frequency ($\theta_i$), Wavelength ($\lambda_i$), and Perplexity:** **RoPE** encodes token position $m$ by rotating pairs of vector dimensions by angle $m\theta_i$, where $\theta_i$ is the rotation **frequency** and $\lambda_i = 2\pi / \theta_i$ is its **wavelength** (tokens per full $2\pi$ rotation). **Perplexity** measures model prediction error on text (lower is better; a sudden spike means quality has collapsed).
+* **RoPE Scaling ($L_{\text{train}}$, $s = L_{\text{target}} / L_{\text{train}}$): Linear PI, NTK-Aware, and YaRN:** Methods to extend a model beyond its training length $L_{\text{train}}$ by factor $s$:
+  * **Linear Position Interpolation (PI):** Divides positions by $s$ to squeeze them into $[0, L_{\text{train}}]$.
+  * **NTK-Aware Scaling:** Increases the RoPE base $\theta_{\text{base}}$ so fast-rotating (local) dimensions stay intact while slow-rotating (long-range) dimensions stretch.
+  * **YaRN (Yet another RoPE extensioN):** Blends scaling across frequency bands by wavelength ("NTK-by-parts") and adjusts attention **temperature** $t$ to keep scores sharp over long contexts.
+* **Prefill, Decode, TTFT, KV Cache, and Activations:** **Prefill** processes all $N$ prompt tokens in parallel (setting **TTFT**, Time to First Token); **Decode** generates 1 token per step while reading the **KV Cache** (saved $K, V$ vectors for past tokens). **Activations** are temporary per-layer tensors (such as **SwiGLU MLP** $d_{\text{ffn}}$ buffers) discarded after each layer.
+* **Preemption, KV Eviction, and CPU Offloading:** Engine fallback actions when concurrent KV Caches exceed VRAM: pausing requests (**preemption**), discarding their cached KV blocks (**eviction**), or copying them to slower CPU RAM (**offloading**).
+* **Sliding Window Attention (SWA), Ring Buffer, and Receptive Field:** **SWA** restricts each token to attend only to the most recent $W$ tokens using a fixed-size circular **ring buffer**. Across $L$ stacked layers, information still propagates across a **receptive field** of $L \times W$ tokens.
+* **Attention Sinks (StreamingLLM) & `<bos>` Token:** Because softmax weights must sum to $1$, heads dump unused probability mass onto the first few tokens (like `<bos>`, the beginning-of-sequence token), termed **attention sinks**. Pinning $k_{\text{sink}}$ initial tokens alongside the sliding window prevents quality collapse in long streams.
+
 ---
 
 ## 1. Quadratic $O(N^2)$ Attention Complexity vs. Memory Linearization

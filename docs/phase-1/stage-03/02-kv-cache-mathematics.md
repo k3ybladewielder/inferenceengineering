@@ -2,6 +2,34 @@
 
 [← 01. Inference Phase Anatomy](./01-inference-phase-anatomy-prefill-vs-decode.md) | [Stage 3 Overview](./README.md) | [Next: 03. Attention Memory & Long Contexts →](./03-attention-memory-and-long-contexts.md)
 
+As a language model generates a long response, it must remember every previous word without re-reading the entire conversation from scratch on every step. This document derives the exact memory formulas behind that memory buffer and compares the attention designs used by modern models to keep it from exhausting GPU memory.
+
+---
+
+## Core Concepts & Terminology
+
+Each concept below is ordered so later definitions build only on earlier ones:
+
+* **Token & Context Length ($S$):** A **token** is the basic unit of text (word or sub-word) processed by a model; **context length ($S$)** is the total number of tokens in a sequence ($S_{\text{prompt}} + S_{\text{generated}}$).
+* **Transformer & Layers ($n_{\text{layers}}$):** A neural network built from $n_{\text{layers}}$ stacked blocks, each containing a *Self-Attention* sub-layer and a Feed-Forward Network.
+* **Hidden State ($x_t$) & Model Dimension ($d_{\text{model}}$):** The vector of length $d_{\text{model}}$ representing token $t$ as it flows from one layer to the next.
+* **Query ($Q$), Key ($K$), Value ($V$) & Head Dimension ($d_{\text{head}}$):** Inside Self-Attention, $x_t$ is multiplied by learned weight matrices ($W_Q, W_K, W_V$) to create **Query** (what token $t$ looks for), **Key** (what each token advertises), and **Value** (what content each token passes along) vectors, split across parallel attention **heads** of width $d_{\text{head}}$.
+* **Causal Self-Attention & Softmax:** Attention compares a Query $q_t$ against all past and current Keys $K_{1:t}$, divides by $\sqrt{d_{\text{head}}}$, applies **softmax** (turning raw scores into positive weights that sum to $1$), and takes a weighted sum of Values $V_{1:t}$. **Causal masking** prevents token $i$ from attending to future tokens $> i$.
+* **Prefill vs. Decode:** **Prefill** processes all prompt tokens in parallel in one pass; **Decode** generates one new token per step, feeding each new token back as input.
+* **HBM (High Bandwidth Memory, e.g., HBM3) & VRAM:** The main off-chip GPU memory (often called VRAM; e.g., 80 GB on an NVIDIA H100) holding model weights, activations, and cached tensors.
+* **KV (Key-Value) Cache:** Stored Key and Value vectors $(k_i, v_i)$ saved in GPU HBM for all previously processed tokens so Decode only projects the single newest token instead of recomputing $K_{1:t}, V_{1:t}$ from scratch (which would turn $O(S^2)$ total work into $O(S^3)$).
+* **Numerical Precision ($b$ bytes/param: FP32, BF16, FP16, FP8, INT8):** Storage size per number: **FP32** (4 bytes), **BF16 / FP16** (2 bytes), **FP8** (1 byte; E4M3 and E5M2 are 8-bit floating-point bit layouts), and **INT8** (1-byte integer).
+* **Binary vs. Decimal Units (KiB/MiB/GiB vs. KB/MB/GB) & ECC:** Binary units use powers of $2$ ($1\text{ KiB} = 1{,}024\text{ B}$, $1\text{ MiB} = 2^{20}\text{ B}$, $1\text{ GiB} = 2^{30}\text{ B}$); decimal units use powers of $10$ ($1\text{ GB} = 10^9\text{ B}$). **ECC (Error-Correcting Code)** reserves a small portion of VRAM to detect and repair hardware memory bit errors.
+* **MHA, MQA, and GQA (Attention Head Sharing Variants):**
+  * **MHA (Multi-Head Attention):** Every Query head has its own dedicated Key and Value head ($n_{\text{kv\_heads}} = n_{\text{q\_heads}}$).
+  * **MQA (Multi-Query Attention):** All Query heads share a single Key head and single Value head ($n_{\text{kv\_heads}} = 1$).
+  * **GQA (Grouped-Query Attention):** Query heads are split into $n_{\text{kv\_heads}}$ groups, where each group of $G = n_{\text{q\_heads}} / n_{\text{kv\_heads}}$ Query heads shares one Key and Value head.
+* **Tensor Parallelism (TP) & TP Ranks:** Splitting model layers across multiple GPUs (called *ranks*); if $\text{TP} > n_{\text{kv\_heads}}$, KV heads must be duplicated across ranks instead of partitioned cleanly.
+* **Low-Rank Projection & Latent Vector ($c_t^{KV}$):** Compressing a high-dimensional vector into a compact intermediate ("latent") vector of size $d_c \ll n_h d_h$ via a down-projection matrix, then expanding back up when needed.
+* **RoPE (Rotary Position Embedding):** An encoding that injects token position $t$ by multiplying Query and Key vectors by a position-dependent 2D rotation matrix $R_t$.
+* **MLA (Multi-Head Latent Attention) & Matrix Absorption:** DeepSeek's attention mechanism that jointly compresses $K$ and $V$ into one latent vector $c_t^{KV}$ plus a small **decoupled RoPE key** $k_t^R$. During Decode, **matrix absorption** uses matrix associativity to fold up-projection matrices ($W^{UK}, W^{UV}$) into $W_Q$ and $W_O$ so full $K^C, V^C$ tensors never need to be materialized in HBM.
+* **CUDA Context & Activation Workspace:** Baseline GPU memory reserved by the NVIDIA CUDA driver/runtime and temporary scratchpad buffers used during layer execution.
+
 ---
 
 ## 1. Why the KV Cache Exists: Trading Memory for Quadratic Compute

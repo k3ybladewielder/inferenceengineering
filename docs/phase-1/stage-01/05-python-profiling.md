@@ -4,6 +4,37 @@
 
 ---
 
+This document teaches how to measure and diagnose whether an AI inference server is slowed down by Python CPU overhead, memory leaks, or the GPU itself. Every Python runtime, profiling, GPU-execution, and AI-inference term used below is defined first in plain English.
+
+## Core Concepts & Terminology
+
+### 1. Python Runtime, Concurrency, & OS Processes
+* **CPython, Bytecode, & Reference Counting:** Standard Python (**CPython**) compiles code into **bytecode** instructions and tracks object lifetimes with a **reference count** (`PyObject->ob_refcnt`) on every object.
+* **OS Process, PID, Thread, RSS, & OOM-Killer:** An **OS Process** (identified by a **PID**, Process ID) is an isolated running program with its own private memory. A **Thread** is an execution stream inside a process sharing the same memory. **RSS (Resident Set Size)** is how much physical RAM a process currently occupies; if RSS grows unchecked (**memory leak**), the **Linux OOM-killer** terminates the process.
+* **Mutex, Condition Variable, & the GIL (Global Interpreter Lock):** A **mutex** (mutual exclusion lock) and **condition variable** coordinate threads so two threads do not corrupt shared data simultaneously. CPython protects its non-atomic reference counts with a single global lock—the **GIL**—allowing **only one thread to execute Python bytecode at any instant** (switching roughly every `sys.getswitchinterval()` = 5 ms, unless a C extension explicitly drops the lock via `Py_BEGIN_ALLOW_THREADS`). **GIL Convoying** happens when one thread holds the GIL for heavy CPU work (like **`asyncio`/FastAPI** HTTP JSON parsing or **Pydantic** validation), starving another thread that needs the GIL just to launch the next GPU step.
+* **Process Isolation & FFI (`multiprocessing`, ZeroMQ IPC, `PyO3`/`nanobind`):** To bypass the GIL, servers run separate processes (`multiprocessing`) communicating over **ZeroMQ IPC (Inter-Process Communication)**, or move CPU work into C++/Rust extensions via **FFI** (`PyO3`/`nanobind`) that release the GIL.
+
+### 2. CPU & Memory Profiling Concepts
+* **Deterministic vs. Sampling Profiling & Heisenberg Distortion:** **Deterministic profiling** hooks every single function call and return, giving exact counts at the cost of slowing down the program (**Heisenberg distortion**: the profiler changes the timing you are trying to measure). **Sampling profiling** pauses or inspects the program periodically (e.g., 250 times per second = 250 Hz) with <1–2% overhead.
+* **`cProfile` (`sys.setprofile`, `ncalls`, `tottime`, `cumtime`):** Python's built-in deterministic profiler (`sys.setprofile`). It reports **`ncalls`** (call count), **`tottime`** (time spent strictly inside that function), and **`cumtime`** (time inside that function plus everything it called).
+* **`tracemalloc` (`PyMem_*` / `PyObject_*`, `nframe`):** Python's built-in CPU heap allocator tracker. It records the exact source line and stack depth (**`nframe`**) of Python heap allocations (not GPU VRAM or raw C `malloc`).
+* **`py-spy` & Flamegraphs:** **`py-spy`** is an external sampling profiler that reads a running process's memory (`process_vm_readv`, requiring `CAP_SYS_PTRACE` or matching user permissions) without touching the GIL, capturing Python + C/C++/Rust stacks (`--native`), GIL-holding threads (`--gil`), or sleeping threads (`--idle`). Its output is a **Flamegraph**: the **Y-axis** shows call-stack depth (caller at bottom, active leaf function at top), while the **X-axis** shows **sample proportion** sorted alphabetically (NOT chronological time!).
+
+### 3. CUDA, GPU Execution, & `torch.profiler`
+* **GPU SMs, Tensor Cores, & HBM:** A GPU contains dozens of **Streaming Multiprocessors (SMs)** packed with **Tensor Cores** (fast matrix math units) fed by high-speed **HBM (High Bandwidth Memory)**. `nvidia-smi dmon` monitors live SM and memory utilization.
+* **CUDA Runtime, CUDA Driver, CUDA Stream, & Asynchronous Launches:** Programs talk to NVIDIA GPUs through the **CUDA Runtime / Driver**. A **CUDA Stream** is an in-order queue of GPU commands. Normally, CPU calls like **`cudaLaunchKernel`** or **`cudaMemcpyAsync`** are **asynchronous**: the CPU drops a command into the stream queue in microseconds and immediately moves on while the GPU executes later.
+* **Implicit CUDA Synchronization & GPU Bubbles:** If Python asks for a value stored on the GPU (via `tensor.item()`, `tensor.cpu()`, `tensor.numpy()`, `print(tensor)`, or dynamic-shape ops like `torch.nonzero()` / `torch.unique()`), CUDA silently injects **`cudaMemcpyDtoH`** (Device-to-Host copy) + **`cudaStreamSynchronize`** (or `cudaDeviceSynchronize`), freezing the CPU until the entire GPU queue drains. This leaves idle empty gaps—called **GPU Bubbles**—on the GPU timeline.
+* **CPU-Launch-Bound vs. GPU-Bound, Operator Fusion, & CUDA Graphs:** If the GPU finishes tiny kernels faster than the CPU can call `cudaLaunchKernel`, the workload is **CPU-launch-bound** (fixed by **Operator Fusion** via **`torch.compile` JIT** or **Triton**, or **CUDA Graphs** that replay a whole sequence of kernels in one launch). If the GPU SMs or HBM are >85% busy with no gaps, it is **GPU-bound**. (`cudaMalloc` allocates GPU VRAM; **cuBLAS heuristic tuning** picks fast matrix kernels on step 0.)
+* **`torch.profiler`, CUPTI, ATen/Autograd, & Perfetto:** **`torch.profiler`** combines PyTorch's C++ **ATen/Autograd** CPU trace with **NVIDIA CUPTI (CUDA Profiling Tools Interface)** hardware GPU timestamps (matched by **`correlation_id`**) into a unified timeline viewed in **Perfetto (`ui.perfetto.dev`)** or Chrome Tracing. Using `schedule(wait, warmup, active, repeat)` skips cold-start noise, and `record_function` adds custom labels.
+* **Pinned Memory, SIMD, SoA, & False Sharing:** **Pinned H2D/D2H memory** enables full-speed DMA transfers between host RAM and GPU. **SIMD** (vector CPU instructions), **SoA** (Structure of Arrays), and **False Sharing** (cache-line contention across threads) are CPU hot-path optimization concepts covered in [04 — C/C++ and Rust on the Hot Path](./04-c-cpp-and-rust-on-the-hot-path.md).
+
+### 4. LLM Inference Metrics & Operations
+* **Tokens/s, TTFT, ITL, & Roofline Model:** Inference speed is measured in output **tokens per second**, **TTFT (Time To First Token)**, and **ITL (Inter-Token Latency)**. The **Roofline model** compares achieved speed against the hardware's theoretical compute and memory-bandwidth ceilings.
+* **Decode Loop, `EOS_ID`, & KV Metadata:** The **decode loop** generates one token per step until **`EOS_ID`** (End-Of-Sequence token). **KV metadata** tracks Key-Value attention cache blocks.
+* **BPE Pre-Tokenizer, SSE Streaming, & Transformer Ops:** **BPE pre-tokenizers** split text with regex before encoding; **SSE (Server-Sent Events)** streams tokens as JSON over HTTP. **RMSNorm**, **RoPE** (Rotary Position Embedding), **QKV bias**, and **SiLU** are small per-layer neural network operations; **Quantization**, **FlashAttention**, and **Batching** are GPU-level optimizations.
+
+---
+
 ## 1. The Python GIL Bottleneck in Inference Pipelines
 
 In standard CPython (3.8–3.12, and default builds of 3.13+), memory management relies on non-atomic reference counting (`PyObject->ob_refcnt`). To prevent two OS threads from corrupting reference counts or internal dicts simultaneously, CPython enforces the **Global Interpreter Lock (GIL)**: a single mutex + condition variable allowing **only one thread to execute Python bytecode at any instant**.

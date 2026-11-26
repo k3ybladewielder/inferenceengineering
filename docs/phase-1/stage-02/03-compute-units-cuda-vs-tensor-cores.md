@@ -4,6 +4,38 @@
 
 ---
 
+This document contrasts the two arithmetic engines inside every NVIDIA GPU—scalar CUDA Cores and matrix-oriented Tensor Cores—and explains the low-precision numeric formats that power modern LLM inference. Understanding how these units process data and accumulate partial sums is key to maximizing throughput without sacrificing model accuracy.
+
+## Core Concepts & Terminology
+
+Every technical term, acronym, hardware unit, and numeric format used in this guide is defined below in dependency order:
+
+* **SM (Streaming Multiprocessor), SM Sub-Partition, Warp, & Warpgroup:** An **SM** is an independent processing complex inside a GPU (divided into 4 **SM Sub-Partitions**). A **Warp** is 32 threads executing together; a **Warpgroup** (introduced in Hopper) is 4 consecutive warps (**128 threads**) acting as a single collective unit across all 4 sub-partitions.
+* **Thread Block (CTA) & Register File / Shared Memory (SMEM):** A **CTA (Cooperative Thread Array)** is a Thread Block running on an SM. The **Register File** is the fastest per-SM storage for 32-bit values; **Shared Memory (SMEM)** is fast on-chip SRAM scratchpad memory shared by threads in a CTA.
+* **ALU & CUDA Core:** An **ALU (Arithmetic Logic Unit)** performs basic math and logic. **CUDA Cores** are the SM's scalar ALU pipelines, executing one instruction per thread per cycle (for example, `FFMA`, **Fused Multiply-Add / FMA**, computing $d = a \times b + c$).
+* **FLOP, FLOP/s, TFLOPS, PFLOPS, & MAC:** A **FLOP** is a single floating-point operation (an FMA counts as 2 FLOPs: one multiply + one add). **TFLOPS** = $10^{12}$ FLOP/s; **PFLOPS** = $10^{15}$ FLOP/s. A **MAC (Multiply-Accumulate)** is one multiply-add pair (2 FLOPs).
+* **TDP (Thermal Design Power):** The maximum sustained heat/power (in Watts) a chip is designed to dissipate, which caps sustained boost clock frequencies under heavy load.
+* **Tensor Core, MMA, & GEMM:** **Tensor Cores** are dedicated matrix-math hardware engines that execute **MMA (Matrix Multiply-Accumulate)**—computing $D_{M \times N} = A_{M \times K} \times B_{K \times N} + C_{M \times N}$ ($2MNK$ FLOPs) in one macro-instruction. **GEMM** is dense matrix-matrix multiplication.
+* **Von Neumann / Register-File Bottleneck & Systolic Array:** The **Von Neumann / Register-File Bottleneck** occurs when scalar cores spend more bandwidth fetching/writing register operands than doing math. Tensor Cores use **systolic-style dot-product arrays** that load matrix tiles once and broadcast them across multipliers, turning $O(MK + KN)$ bytes read into $O(MNK)$ MACs.
+* **2:4 Structured Sparsity:** A hardware acceleration mode where at least 2 out of every 4 contiguous weights are zero, allowing Tensor Cores to skip zeros and double throughput.
+* **PTX Matrix Instructions (`mma.sync`, `ldmatrix`, `wgmma.mma_async`, `tcgen05.mma`) & TMEM:**
+  * **`mma.sync`** (Ampere): Warp-level (32 threads) synchronous MMA using general-purpose registers, typically loaded from SMEM via **`ldmatrix`** (a bank-conflict-free matrix load).
+  * **`wgmma.mma_async`** (Hopper): Warpgroup-level (128 threads) asynchronous MMA that reads matrix $B$ (and optionally $A$) directly from swizzled SMEM via a 64-bit **matrix descriptor (`smem_desc`)**, managed with `wgmma.fence`, `wgmma.commit_group`, and `wgmma.wait_group`.
+  * **`tcgen05.mma` & TMEM (Tensor Memory)** (Blackwell): Single-thread-issued 5th-gen MMA using **TMEM**—256 KB of dedicated matrix accumulator memory per SM separate from the register file—and supporting **2-CTA cooperative MMA** across paired SMs.
+* **Floating-Point Anatomy (Sign, Exponent, Mantissa/Significand, Bias, Subnormal, Binade, `Inf`/`NaN`, ULP):**
+  * A floating-point number encodes $1$ **Sign ($S$)** bit, $E$ **Exponent** bits (shifted by an **Exponent Bias** $b$), and $M$ **Mantissa (significand)** fraction bits.
+  * **Subnormal** numbers represent tiny values near zero with reduced precision; a **binade** is one power-of-2 interval $[2^k, 2^{k+1})$.
+  * **`Inf` / `NaN`** are special bit patterns for Infinity and Not-a-Number.
+  * **ULP (Unit in the Last Place)** is the gap between two adjacent representable numbers; **Swamping (Absorption)** happens when a large running sum's ULP exceeds small incoming terms, rounding them to zero.
+  * **Mixed-Precision Accumulation & Epilogue:** Multiplying low-precision inputs and summing into high-precision **FP32 accumulators**, downcasting only in the **epilogue** (final output step).
+* **Low-Precision Formats (`FP32`, `FP16`, `BF16`, `INT8`, `FP8 E4M3/E5M2`, `FP4 E2M1`, `MXFP4`, `NVFP4`, `W4A4`):**
+  * **FP32** `(1,8,23)` and **FP16** `(1,5,10)` are IEEE 32-bit and 16-bit floats; **BF16 (Brain Float 16)** `(1,8,7)` trades mantissa bits for FP32's wide dynamic range. **INT8** is 8-bit integer.
+  * **FP8 (`E4M3` & `E5M2`, OFP8 standard):** 8-bit floats; `E4M3` omits `Inf` for extra precision (ideal for inference), while `E5M2` keeps `Inf` and wider range (for gradients/outliers).
+  * **FP4 (`E2M1`), MXFP4, & NVFP4:** 4-bit float (`E2M1`) has only 16 bit patterns; **Microscaling** shares one scale factor per block of elements—**MXFP4** (OCP standard: 32 elements + 8-bit `E8M0` power-of-2 scale) and **NVFP4** (Blackwell: 16 elements + `E4M3` scale). **W4A4** means 4-bit weights and 4-bit activations.
+* **LLM Inference Terms:** **Transformer Linear Layers (`QKV`, `O`, `FFN`)**, **Activations (`SiLU`, `GELU`)**, **`RMSNorm`**, **`Softmax` (`exp2`, `rcp`)**, **RoPE**, **KV Cache**, **Perplexity** (a text-prediction quality metric; lower is better), and **DeepSeek-V3** (an open-weight model whose training/inference analysis highlighted Hopper's ~14-bit FP8 intermediate accumulation width).
+
+---
+
 ## 1. CUDA Cores vs. Tensor Cores: Architectural Divide
 
 Every Streaming Multiprocessor (SM) contains two fundamentally distinct classes of arithmetic hardware:

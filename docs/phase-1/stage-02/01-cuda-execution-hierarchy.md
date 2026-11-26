@@ -4,6 +4,57 @@
 
 ---
 
+This document explains how NVIDIA GPUs organize and schedule thousands of parallel tasks, from the code a programmer writes down to the silicon hardware that executes it. Understanding this hierarchy is essential for diagnosing why Large Language Model (LLM) inference stalls or leaves hardware idle.
+
+## Core Concepts & Terminology
+
+Every technical term, acronym, hardware unit, and inference concept used in this guide is defined below in dependency order:
+
+* **GPU (Graphics Processing Unit) & Kernel:** A **GPU** is a processor containing thousands of simple arithmetic lanes designed to run the same program across many data elements simultaneously. A **kernel** is a function written to execute in parallel across thousands of GPU workers.
+* **Host vs. Device:** The **host** is the CPU and its main system memory (RAM); the **device** is the GPU and its own dedicated memory.
+* **CUDA (Compute Unified Device Architecture) & CUDA C++:** NVIDIA's parallel computing platform and C++ language extension used to write, compile, and launch GPU kernels.
+* **PTX ISA, `nvcc`, `ptxas`, & SASS:** An **ISA** (Instruction Set Architecture) is the formal set of instructions a processor understands. **PTX** (Parallel Thread Execution) is NVIDIA's hardware-independent virtual assembly language. The compiler **`nvcc`** translates CUDA C++ into PTX, and the assembler **`ptxas`** compiles PTX into **SASS** (Streaming Assembler), the actual binary machine instructions executed by a specific GPU chip.
+* **Compute Capability (`cc`):** A version number (such as `cc 9.0` for Hopper H100 or `cc 7.0` for Volta) identifying the hardware generation and supported features of an NVIDIA GPU.
+* **SM (Streaming Multiprocessor) & GPC (Graphics Processing Cluster):** An **SM** is an independent, self-contained processing complex inside a GPU (for example, an H100 GPU has 132 SMs). A **GPC** is a higher-level hardware group that bundles multiple SMs together on the silicon chip.
+* **Register & Register File:** A **register** is the fastest, smallest on-chip storage slot, holding a single 32-bit value directly inside an SM. The **Register File** is the pool of all 32-bit registers inside an SM (65,536 registers per SM on H100).
+* **SRAM, Shared Memory (SMEM), L1/L2 Cache, & Instruction Cache (I-cache):** **SRAM** (Static Random-Access Memory) is ultra-fast memory built directly onto the processor silicon. Each SM has an SRAM pool shared between **Shared Memory (SMEM)** (fast scratchpad memory explicitly managed by the programmer) and the **L1 Data Cache** (hardware-managed cache for recent data reads). **L2 Cache** is a larger on-chip cache shared across *all* SMs. The **Instruction Cache (I-cache)** stores recently fetched SASS instructions inside each SM.
+* **Global Memory, Local Memory, & HBM3 (High Bandwidth Memory 3):** **Global Memory** is the GPU's main, large-capacity memory pool accessible by all SMs, physically built from off-chip **HBM3** (3D-stacked memory chips). **Local Memory** is private per-thread overflow memory that is also physically stored in off-chip HBM3 (cached in L1/L2).
+* **Thread, Thread Block (CTA), Grid, & Stream:**
+  * A **Thread** is the smallest unit of execution: one independent sequence of instructions with its own thread index and private registers.
+  * A **Thread Block**—formally called a **CTA (Cooperative Thread Array)** in PTX—is a group of threads (up to 1,024) that run together on a single SM and can share SMEM and synchronize.
+  * A **Grid** is the entire collection of Thread Blocks launched by a single kernel call (`kernel<<<gridDim, blockDim, sharedMemBytes, stream>>>`).
+  * A **Stream** is an ordered queue of GPU commands (kernels and memory copies) that run sequentially relative to one another.
+* **Thread Block Cluster & Cooperative Grid Launch:** A **Thread Block Cluster** (Hopper+) is a group of CTAs guaranteed to run simultaneously on neighboring SMs so they can coordinate directly. A **cooperative grid launch** (`cudaLaunchCooperativeKernel`) is a special launch mode allowing all CTAs in a grid to synchronize globally.
+* **GigaThread Engine:** The GPU's global hardware work distributor that assigns Thread Blocks (CTAs) from a Grid onto SMs with enough free resources.
+* **Warp, Lane, & SM Sub-Partition:** A **Warp** is a hardware group of **32 consecutive threads** that execute together inside an SM. Each thread position ($0 \dots 31$) inside a warp is a **Lane**. Each SM is split into 4 **SM Sub-Partitions** (Processing Blocks), each with its own **Warp Scheduler** (hardware that picks which warp runs next) and **Dispatch Unit** (hardware that sends the instruction to execution pipes).
+* **Program Counter (PC), SIMD, & SIMT:** A **Program Counter (PC)** tracks the memory address of the next instruction to execute. **SIMD** (Single Instruction, Multiple Data, used in CPU vector registers like `__m512`) packs multiple scalars into one wide vector register under one PC. **SIMT** (Single Instruction, Multiple Thread, used in GPUs) lets programmers write scalar code for a single thread while hardware groups 32 threads into a warp sharing instruction fetch and decode.
+* **ALU, CUDA Core, FP32, INT32, Tensor Core, SFU, LSU, & MIO Queue:**
+  * **ALU** (Arithmetic Logic Unit) / **CUDA Core**: Hardware circuits that perform scalar math and logic (e.g., **FP32** = 32-bit floating-point; **INT32** = 32-bit integer; `FFMA` = fused multiply-add; `FADD` = float add; `ISETP` = integer comparison; `BRA` = branch).
+  * **Tensor Core:** A specialized matrix-multiplication hardware unit on the SM.
+  * **SFU (Special Function Unit):** Hardware dedicated to transcendental math such as `exp2` (base-2 exponential) and `rsqrt` (reciprocal square root).
+  * **LSU (Load/Store Unit) & MIO (Memory Input/Output) Queue:** The **LSU** executes memory reads/writes (`LDG` = load global, `LDS` = load shared, `STS` = store shared, `ldmatrix` = load matrix tile from SMEM). **MIO** is the hardware FIFO (first-in, first-out) queue feeding SMEM, constant/texture memory, and the SFU.
+* **Active Mask, Warp Divergence, Predication, & Independent Thread Scheduling (ITS):**
+  * **Active Mask (`__activemask()`):** A 32-bit bitmask showing which of the 32 lanes in a warp are enabled for the current instruction.
+  * **Warp Divergence:** Occurs when threads in the same warp take different paths at an `if/else` branch.
+  * **Predication:** A branchless technique where each lane sets a 1-bit **predicate register** (`P0`) and executes both paths while suppressing register writeback on inactive lanes.
+  * **ITS (Independent Thread Scheduling):** Introduced in Volta (`cc >= 7.0`), ITS gives every lane its own PC and call stack so diverged threads can interleave and use intra-warp locks (`atomicCAS` = atomic compare-and-swap) without deadlocking, coordinated via **Convergence Barriers (`BSSY`/`BSYNC`)** and warp-sync primitives (`__shfl_sync`, `__ballot_sync`, `__shfl_down_sync`, `__reduce_add_sync`).
+* **Hardware Barriers (`__syncthreads()`, `bar.sync`, `mbarrier`):** Synchronization points where threads in a CTA pause until all participating threads (or asynchronous memory copies, for Hopper's `mbarrier`) finish.
+* **Occupancy, ILP, IPC, Scoreboard, & RAW Dependency:**
+  * **SM Occupancy:** The ratio of resident warps on an SM to the SM's maximum warp capacity.
+  * **ILP (Instruction-Level Parallelism):** Executing multiple independent instructions from the same warp without waiting on each other (often increased via `#pragma unroll` loop unrolling).
+  * **IPC (Instructions Per Cycle):** Average number of instructions issued per clock cycle.
+  * **Scoreboard & RAW (Read-After-Write) Dependency:** A hardware **scoreboard** tracks in-flight instructions; a **RAW dependency** occurs when an instruction must wait for a prior instruction to finish writing a register before reading it.
+* **Nsight Compute (`ncu`) & Stall Counters:** **`ncu`** is NVIDIA's offline kernel profiler, which reports exact per-cycle warp stall reasons (`stall_long_scoreboard`, `stall_short_scoreboard`, `stall_wait`, `stall_barrier`, `stall_math_pipe_throttle`, `stall_mio_throttle`, `stall_drain`, `stall_no_instruction`, `stall_not_selected`).
+* **LLM Inference & Data-Movement Terms:**
+  * **Prefill vs. Decode:** **Prefill** processes all input prompt tokens in parallel (compute-heavy); **Decode** generates one output token at a time (memory-bandwidth-heavy).
+  * **Continuous Batching / Ragged Batches:** Dynamically packing requests of varying prompt lengths into a single GPU batch.
+  * **FlashAttention / FlashDecoding / PagedAttention (split-K):** Tiled attention algorithms that keep intermediate data in SRAM and split long sequences across CTAs (**split-K**) to reduce HBM traffic and tail latency.
+  * **Quantization (FP8 / FP4), Softmax, & FLOP/s:** **Quantization** stores numbers in lower precision (8-bit `FP8`, 4-bit `FP4`) to cut memory traffic; **Softmax** converts raw scores into probabilities; **FLOP/s** is floating-point operations per second.
+  * **`cp.async`, TMA (Tensor Memory Accelerator), & WMMA:** Asynchronous hardware copy mechanisms (`cp.async` on Ampere, `TMA` on Hopper) that move tiles from HBM/L2 into SMEM without stalling threads; **WMMA** refers to Warp Matrix Multiply-Accumulate Tensor Core operations.
+  * **Warp Specialization:** Assigning producer warps (loading data) and consumer warps (running math) inside the same CTA.
+
+---
+
 ## 1. Software Abstraction vs. Hardware Topology
 
 CUDA decouples algorithmic parallelism from fixed core counts through a three-level software hierarchy—**Grid**, **Thread Block (CTA)**, and **Thread**—which the GPU hardware maps dynamically onto **Streaming Multiprocessors (SMs)**, **SM Sub-Partitions**, and **Warps**.

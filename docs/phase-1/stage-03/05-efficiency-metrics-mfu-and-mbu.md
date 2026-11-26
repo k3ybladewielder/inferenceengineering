@@ -2,6 +2,28 @@
 
 [← 04. Mixture-of-Experts Architectures](./04-mixture-of-experts-architectures.md) | [Stage 3 Overview](./README.md) | [Complete Syllabus](../../syllabus.md)
 
+Measuring whether an inference engine is actually fast requires different yardsticks for prompt processing and token generation. This document breaks down every sub-operation inside a Transformer layer, defines **MFU** and **MBU** rigorously, and walks through a complete end-to-end hardware audit on an NVIDIA H100.
+
+---
+
+## Core Concepts & Terminology
+
+Each concept below is ordered so later definitions build only on earlier ones:
+
+* **Token, Batch Size ($B$), Context Lengths ($S_p, S_{\text{ctx}}$), and Active Tokens ($M$):** A **token** is the basic unit of text. $B$ is the number of concurrent requests; $S_p$ is prompt length in tokens; $S_{\text{ctx}}$ is cached context length; $M$ is total active tokens in one forward pass ($M = B \cdot S_p$ in Prefill, $M = B$ in Decode).
+* **Transformer Decoder Layer & Dimensions ($d, n_q, n_{kv}, d_h, d_{\text{ffn}}, V$):** A layer with hidden width $d$ ($d_{\text{model}} = n_q \cdot d_h$), $n_q$ Query heads, $n_{kv}$ Key/Value heads (under **GQA** or **MQA**, with group ratio $G = n_q / n_{kv}$), head width $d_h$, **SwiGLU FFN** (gated Feed-Forward Network using the **SiLU** activation and elementwise product $\odot$) intermediate width $d_{\text{ffn}}$, and vocabulary size $V$ for the final **LM Head** output projection.
+* **Prefill, Decode, TTFT, and ITL:** **Prefill** processes all prompt tokens in parallel (setting **TTFT**, Time to First Token); **Decode** generates 1 token per request per step (measured by **ITL**, Inter-Token Latency).
+* **HBM (High Bandwidth Memory, e.g., HBM3 / HBM3e) & SRAM:** **HBM** is off-chip GPU main memory ($3.35\text{ TB/s}$ on H100; $4.8\text{ TB/s}$ on H200); **SRAM** is fast on-chip memory inside GPU compute units.
+* **KV Cache & FlashAttention:** The **KV Cache** stores past Key and Value vectors in HBM. **FlashAttention** uses SRAM tiling to compute exact attention ($QK^T$, causal mask, softmax, $PV$) without writing the $O(S_p^2)$ score matrix to HBM.
+* **Elementwise & Reduction Ops (RMSNorm, RoPE, Residual Adds, SiLU) & Operator Fusion:** Lightweight non-matrix steps—**RMSNorm** (normalization), **RoPE** (rotary position encoding), **Residual Adds** (skip connections), and **SiLU**. **Operator fusion** merges these into neighboring kernels so activations stay in SRAM/registers rather than round-tripping to HBM.
+* **Numerical Precision ($b$ bytes/elem: BF16, FP16, FP8, FP4, W4A16) & 2:4 Sparsity:** **BF16/FP16** use 2 bytes; **FP8** uses 1 byte; **FP4 / W4A16** store weights in 4 bits ($0.5\text{ B}$) with 16-bit activations. **2:4 structured sparsity** is a hardware mode that zeroes 2 of every 4 weights to double nominal peak math rate.
+* **FLOP, FLOPs, FLOP/s, Tensor Cores (MMA), GEMM, and Skinny GEMM:** A **FLOP** is one floating-point operation; **FLOPs** is total operations; **FLOP/s** is execution rate. **Tensor Cores** execute **MMA** (Matrix Multiply-Accumulate) instructions. **GEMM** is dense matrix-matrix multiplication; **skinny GEMM** has small $M$.
+* **Arithmetic Intensity ($I$), Roofline Model, Ridge Point ($I^*$), Compute-Bound vs. Memory-Bound:** $I = \text{FLOPs}/\text{Bytes}_{\text{HBM}}$. The **Roofline model** caps speed at $\min(F_{\text{peak}}, I \cdot \text{BW}_{\text{peak}})$, meeting at the **ridge point** $I^* = F_{\text{peak}}/\text{BW}_{\text{peak}}$ ($295.3\text{ FLOPs/B}$ on H100 BF16). Operations with $I < I^*$ are **memory-bound**; $I \ge I^*$ are **compute-bound**.
+* **MoE (Mixture-of-Experts: $N_s, K, E, d_{\text{ffn}}^{\text{exp}}$):** Sparse FFN layers with $N_s$ shared experts and $K$ active routed experts out of $E$ total, where HBM weight reads scale with the expected number of distinct hit experts $\mathbb{E}[E_{\text{active}}(M)]$.
+* **MFU (Model FLOPs Utilization) vs. HFU (Hardware FLOPs Utilization):** **MFU** is achieved *useful minimum model FLOP/s* divided by peak hardware FLOP/s ($F_{\text{peak}}$). **HFU** also counts wasted hardware FLOPs (e.g., zero-padding **ragged batches** of unequal lengths or computing masked upper-triangular attention).
+* **MBU (Model Bandwidth Utilization):** Achieved minimum required HBM bytes/s (weights + KV Cache + boundary activations) divided by peak HBM bandwidth ($\text{BW}_{\text{peak}}$).
+* **Serving Optimization Levers:** **Chunked Prefill** (splitting long prompts into fixed-size chunks), **CUDA Graphs** (replaying captured kernel sequences to eliminate CPU launch latency), **Speculative Decoding** (verifying multiple draft tokens in parallel), **PagedAttention** (storing KV Cache in non-contiguous memory pages), and **Prefill/Decode Disaggregation** (isolating Prefill and Decode on separate GPU pools).
+
 ---
 
 ## 1. Per-Layer Operation Anatomy: Exact FLOPs and HBM Bytes Moved
