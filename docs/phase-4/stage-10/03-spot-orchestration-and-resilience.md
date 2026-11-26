@@ -62,7 +62,8 @@ Running standard stateless microservice Spot patterns on an LLM inference engine
 
 ## 2. Cloud Interruption Signal Detection & Control-Plane Hooks
 
-Resilient Spot serving depends on detecting the provider's reclamation notice within **< 2 seconds** and immediately separating **admission cut-off** from **execution termination**.
+
+Resilient Spot serving depends on detecting the provider's reclamation notice within **< 2 seconds** and immediately separating **admission cut-off** from **execution termination**. Conceptually, if a Spot GPU is reclaimed mid-generation, the remaining work can be resumed on a healthy GPU just like calling `model.generate(input_ids=torch.cat([prompt_ids, generated_ids]))`—either by re-prefilling the token IDs at the gateway or by copying the precomputed KV cache tensors directly over RDMA.
 
 ### 2.1 Instance Metadata Polling & EventBridge Queues
 

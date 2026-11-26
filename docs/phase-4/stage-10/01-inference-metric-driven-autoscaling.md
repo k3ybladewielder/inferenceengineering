@@ -67,7 +67,8 @@ Every technical term, metric, and system component used in this document is defi
 
 ## 1. Why Traditional Infrastructure Metrics Fail Completely for LLMs
 
-In conventional stateless microservices (REST APIs, gRPC workers), Kubernetes Horizontal Pod Autoscaler (HPA) relies on host/container **CPU utilization** (`cpu_usage_seconds_total / cpu_quota`) or **memory working set** (`container_memory_working_set_bytes`) to infer saturation. Applying these signals—or naive GPU telemetry from `nvidia-smi` / DCGM—to LLM serving engines (vLLM, SGLang, TensorRT-LLM) causes catastrophic mis-scaling: pods either scale out permanently under trivial traffic or fail to scale out while requests time out in queues.
+
+In conventional stateless microservices (REST APIs, gRPC workers), Kubernetes Horizontal Pod Autoscaler (HPA) relies on host/container **CPU utilization** (`cpu_usage_seconds_total / cpu_quota`) or **memory working set** (`container_memory_working_set_bytes`) to infer saturation. Applying these signals—or naive GPU telemetry from `nvidia-smi` / DCGM—to LLM serving engines (vLLM, SGLang, TensorRT-LLM) causes catastrophic mis-scaling: pods either scale out permanently under trivial traffic or fail to scale out while requests time out in queues. For a data scientist used to seeing `100%` utilization in `nvidia-smi` during a PyTorch training run and assuming the GPU is doing maximum math, inference behaves completely differently because single-sequence generation is gated by memory bandwidth rather than arithmetic throughput.
 
 ### 1.1 The `GPU-Util` Illusion (`NVML utilization.gpu`)
 
@@ -119,7 +120,7 @@ The serving engine's Python/C++ scheduler and HTTP API server typically consume 
 
 ## 2. True Inference-Level Autoscaling Signals
 
-Effective LLM autoscaling requires scraping **application-layer telemetry** directly from the serving engine's `/metrics` Prometheus endpoint, because only the engine's block manager and continuous batching scheduler know the true remaining capacity.
+Effective LLM autoscaling requires scraping **application-layer telemetry** directly from the serving engine's `/metrics` Prometheus endpoint, because only the engine's block manager and continuous batching scheduler know the true remaining capacity (just as `nvidia-smi` cannot see how full a Python `queue.Queue` or a PyTorch tensor pool is).
 
 ### 2.1 Request Queue Depth & Queued Prefill Tokens
 

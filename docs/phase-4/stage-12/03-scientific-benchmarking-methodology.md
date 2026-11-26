@@ -63,7 +63,8 @@ Before a single timed request is recorded, the serving engine must reach **therm
 
 ## 3. Open-Loop vs. Closed-Loop Traffic & Coordinated Omission
 
-Even experienced engineers fall into a subtler trap: **multi-worker closed-loop benchmarking**.
+
+Even experienced engineers fall into a subtler trap: **multi-worker closed-loop benchmarking**. In Python `asyncio`, a naive `for _ in range(N): await send_request()` loop waits for the server to finish before sending the next request, which artificially hides queuing delays whenever the server slows down:
 
 ### 3.1 Closed-Loop Benchmarking and Coordinated Omission
 
@@ -117,7 +118,7 @@ async def dispatch_at(offset: float, req_payload: dict):
 Benchmarking solely with fixed `(input_len=512, output_len=128)` pairs misrepresents real engine behavior:
 * **Synchronized Batch Exits:** Uniform output lengths cause entire batches to finish simultaneously, alternating artificially between pure prefill spikes and empty decode queues.
 * **Hidden PagedAttention Fragmentation & Preemption:** Variable long outputs ($2\text{K–}8\text{K}$) mixed with short outputs ($20\text{–}100$) test dynamic KV block reclamation and chunked prefill token-budget slicing.
-* **Control of `ignore_eos`:** If comparing FP16 vs. INT4/FP8 quantized models on natural EOS stopping, minor logit shifts can alter average output length by $\pm 15\%$, skewing E2E latency and total throughput. Set `ignore_eos=True` with target output lengths drawn from an empirical distribution when isolating **pure systems throughput**, and test natural EOS separately when measuring **task-level token efficiency**.
+* **Control of `ignore_eos`:** If comparing FP16 vs. INT4/FP8 quantized models on natural EOS stopping, minor logit shifts can alter average output length by $\pm 15\%$ (one model might write 180 tokens while the other writes 210 tokens), skewing E2E latency and total throughput. Set `ignore_eos=True` with target output lengths drawn from an empirical distribution when isolating **pure systems throughput**, and test natural EOS separately when measuring **task-level token efficiency**.
 
 **Standard Empirical Workload Profiles:**
 1. **ShareGPT / LMSYS-Chat-1M:** General conversational distribution; heavily right-skewed prompts (median $\sim 150\text{–}300$ tokens, tail $>4\text{K}$) and variable outputs (median $\sim 200$, tail $>1.5\text{K}$).

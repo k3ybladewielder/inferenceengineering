@@ -62,7 +62,8 @@ Any configuration $c$ whose latency percentiles breach the SLA threshold is **ma
 
 ## 3. Mathematical Formulation of the Pareto Frontier & Knee
 
-Consider the feasible configuration space $\mathcal{C}_{\text{feas}} \subseteq \mathcal{C}$ passing $\Omega_{\text{SLA}}$. Let every configuration $c \in \mathcal{C}_{\text{feas}}$ map to an objective vector to minimize:
+
+Consider the feasible configuration space $\mathcal{C}_{\text{feas}} \subseteq \mathcal{C}$ passing $\Omega_{\text{SLA}}$. In multi-objective optimization (familiar from hyperparameter sweeps in scikit-learn or Optuna), we cannot simply maximize tokens/sec without checking latency: every configuration maps to an objective vector to minimize:
 $$\mathbf{f}(c) = \big(\text{Cost\_per\_1M}(c),\; \text{P99\_TTFT}(c),\; \text{P99\_TPOT}(c),\; -\Theta_{\text{good}}(c)\big)$$
 *(Equivalently, maximize $\Theta_{\text{good}}$ while minimizing Cost, TTFT, and TPOT; note that for a fixed GPU SKU and fixed $N_{\text{GPU}}$, $\text{Cost\_per\_1M}$ is inversely proportional to $\Theta_{\text{good}}$, reducing 4D to 3D—while across heterogeneous SKUs like L40S vs. H100 vs. B200, Cost and $\Theta_{\text{good}}$ remain independent axes!)*
 

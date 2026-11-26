@@ -68,6 +68,9 @@ To make KEDA autoscaling and Spot recovery viable under real-time SLOs, cold sta
 
 ## 2. Optimized Container Images: Lazy Pulling & Read-Only Filesystems
 
+
+In a typical PyTorch notebook, `import torch` and `AutoModelForCausalLM.from_pretrained(...)` feel like simple function calls, but inside a freshly provisioned Kubernetes GPU node, every container layer and every gigabyte of model weights must physically traverse the network, disk, and PCIe bus before the first token can be served.
+
 ### 2.1 Why Standard OCI `.tar.gz` Images Stall Container Startup
 
 Standard OCI container images store filesystem layers as **gzip-compressed tarballs (`.tar.gz`)**. Because standard `gzip` uses a continuous LZ77 sliding compression window across the entire stream, **random access is impossible**: to read byte offset `5,000,000,000` (e.g., `vllm/_C.abi3.so`), `containerd` must download and sequentially decompress every preceding byte from offset `0`.
@@ -108,7 +111,7 @@ Optimizing the container image still leaves the elephant in the room: **loading 
 
 When a pod runs `huggingface-cli download` or `safetensors.safe_open()` over a standard POSIX filesystem:
 1. **Copy 1 (Network/Disk -> Kernel Socket/BIO Buffer):** Bytes arrive from NIC or NVMe into kernel space.
-2. **Copy 2 (Kernel -> Userspace -> Kernel Page Cache):** `python` writes weights to disk (`/tmp` or EBS), duplicating them into the Linux **OS Page Cache**. On a node with 128 GB host RAM loading a 140 GB model, the page cache fills 100% of host RAM, triggering aggressive `kswapd` page reclaim or even **cgroup OOM-Kills** (`ContainerMemoryUsage` counts page cache charged to the pod cgroup!).
+2. **Copy 2 (Kernel -> Userspace -> Kernel Page Cache):** `python` writes weights to disk (`/tmp` or EBS), duplicating them into the Linux **OS Page Cache**. On a node with 128 GB host RAM loading a 140 GB model, the page cache fills 100% of host RAM, triggering aggressive `kswapd` page reclaim or even **cgroup OOM-Kills** (`ContainerMemoryUsage` counts page cache charged to the pod cgroup, even though your Python process itself only holds a small reference!).
 3. **Copy 3 (Page Cache -> Pinned Staging Buffer):** PyTorch `safetensors` reads tensors into CPU memory, slices Tensor Parallel (TP) shards, and copies into CUDA pinned host memory (`cudaHostAlloc`).
 4. **Copy 4 (Pinned Host RAM -> GPU HBM):** PCIe DMA engine executes `cudaMemcpyAsync` into GPU VRAM.
 

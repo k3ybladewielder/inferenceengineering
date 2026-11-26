@@ -116,7 +116,8 @@ In this concrete single-node calculation, **1M output tokens cost $5.18\times$ m
 
 ## 2. Why Output Tokens Cost 3x–10x More Than Input Tokens
 
-The 3x–10x price multiplier on completion tokens is not arbitrary marketing; it reflects three compounding hardware constraints:
+
+The 3x–10x price multiplier on completion tokens is not arbitrary marketing; it reflects three compounding hardware constraints. In PyTorch terms, processing a 4,000-token input prompt is one parallel `[4000, d_model] @ [d_model, d_ffn]` matrix multiplication, whereas generating 1,000 output tokens requires running 1,000 sequential `[B, d_model] @ [d_model, d_ffn]` steps—re-reading the entire multi-gigabyte weight matrix from HBM on every single step while pinning the growing KV cache in VRAM:
 
 1. **Compute vs. Memory-Bandwidth Throughput Gap (4x–15x):**
    On modern datacenter GPUs (H100/H200/B200), the **ridge point** ($\Phi_{\text{peak}} / \beta_{\text{HBM}}$) is roughly **300–600 FLOPs/byte** in FP8. Prefill operates above the ridge point (parallelizing across thousands of prompt tokens simultaneously), achieving **6,000+ tok/s** on 70B. Decode operates far below the ridge point at practical interactive batch sizes ($B = 16\text{–}64$, arithmetic intensity $\approx 32\text{–}128$ FLOPs/byte), yielding **400–1,500 tok/s**. Since cost is inversely proportional to delivered tokens/sec, decode directly costs 4x–15x more GPU time per token.

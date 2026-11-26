@@ -51,7 +51,8 @@ A credible inference engineering teardown is **not** a marketing blog post displ
 
 ## 2. Reading and Annotating the GPU Compiler Lowering Stack (IR → PTX → SASS)
 
-To prove a kernel optimization genuinely eliminated redundant HBM round-trips, register spills, or shared-memory bank conflicts, systems engineers inspect all four lowering stages from high-level DSL down to native hardware machine code.
+
+To prove a kernel optimization genuinely eliminated redundant HBM round-trips, register spills, or shared-memory bank conflicts, systems engineers inspect all four lowering stages from high-level Python/Triton code down to native hardware machine code—tracing how a high-level `tl.load` or `torch.matmul` compiles into actual silicon instructions:
 
 ### 2.1 Stage 1 & 2: Triton TTIR and TTGIR
 

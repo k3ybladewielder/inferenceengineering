@@ -64,7 +64,8 @@ Every unique label combination creates a separate Prometheus time series (holdin
 
 ## 2. Distributed Tracing Across Gateway → Router → Prefill → Decode
 
-When a single request hits a P99 TTFT spike of $4.2\text{ s}$, metrics tell you *that* a spike happened; **distributed tracing** tells you *where* in the pipeline the 4.2 seconds went.
+
+When a single request hits a P99 TTFT spike of $4.2\text{ s}$, metrics tell you *that* a spike happened; **distributed tracing** tells you *where* in the pipeline the 4.2 seconds went—just as `torch.profiler` breaks down a slow training step into DataLoader wait, CPU dispatch, and CUDA kernel time:
 
 ### 2.1 End-to-End W3C Trace Context Propagation
 

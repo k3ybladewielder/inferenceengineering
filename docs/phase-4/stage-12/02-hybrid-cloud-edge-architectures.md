@@ -44,7 +44,8 @@ A **Hybrid Cloud-Edge Architecture** unifies cloud frontier models ($70\text{Bâ€
 
 ## 2. Fault Detection, Watchdogs, and Circuit Breakers
 
-Naive failover catches only explicit `HTTP 500/503` responses after a multi-second TCP/TLS timeout. Production hybrid clients must detect **soft degradation** (silent stream stalls and SLA breaches) using layered timers and state machines.
+
+Naive failover catches only explicit `HTTP 500/503` responses after a multi-second TCP/TLS timeout. Production hybrid clients must detect **soft degradation** (silent stream stalls and SLA breaches) using layered timers and state machinesâ€”much like adding a per-token timeout watchdog around an `async for chunk in stream` loop in Python:
 
 ### 2.1 Four Concrete Failure Signals
 

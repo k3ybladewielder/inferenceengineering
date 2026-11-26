@@ -37,7 +37,8 @@ Consider a multi-turn coding agent or enterprise RAG pipeline sending a **$16,38
 
 ### 1.2 The Round-Robin / Least-Connections Catastrophe
 
-Traditional Kubernetes Services (`kube-proxy`), NGINX, and Envoy default to **Round-Robin** or **Least-Connections** load balancing across a fleet of $N$ identical GPU replicas. Let us calculate what happens to prefix caching across $N = 16$ replicas:
+
+Traditional Kubernetes Services (`kube-proxy`), NGINX, and Envoy default to **Round-Robin** or **Least-Connections** load balancing across a fleet of $N$ identical GPU replicas. Because each GPU replica maintains its own isolated HBM KV cache (like separate Python processes with independent in-memory dictionaries), spraying sequential turns across random replicas forces every replica to recompute the shared system prompt from zero:
 
 1. **Single-Session Hit Rate Collapse:** If an agent runs an 8-turn loop under Round-Robin across $N=16$ replicas, Turn 1 hits Replica 0, Turn 2 hits Replica 1, Turn 3 hits Replica 2... **Every single turn lands on a cold replica with $0\%$ prefix cache hit rate!** Even after 16 turns wrap around, Turn 1's KV blocks on Replica 0 have likely been evicted by LRU pressure from other tenants' traffic.
 2. **Fleet-Wide KV HBM Duplication ($N\times$ Waste):** For popular shared system prompts (e.g., 500 concurrent users sharing the same 10k-token coding assistant prompt), Round-Robin sprays requests across all $N=16$ replicas. Every replica must materialize and retain its own redundant copy of that 10k-token KV cache in HBM!
