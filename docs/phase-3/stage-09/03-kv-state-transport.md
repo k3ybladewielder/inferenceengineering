@@ -2,13 +2,42 @@
 
 > **Navigation:** [Prev: 02 — Disaggregated Prefill/Decode Architecture](./02-disaggregated-prefill-decode-architecture.md) | [Stage 9 Index](./README.md) | **Next:** [04 — Distributed MoE Systems Engineering](./04-distributed-moe-systems-engineering.md)
 
-The physical separation of Prefill and Decode introduces a mandatory data movement step between computing the prompt's representations and generating the second token: **KV State Transport**. If implemented naively (host-staged TCP, unpipelined full-context transfer, dynamic `ibv_reg_mr` per request, or 100,000 tiny non-contiguous RDMA writes), KV transport adds hundreds of milliseconds to TTFT and destroys the benefits of disaggregation.
+When prompt processing (Prefill) and token generation (Decode) run on separate servers, the intermediate attention state computed during Prefill must be moved across the network before Decode can generate the second token. This document explains the math, transport software, pipelining techniques, and GPU memory layouts needed to move gigabytes of state in milliseconds.
 
-This document details the memory math, transport middleware, push/pull semantics, layer-wise pipelining, PagedAttention scatter-gather vs. TP-resharding mechanics, and zero-overhead memory registration required for production KV transport.
+---
+
+## Core Concepts & Terminology
+
+Every model parameter, networking primitive, and GPU memory mechanism used in this document is defined below in dependency order:
+
+### 1. Model & Attention State Fundamentals
+* **Prefill, Decode, TTFT, & KV Cache:** *Prefill* processes all prompt tokens in parallel and outputs the first token (completing **TTFT**, Time to First Token). *Decode* generates subsequent tokens one by one. The **KV (Key-Value) Cache** stores the Key and Value attention vectors for all processed tokens so Decode does not recompute them.
+* **Transformer Layer Components ($L_{\text{layers}}$, QKV Proj, RoPE, FlashAttention, FFN/MLP):** An LLM stacks $L_{\text{layers}}$ Transformer layers. Each layer computes Query, Key, and Value vectors (**QKV Projection**), applies positional rotation (**RoPE**, Rotary Position Embedding) to $Q$ and $K$, computes attention (**FlashAttention**), and finishes with a feed-forward network (**FFN/MLP**: `Gate + Up + Down` projections, which consumes ~65–75% of the layer's math operations or **FLOPs**).
+* **GQA (Grouped-Query Attention) & MLA (Multi-Head Latent Attention):** **GQA** reduces KV cache size by sharing $n_{\text{kv\_heads}}$ Key/Value heads (each of dimension $d_{\text{head}}$) across multiple Query heads. **MLA** (used in DeepSeek-V3) compresses Keys and Values into a single compact latent vector of size $d_c + d_R$ per token.
+* **BF16 / FP16 vs. FP8:** **BF16/FP16** store each number in 2 bytes; **FP8** uses 1 byte, cutting KV cache memory and network bytes in half.
+
+### 2. Hardware Buses, Fabrics, & RDMA Primitives
+* **NIC, 400G NDR, 100GbE, & Multi-Rail Striping:** A **NIC** is a server's network adapter (e.g., 400 Gbps InfiniBand **NDR** at ~48 GB/s effective speed, or 100 Gbps Ethernet **100GbE**). **Multi-rail striping** splits one large transfer across all 8 NICs on an 8-GPU server in parallel (~384 GB/s aggregate).
+* **PCIe, BAR1, `MaxReadReqSize`, QPI/UPI, NVMe-oF, CXL, & SRAM:** **PCIe** is the motherboard bus linking CPUs, GPUs, and NICs; **BAR1** is the PCIe address window exposing GPU HBM to the NIC; **`MaxReadReqSize`** is a PCIe hardware limit on single read transaction sizes. **QPI/UPI** are inter-socket CPU links (crossing them slows PCIe transfers). **NVMe-oF** (NVMe over Fabrics) and **CXL** connect remote SSDs/DRAM; **SRAM** is fast on-chip memory (used inside the NIC to cache address translations).
+* **RDMA, `libibverbs`, `ibv_reg_mr`, `ibv_reg_dmabuf_mr`, `nvidia-peermem`, `dma-buf`, & MTT:** **RDMA** lets a NIC read/write remote memory directly, bypassing the OS kernel. **`libibverbs`** is the Linux RDMA library. **Memory registration** (`ibv_reg_mr` or modern `ibv_reg_dmabuf_mr` via `nvidia-peermem`/`dma-buf`) pins GPU pages and writes their physical BAR1 addresses into the NIC's **MTT (Memory Translation Table)**, returning **`lkey`** (local access key) and **`rkey`** (remote access key).
+* **WQE, SQ, `ibv_post_send`, Doorbell Batching, `ibv_sge`, & `max_sge`:** Software submits **WQEs (Work Queue Elements)** to a **Send Queue (SQ)** via `ibv_post_send` and rings the NIC's **Doorbell**. **Doorbell batching** chains many WQEs and rings the doorbell once. An **`ibv_sge` (Scatter-Gather Element)** lets one WQE describe up to `max_sge` non-contiguous memory chunks.
+* **One-Sided Verbs (`RDMA_WRITE`, `RDMA_WRITE_WITH_IMM`, `RDMA_READ`):** `RDMA_WRITE` pushes data into a remote virtual address (`remote_va`) using `rkey` with zero remote CPU involvement (`WITH_IMM` adds a 32-bit notification flag). `RDMA_READ` pulls data from a remote peer.
+
+### 3. Transport Middleware & GPU Pipelining
+* **NCCL / `PyNccl`:** NVIDIA's collective communication library; it assumes a fixed group of GPUs where one node failure tears down the communicator.
+* **NIXL, UCX (`UCT`, `UCP`, `rc_mlx5`, `dc_mlx5`, `cuda_ipc`, `gdr_copy`, `RNDV`), & Mooncake TE:** **NIXL** (NVIDIA Inference Transfer Library) provides dynamic point-to-point agents (`nixlAgent`) and async transfer lists (`nixlXferDescList`) over pluggable backends like **UCX**, **GPUDirect RDMA**, **GPUDirect Storage (GDS)**, and **NVSHMEM** (GPU-initiated RDMA). **UCX** splits into **`UCT`** (hardware transports: `rc_mlx5` Reliable Connected, `dc_mlx5` Dynamically Connected to avoid $O(N^2)$ Queue Pairs, `cuda_ipc` NVLink, `gdr_copy` BAR mapping) and **`UCP`** (chooses **Eager** inline copy for $<8\text{ KB}$ or zero-copy **Rendezvous `RNDV`** for bulk tensors). **Mooncake TE** is a C++ RDMA/NVMe-oF transfer engine with topology-aware multi-rail routing.
+* **CUDA Streams & Events (`ComputeStream`, `TransferStream`, `cudaEventRecord`, `cudaStreamWaitEvent`):** **CUDA Streams** are independent queues of GPU operations. Recording a `cudaEventRecord` on `ComputeStream` and waiting on it via `cudaStreamWaitEvent` on `TransferStream` synchronizes data transfers with compute entirely on the GPU without blocking the host CPU.
+
+### 4. PagedAttention Layouts, TP Resharding, & CUDA VMM
+* **PagedAttention, NHD vs. HND Layouts, & Triton/CUDA Staging Kernel:** **PagedAttention** stores KV cache in fixed-size virtual blocks (`block_size` tokens). **NHD** layout (`[num_blocks, 2, num_layers, ...]`) scatters each layer's data across thousands of blocks; **HND** layout (`[num_layers, 2, num_blocks, ...]`) groups blocks by layer first. A lightweight **Triton/CUDA kernel** can pack scattered blocks into a contiguous GPU **staging buffer** in ~15–20 µs so RDMA sends one bulk write.
+* **Asymmetric Tensor Parallelism ($TP_P \neq TP_D$) & GQA Head Deduplication:** Prefill often uses more GPUs per instance ($TP_P = 8$) than Decode ($TP_D = 4$). Transport must map each Prefill GPU's KV heads into the right head slices on Decode—and when $TP_P > n_{\text{kv\_heads}}$, skip sending duplicate KV head copies held on odd ranks.
+* **CUDA VMM (`cudaMalloc`, `cuMemCreate`, `cuMemMap`, 2 MB Granularity) & Static KV Arena:** Instead of registering memory per request, engines allocate one **Static KV Arena** at startup using CUDA Virtual Memory Management (`cuMemCreate` with 2 MB physical pages + `cuMemMap`) and register it once, yielding **0 µs** per-request registration overhead and preventing NIC MTT cache misses.
 
 ---
 
 ## 1. KV Cache Volume Math & Fabric Bandwidth Budget
+
+The physical separation of Prefill and Decode introduces a mandatory data movement step between computing the prompt's representations and generating the second token: **KV State Transport**. If implemented naively (host-staged TCP, unpipelined full-context transfer, dynamic `ibv_reg_mr` per request, or 100,000 tiny non-contiguous RDMA writes), KV transport adds hundreds of milliseconds to TTFT and destroys the benefits of disaggregation.
 
 For a standard Grouped-Query Attention (GQA) Transformer, the total KV state generated by a prompt of length $S$ tokens is:
 

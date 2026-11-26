@@ -2,13 +2,40 @@
 
 > **Navigation:** [Prev: 01 — High-Speed Network Fabrics](./01-high-speed-network-fabrics.md) | [Stage 9 Index](./README.md) | **Next:** [03 — KV State Transport](./03-kv-state-transport.md)
 
-In traditional LLM serving engines (early vLLM, TensorRT-LLM, TGI), **Prefill** (processing the entire prompt in parallel) and **Decode** (autoregressively generating one token per step) execute **co-located** on the exact same GPU instances. While Continuous Batching eliminates head-of-line request blocking at the batch level, co-locating two fundamentally opposite physical regimes on shared silicon creates severe SLO violations, poor hardware utilization, and rigid parallelism compromises.
+Serving large language models efficiently is hard because processing a user's prompt and generating the reply place completely opposite demands on GPU hardware. This document explains why running both steps on the same GPUs causes latency spikes and hardware waste, and how separating them into dedicated pools solves the problem.
 
-**Prefill/Decode (P/D) Disaggregation** physically separates the inference cluster into two specialized pools—a **Prefill Pool** and a **Decode Pool**—connected over a high-speed KV Cache transport fabric.
+---
+
+## Core Concepts & Terminology
+
+Every inference concept, hardware metric, and distributed-systems term used in this document is defined below in dependency order:
+
+### 1. LLM Serving & Request Lifecycle
+* **Token, Prompt ($L_{\text{in}}$), Output ($L_{\text{out}}$), `EOS`, & `max_tokens`:** A *token* is a small piece of text. A user sends a prompt of length $L_{\text{in}}$ tokens, and the model generates $L_{\text{out}}$ output tokens until it emits a special stop token (**`EOS`**, End of Sequence) or hits the **`max_tokens`** limit.
+* **Prefill vs. Decode (Autoregressive) & Co-Location:** *Prefill* processes all $L_{\text{in}}$ prompt tokens in parallel to produce the first output token ($t_1$). *Decode* then generates one output token per step, feeding each new token back as input for the next step (*autoregressive*). **Co-location** means running both Prefill and Decode on the exact same GPUs.
+* **KV Cache (Key-Value Cache):** Intermediate attention vectors (*Keys* and *Values*) computed for every processed token and saved in GPU memory so Decode does not recompute the prompt on every step.
+* **LM Head & Logits:** At the end of a forward pass, the **LM Head** projects the final hidden vector into vocabulary scores called **logits**, from which the next token is sampled.
+* **Continuous Batching & Head-of-Line Blocking:** Early serving engines (**vLLM**, **TensorRT-LLM**, **TGI**) used static batches, where short requests waited for long requests to finish (*head-of-line blocking*). **Continuous Batching** (iteration-level scheduling) adds newly arrived requests and removes finished ones at every single token step.
+* **Chunked Prefill (`max_num_batched_tokens`):** A scheduling technique (e.g., *Sarathi-Serve*) that splits a long prompt into smaller chunks capped by `max_num_batched_tokens` and mixes one chunk into each Decode step to bound single-step stalls.
+
+### 2. Compute Roofline, Hardware SKUs, & Latency SLOs
+* **GEMM, GEMV, Arithmetic Intensity, & Roofline Profile:** **GEMM** (General Matrix-Matrix Multiply, used in Prefill) performs many math operations per byte read from memory (**high arithmetic intensity**, $\text{FLOPs}/\text{Byte}$), making it limited by **Tensor Core** compute speed (`TFLOP/s`). **GEMV** (Matrix-Vector / Skinny GEMM, used in Decode) performs very few operations per byte loaded (**low arithmetic intensity**), making it limited by **HBM (High Bandwidth Memory)** transfer speed (`TB/s`) and capacity (`GB`). A **Roofline profile** plots this transition between memory-bound and compute-bound execution.
+* **FP8 / FP4, HBM3 / HBM3e, GDDR6, VRAM, & KV OOM:** **FP8** and **FP4** are compact 8-bit and 4-bit floating-point formats that shrink memory usage and boost Tensor Core throughput. **VRAM** (Video RAM) is GPU memory—implemented as ultra-fast stacked **HBM3/HBM3e** on `H100`/`H200`/`B200`/`MI300X` GPUs, or cheaper **GDDR6** on `L40S` GPUs. **KV OOM** (Out of Memory) occurs when active KV caches exhaust available VRAM.
+* **TTFT, ITL, TPOT, SLO, Goodput, & MFU:** **TTFT (Time to First Token)** is prompt-to-first-token latency; **ITL (Inter-Token Latency)** and **TPOT (Time Per Output Token)** measure the delay between consecutive output tokens. An **SLO (Service Level Objective)** is a target latency bound (e.g., P99 ITL $\le 30\text{ ms}$). **Goodput** is the maximum requests per second (**RPS**) that satisfy *both* TTFT and ITL SLOs. **MFU (Model FLOPs Utilization)** is the fraction of peak theoretical GPU FLOP/s achieved.
+* **Parallelism: TP, PP, DP, & `AllReduce`:** **Tensor Parallelism (TP)** splits each layer's weight matrices across GPUs, requiring `AllReduce` synchronization barriers every layer. **Pipeline Parallelism (PP)** places different layers on different GPUs. **Data Parallelism (DP)** runs independent model replicas on separate GPUs.
+* **RAG (Retrieval-Augmented Generation):** A workload pattern that injects long retrieved documents into prompts, creating very high $L_{\text{in}}$ relative to $L_{\text{out}}$.
+
+### 3. Disaggregation, KV Storage, & Distributed Control
+* **Prefill/Decode (P/D) Disaggregation:** Splitting an inference cluster into a compute-optimized **Prefill Pool** and a memory-bandwidth/capacity-optimized **Decode Pool**, connected by a high-speed network fabric. Landmark systems include **DistServe**, **Splitwise**, **Mooncake**, and **NVIDIA Dynamo + NIXL**.
+* **NIXL, UCX, GPUDirect RDMA, GPUDirect Storage (GDS), POSIX, `rkey`, & `remote_va`:** **NIXL** (NVIDIA Inference Transfer Library) is an asynchronous data-movement API unifying **UCX** (an HPC transport framework), **GPUDirect RDMA** (direct GPU-to-GPU network transfers bypassing host RAM), **NVLink** (high-speed intra-node GPU interconnect), **GPUDirect Storage** (direct NVMe SSD-to-GPU transfers), and **POSIX** file I/O. An RDMA **`rkey`** (remote key) and **`remote_va`** (remote virtual address) authorize a remote GPU/NIC to write directly into pre-allocated memory.
+* **PagedAttention, Prefix Cache, Radix Tree, & LRU:** **PagedAttention** divides the KV cache into fixed-size non-contiguous blocks (e.g., 16 or 64 tokens). A **Prefix Cache** stores and reuses KV blocks for repeated prompt prefixes (e.g., system prompts), indexed via a **Radix Tree** (a prefix trie) and evicted using **LRU (Least Recently Used)** ordering.
+* **HTTP/gRPC, SSE, RPC, Admission Control, TTL Lease, & XID:** Clients connect via **HTTP/gRPC** and receive streaming tokens via **SSE (Server-Sent Events)**. Internal nodes coordinate via lightweight **RPCs (Remote Procedure Calls)**. **Admission Control** reserves destination KV blocks before Prefill begins; a **TTL (Time-To-Live) lease** automatically reclaims orphaned blocks if a Prefill worker crashes (e.g., via a fatal NVIDIA **XID** GPU hardware error).
 
 ---
 
 ## 1. The Co-Location Pathology: Physics of TTFT vs. ITL Interference
+
+In traditional LLM serving engines (early vLLM, TensorRT-LLM, TGI), **Prefill** and **Decode** execute **co-located** on the exact same GPU instances. While Continuous Batching eliminates head-of-line request blocking at the batch level, co-locating two fundamentally opposite physical regimes on shared silicon creates severe SLO violations, poor hardware utilization, and rigid parallelism compromises. **Prefill/Decode (P/D) Disaggregation** physically separates the inference cluster into two specialized pools—a **Prefill Pool** and a **Decode Pool**—connected over a high-speed KV Cache transport fabric.
 
 Every LLM request consists of two sequential computational phases with opposite Roofline profiles:
 

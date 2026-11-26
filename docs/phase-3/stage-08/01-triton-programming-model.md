@@ -4,6 +4,62 @@
 
 ---
 
+This document explains how **Triton** lets engineers write fast GPU programs for Large Language Model (LLM) inference in Python by operating on rectangular blocks of data rather than individual threads. Before diving into code and compiler internals, the section below defines every hardware, compiler, and inference term used throughout this guide in dependency order.
+
+## Core Concepts & Terminology
+
+### 1. GPU Hardware & Memory Hierarchy
+* **GPU (Graphics Processing Unit) & SM (Streaming Multiprocessor):** A GPU contains dozens to over a hundred independent compute units called **Streaming Multiprocessors (SMs)** (e.g., 132 SMs on an NVIDIA H100). Each SM contains arithmetic units, warp schedulers, registers, and fast on-chip memory.
+* **Kernel:** A function compiled to execute in parallel on a GPU across many workers.
+* **HBM (High Bandwidth Memory, e.g., HBM3 / HBM3e):** The GPU's large off-chip main memory (e.g., 80 GB on an H100). It offers high capacity and bandwidth (~3.35 TB/s on H100) but takes ~400–800 clock cycles to return data.
+* **L2 Cache & L1 Cache:** Hardware-managed memory caches that store recently used HBM data. The **L2 cache** (~50 MB on H100) is shared across all SMs; the **L1 cache** is small and private to a single SM.
+* **SRAM (Static Random-Access Memory) / Shared Memory (`__shared__`):** Fast, programmer-managed on-chip memory (~20–30 cycles latency) located inside each SM (physically unified with the L1 cache).
+* **Registers & Register File (RF):** The fastest, smallest storage on a GPU (0-cycle access), private to each thread inside an SM. If a kernel uses too many registers (exceeding the 255-register-per-thread limit), excess variables **spill** into slow off-chip HBM ("local memory").
+* **Cache Line (128B) & Memory Coalescing:** GPU memory controllers fetch HBM data in aligned 128-byte **cache lines** (and 32-byte sectors). **Coalescing** occurs when adjacent threads request adjacent memory addresses so their requests merge into the fewest possible cache-line transfers.
+* **Virtual Memory Pointer, Stride, & Page Fault:** A **pointer** holds a virtual memory address. **Stride** is the number of elements to skip in memory to move by 1 step along a tensor dimension. Reading or writing outside mapped virtual memory pages causes a **page fault** (a CUDA `illegal memory access` error).
+
+### 2. GPU Execution Models (CUDA SIMT vs. Triton SPMD)
+* **Thread & Warp:** A **thread** is the smallest sequential execution unit on a GPU. A **warp** is a group of 32 threads that execute the exact same instruction simultaneously in lockstep.
+* **Thread Block / CTA (Cooperative Thread Array):** A group of warps (up to 1,024 threads) assigned together to one SM so they can share SRAM and synchronize.
+* **CUDA C++ & SIMT (Single Instruction, Multiple Threads):** NVIDIA's C++-based GPU programming model. In **SIMT**, the programmer writes code for a single scalar thread (`threadIdx` inside a block `blockIdx`), and hardware groups 32 threads into a warp.
+* **Control Flow Divergence:** In SIMT, if threads within the same warp take different `if/else` branches, hardware executes both paths sequentially with non-matching threads masked off, reducing efficiency.
+* **Synchronization Barriers (`__syncthreads()`, `bar.sync`, `mbarrier`):** Instructions that pause all warps in a CTA until every warp reaches the barrier, ensuring SRAM writes are visible before reads.
+* **Warp Shuffle (`__shfl_xor_sync`, `shfl.sync.bfly`):** A fast hardware instruction that exchanges register values directly between threads in the *same* warp without using SRAM.
+* **Bank Conflicts & XOR Swizzling:** SRAM is split into 32 independent 4-byte **banks**. If multiple threads in a warp access different addresses in the same bank simultaneously, hardware serializes them (**bank conflict**). **XOR swizzling** permutes column indices using bitwise XOR so concurrent accesses hit distinct banks.
+* **SPMD (Single Program, Multiple Data) & Program Instance (`tl.program_id`):** An execution model where independent workers run the same program on different data slices. In **Triton**, each worker is a **Program Instance** (compiled to a CTA) identified by `tl.program_id(axis)` (analogous to CUDA's `blockIdx`).
+* **Triton, `@triton.jit`, Tile (`tl.tensor`), & `tl.constexpr`:** **Triton** is a Python GPU language and compiler (`@triton.jit` marks a kernel for compilation). Instead of scalar threads, Triton variables are multi-dimensional rectangular data blocks called **tiles** (`tl.tensor`) whose dimensions must be compile-time power-of-two constants (`tl.constexpr`).
+
+### 3. Number Formats, Hardware Units & Memory Instructions
+* **Precision Formats (`FP32`, `FP16`, `BF16`, `FP8`, `int32`, `int64`):**
+  * `FP32` (32-bit float, 4 bytes): Standard single precision used for accurate accumulation.
+  * `FP16` / `BF16` (16-bit float, 2 bytes): Half-precision formats used for LLM weights and activations (`BF16` keeps FP32's wide numeric range).
+  * `FP8` (8-bit float, 1 byte): Ultra-compact format for high-throughput inference.
+  * `int32` / `int64`: 32-bit and 64-bit signed integers used for indices and pointer math.
+* **Tensor Cores & MMA (`wmma`, `mma.sync`, `wgmma`, `nvidia_mma`, `tl.dot`):** Dedicated matrix-math hardware inside each SM that executes fast Matrix Multiply-Accumulate (**MMA**) instructions on tiles (`tl.dot` in Triton).
+* **Vectorized Loads/Stores (`LDG.E.128`, `STG`) & Predicated Loads (`@P0 LDG.E`, `SEL`):** **Vectorized** instructions load or store 128 bits (16 bytes) per thread in one instruction instead of multiple narrow loads. **Predicated** loads (`mask=` in Triton) suppress HBM transactions for out-of-bounds lanes, and `SEL` (select) fills masked registers with a safe fallback value (`other=`).
+* **Asynchronous Prefetching (`cp.async`, TMA, `num_stages`):** Hardware copy engines (`cp.async` on Ampere, **TMA — Tensor Memory Accelerator** on Hopper) that stream tiles from HBM into circular SRAM ring buffers (`num_stages` deep) in the background while SMs compute on earlier tiles.
+* **PTX Cache Modifiers (`.ca`, `.cg`) & Eviction Policies (`evict_first`, `evict_last`):** Low-level hints controlling whether loads cache in L1+L2 (`.ca`) or L2-only (`.cg`), and whether streaming data is marked for early L2 eviction (`evict_first`) to protect reusable data (`evict_last`).
+
+### 4. Compiler Stack, Autotuning & LLM Inference Concepts
+* **Triton Compilation Pipeline (`AST`, `SSA`, `TTIR`, `TTGIR`, `LLVM IR`, `PTX`, `SASS`, `CUTLASS`):**
+  * **AST (Abstract Syntax Tree):** Tree structure of the Python kernel code.
+  * **SSA (Static Single Assignment):** Compiler form where each variable is assigned once.
+  * **TTIR (Triton IR):** Hardware-agnostic tile-level intermediate representation.
+  * **TTGIR (Triton GPU IR):** GPU-specific IR that assigns register/SRAM layouts (`#triton_gpu.blocked`, `#triton_gpu.shared`, `#triton_gpu.nvidia_mma`, `#triton_gpu.dot_op`), inserts `bar.sync`, and schedules `cp.async`.
+  * **LLVM IR & NVVM / NVPTX:** Low-level compiler IR lowered into **PTX** (NVIDIA's hardware-independent virtual assembly).
+  * **SASS (`ptxas` / Cubin):** Native SM machine code assembled by `ptxas`. **CUTLASS** is NVIDIA's hand-tuned C++ template library for matrix math.
+* **Launch Grid, `cuLaunchKernel`, & GigaThread Engine:** Launching a kernel via `cuLaunchKernel` specifies a 1D/2D/3D **grid** of program instances, which the GPU's **GigaThread Engine** dispatches in waves across SMs.
+* **L2 Cache Swizzling (`tl.swizzle2d`, `GROUP_SIZE_M`):** Reordering 2D grid indices so SMs execute a compact square of output tiles concurrently, maximizing shared L2 cache hits.
+* **Autotuning (`@triton.autotune`, `BLOCK_SIZE`, `num_warps`, `num_stages`):** Benchmarking candidate tile sizes (`BLOCK_SIZE`), warps per CTA (`num_warps`), and pipeline stages (`num_stages`) on first run for a given input shape and caching the fastest configuration.
+* **GEMM & Arithmetic Intensity:** **GEMM** is General Matrix Multiplication ($C = A \times B$). **Arithmetic Intensity** is FLOPs performed per byte moved from memory; **memory-bandwidth-bound** kernels wait on HBM transfers, while **launch-latency-bound** kernels wait on CPU kernel dispatch.
+* **LLM Inference Kernels (`RMSNorm`, `Residual Add`, `RoPE`, `KV Cache`, `PagedAttention`, `SwiGLU`, `Softmax`):**
+  * **RMSNorm & Residual Add:** Normalizing hidden activations by their root-mean-square magnitude and adding the skip-connection ($h = x + r$).
+  * **RoPE (Rotary Position Embedding):** Encoding token positions by rotating query/key vectors.
+  * **KV Cache & PagedAttention:** Caching past Key/Value vectors across tokens; **PagedAttention** stores them in fixed-size non-contiguous memory blocks.
+  * **SwiGLU & Softmax:** **SwiGLU** is a gated feed-forward activation; **Softmax** converts raw scores (logits) into probabilities.
+
+---
+
 ## 1. Block-Level Programming: SPMD Over Program Instances vs. CUDA SIMT
 
 In native CUDA C++, engineers write kernels using the **SIMT (Single Instruction, Multiple Threads)** model at **scalar thread granularity**. Every instruction is written from the perspective of a single thread (`threadIdx.x`, `threadIdx.y`, `threadIdx.z`) inside a thread block (`blockIdx.x`, `blockDim.x`). To perform a high-throughput tile operation—such as loading a 2D block of activations, reducing across a row, or feeding Tensor Cores—the CUDA programmer must manually:

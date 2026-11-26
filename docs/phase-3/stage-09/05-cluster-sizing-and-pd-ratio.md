@@ -2,15 +2,41 @@
 
 > **Navigation:** [Prev: 04 — Distributed MoE Systems Engineering](./04-distributed-moe-systems-engineering.md) | [Stage 9 Index](./README.md)
 
-Disaggregating a serving cluster into separate Prefill and Decode pools unlocks independent scaling—but immediately raises the central capacity-planning question: **Given a target workload and strict SLOs, how many Prefill GPUs ($N_P$) and how many Decode GPUs ($N_D$) must be provisioned, and what is the optimal $N_P : N_D$ ratio?**
+When prompt processing and token generation run on separate GPU pools, cluster operators must decide how many GPUs to assign to each pool as traffic changes. This document derives the exact sizing formulas, queueing rules, and dynamic rebalancing protocols used to match hardware capacity to shifting workloads.
 
-Over-provisioning $N_P$ leaves expensive Tensor Cores idle waiting on prompts while Decode queues overflow KV VRAM; under-provisioning $N_P$ creates queueing backlogs that blow up Time to First Token (TTFT). Worse, real-world workloads exhibit wildly different input/output length ratios—a shift from interactive chat to RAG or agentic coding can flip the optimal $N_P : N_D$ ratio by **nearly two orders of magnitude**.
+---
 
-This document derives the exact analytical sizing equations, incorporates queueing and KV-memory capacity bounds, quantifies regime flips across real workloads, and explains dynamic elastic pool rebalancing.
+## Core Concepts & Terminology
+
+Every workload metric, queueing formula, and cluster-orchestration term used in this document is defined below in dependency order:
+
+### 1. Disaggregated Pools & Latency SLOs
+* **Prefill Pool ($N_P$), Decode Pool ($N_D$), & $N_P : N_D$ Ratio:** In a disaggregated cluster, $N_P$ GPUs handle prompt processing (**Prefill**) and $N_D$ GPUs handle token-by-token generation (**Decode**).
+* **SLO, TTFT, ITL, & P95/P99:** A **Service Level Objective (SLO)** is a strict latency target, usually enforced at the 95th or 99th percentile (**P95/P99**). **TTFT** (Time to First Token) measures prompt-to-first-token latency; **ITL** (Inter-Token Latency) measures the delay between consecutive output tokens.
+* **Exposed KV Transfer Latency ($T_{\text{exposed\_kv}}$):** Any unhidden network time spent transferring the KV Cache from Prefill to Decode that adds directly to TTFT.
+
+### 2. Workload & Hardware Capacity Metrics
+* **Arrival Rate ($\lambda$), $L_{\text{in}}$, $L_{\text{out}}$, & Prefix Cache Hit Rate ($\rho$):** $\lambda$ is incoming requests per second. $L_{\text{in}}$ and $L_{\text{out}}$ are prompt and output token lengths (with means $\bar{L}_{\text{in}}, \bar{L}_{\text{out}}$). $\rho \in [0, 1)$ is the fraction of prompt tokens already stored in a warm **Prefix Cache**, skipping Prefill compute.
+* **Workload Regimes (Chat, RAG, Agentic Coding):** *Interactive chat* has short prompts and long replies; **RAG (Retrieval-Augmented Generation)** and *agentic coding* inject huge documents or codebases into prompts ($L_{\text{in}} \gg L_{\text{out}}$).
+* **Prefill & Decode Goodput ($R_P$, $R_D(B^*)$) & Optimal Batch Size ($B^*$):** **Goodput** is sustained token throughput per GPU while meeting SLOs. $R_P$ is prefill tokens/s/GPU within $\text{SLO}_{\text{TTFT}}$. $R_D(B^*)$ is decode output tokens/s/GPU at the largest batch size $B^*$ whose step time $T_{\text{step}}(B^*)$ still satisfies $\text{SLO}_{\text{ITL}}$.
+* **HBM, $\text{VRAM}_{\text{KV\_per\_GPU}}$, PagedAttention, GQA, & FP8:** **HBM** is high-speed GPU memory. $\text{VRAM}_{\text{KV\_per\_GPU}}$ is the HBM left for **PagedAttention** KV Cache blocks after subtracting model weights, activation workspace, and **CUDA context** overhead. **GQA** (Grouped-Query Attention) and **FP8** (1-byte floats) shrink KV bytes per token.
+* **Parallelism Multiples ($TP_P, PP_P, TP_D, PP_D$):** Each Prefill or Decode instance spans $TP \cdot PP$ GPUs (Tensor Parallelism $\times$ Pipeline Parallelism), so $N_P$ and $N_D$ must be rounded up to multiples of their instance sizes.
+
+### 3. Queueing Theory & Memory Concurrency
+* **Utilization Headroom ($\eta_P, \eta_D$) & Stochastic Arrivals:** Real traffic arrives randomly (**Poisson/bursty arrivals**). Running any queue at 100% utilization ($\eta = 1$) drives wait times to infinity, so clusters target headroom $\eta < 1$.
+* **Little's Law:** A fundamental queueing law stating that average concurrent active requests equal arrival rate times average residence time: $N_{\text{conc}} = \lambda \cdot \bar{T}_{\text{decode}}$.
+* **Kingman's M/G/1 Queueing Approximation ($W_q, C_a^2, C_s^2$):** Estimates average queue wait time $W_q$ from utilization $\eta$, arrival variance $C_a^2$, and service-time variance $C_s^2 = \sigma^2 / \mu^2$ (squared coefficient of variation). High-variance Prefill ($C_s^2 \gg 1$) needs lower utilization ($\eta_P$) than smooth Continuous-Batching Decode ($C_s^2 \ll 1$).
+
+### 4. Elastic Role-Switching & Rebalancing
+* **Cold Start vs. Zero-Cold-Start Role-Switching:** Loading a 70B–671B model from S3/NVMe into HBM takes 30–180 s (**cold start**). Because Prefill and Decode hold the exact same model weights, planners (**NVIDIA Dynamo Planner**, **Splitwise**, **SGLang Router**) can switch a node's role in ~50–500 ms without reloading weights.
+* **CUDA Graphs, `max_num_batched_tokens`, & Chunked Prefill:** **CUDA Graphs** capture fixed GPU kernel sequences for fast Decode; switching to Prefill mode reconfigures the scheduler to allow larger token batches (`max_num_batched_tokens`) and **Chunked Prefill**.
+* **Hysteresis (*Flapping*), `DRAINING`, `EOS`, GPUDirect RDMA, NIXL, & SSE:** **Hysteresis** waits for a sustained imbalance before switching roles so the cluster does not oscillate (*flap*). Placing a node in **`DRAINING`** stops new admissions until active requests hit **`EOS`** (End of Sequence) or migrate over **GPUDirect RDMA / NIXL** without dropping the client's **SSE** (Server-Sent Events) token stream.
 
 ---
 
 ## 1. Analytical Foundations & Input Variables
+
+Disaggregating a serving cluster into separate Prefill and Decode pools unlocks independent scaling—but immediately raises the central capacity-planning question: **Given a target workload and strict SLOs, how many Prefill GPUs ($N_P$) and how many Decode GPUs ($N_D$) must be provisioned, and what is the optimal $N_P : N_D$ ratio?** Over-provisioning $N_P$ leaves expensive Tensor Cores idle waiting on prompts while Decode queues overflow KV VRAM; under-provisioning $N_P$ creates queueing backlogs that blow up TTFT, and real-world shifts from chat to RAG or agentic coding can flip the optimal $N_P : N_D$ ratio by **nearly two orders of magnitude**.
 
 To size a disaggregated cluster rigorously, separate **workload demand parameters**, **empirically benchmarked hardware capacities**, and **SLO constraints**:
 

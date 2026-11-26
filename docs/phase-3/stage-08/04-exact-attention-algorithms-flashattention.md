@@ -4,6 +4,32 @@
 
 ---
 
+This guide explains how **FlashAttention** computes exact Transformer attention without running out of memory or stalling on slow off-chip transfers, tracing its evolution across three generations of GPU hardware. Every mathematical, hardware, and precision concept used below is defined in dependency order before its first use.
+
+## Core Concepts & Terminology
+
+### 1. Attention Math & Inference Phases
+* **Scaled Dot-Product Attention ($Q, K, V, S, P, O$), Causal Mask, & Softmax:** Attention compares Query ($Q$) and Key ($K$) matrices to produce similarity scores $S = Q K^T / \sqrt{d}$. A **causal mask** sets future token positions to $-\infty$, **Softmax** normalizes each row into probabilities $P$, and multiplying by Value ($V$) yields output $O$.
+* **Prefill vs. Autoregressive Decode:** **Prefill** processes all prompt tokens ($N$) in parallel. **Autoregressive Decode** generates one new token at a time ($N_Q = 1$) while attending over all past cached Key/Value tokens ($N_{\text{KV}}$).
+* **Safe Softmax, Online Softmax, & Logsumexp ($L = m + \ln \ell$):** **Safe Softmax** subtracts the row maximum $m(x)$ before exponentiating to prevent numeric overflow. **Online Softmax** computes the exact row max $m$, exponential sum $\ell$, and output $O$ in a single streaming pass over tiles by rescaling prior accumulators with $\alpha = \exp(m^{\text{old}} - m^{\text{new}})$. **Logsumexp** ($L = m + \ln \ell$) is the compact log-normalizer.
+
+### 2. GPU Execution, Memory & Compute Units
+* **HBM, SRAM (Shared Memory), Registers, & OOM:** **HBM** is the GPU's large off-chip main memory (slow, ~400–800 cycles). **SRAM (Shared Memory)** is fast on-chip memory (~20–30 cycles) inside each **SM (Streaming Multiprocessor)**. **Registers** are 0-cycle private thread storage. **OOM** is an Out-Of-Memory error when HBM capacity is exceeded.
+* **Thread, Warp, CTA (Thread Block), & Warpgroup:** A **warp** is 32 threads executing in lockstep; a **CTA** is a thread block on one SM. On Hopper GPUs, a **warpgroup** is 4 warps (128 threads) cooperating as a single matrix-math unit.
+* **GEMM, `bmm`, TFLOP/s, PFLOP/s, Arithmetic Intensity, & Ridge Point:** **GEMM** is General Matrix Multiplication (`bmm` is Batched Matrix Multiply). **TFLOP/s** ($10^{12}$ FLOPs/s) and **PFLOP/s** ($10^{15}$ FLOPs/s) measure compute rate. **Arithmetic Intensity** (FLOPs per byte moved) and the **Ridge Point** (~295 FLOPs/Byte on H100 BF16) separate **HBM-bandwidth-bound** kernels from **compute-bound** kernels.
+* **Tensor Cores (`mma.sync`, `wgmma.mma_async`) vs. SFU (`MUFU.EX2`, `exp2f`):** **Tensor Cores** execute high-throughput Matrix Multiply-Accumulate (`mma.sync` on Ampere; asynchronous **`wgmma.mma_async`** on Hopper). The **SFU (Special Function Unit)** computes transcendental functions like base-2 exponential (`exp2f` / `MUFU.EX2`) at ~16x lower throughput than Tensor Cores.
+
+### 3. Precision, Data Movement & Synchronization
+* **Precision Formats (`FP32`, `FP16`, `BF16`, `FP8 E4M3`, Mantissa, Subnormals):** `FP32` (4 bytes, max `FLT_MAX`), `FP16` (2 bytes, max `HALF_MAX` $\approx 65,504$), `BF16` (2 bytes, wide range), and `FP8 E4M3` (1 byte, 4 exponent bits, **3 mantissa bits**, max 448). Narrow FP8 precision can underflow small values to zero or **subnormals** when large **channel-wise outliers** dominate a tensor's scale.
+* **Asynchronous Copy (`cp.async`, TMA, `mbarrier`) & XOR Swizzling:** `cp.async` (Ampere) and **TMA (`cp.async.bulk.tensor`)** (Hopper) copy tiles from HBM into **XOR-swizzled** (bank-conflict-free) SRAM in the background, signaling completion via hardware **`mbarrier`** objects.
+* **Fragment & Synchronization Instructions (`ldmatrix`, `stmatrix`, `bar.sync`, `shfl.sync.bfly`, `setmaxnreg`):** `ldmatrix` / `stmatrix` move matrix tiles between SRAM and registers; `bar.sync` / **named barriers** synchronize warps; `shfl.sync.bfly` exchanges register values within a warp. Hopper's **`setmaxnreg.dec` / `setmaxnreg.inc`** dynamically transfers register budget from Producer to Consumer warpgroups.
+
+### 4. Attention Variants & FP8 Incoherent Processing
+* **FlashAttention-1, 2, 3 & FlashDecoding:** **FA-1** tiles attention in SRAM with an outer-$K,V$ loop and Split-K warps. **FA-2** flips to an outer-$Q$ loop, defers normalization to the epilogue, uses `exp2f`, and uses **Split-Q** warps. **FlashDecoding** splits long $N_{\text{KV}}$ across CTAs during decode (**Split-KV**). **FA-3** uses Hopper **Warp-Specialization** (Producer TMA + Consumer **Ping-Pong** WGMMA/Softmax overlap) and FP8 scaling.
+* **Block-Wise Quantization & Hadamard Incoherent Processing (FWHT, Rademacher, RMSE):** **Block-wise scaling** gives each SRAM tile its own FP32 scale factor. Multiplying $Q, K$ by a randomized orthogonal Hadamard matrix $H = D \cdot H_d$ ($D$ has random $\pm 1$ **Rademacher** signs) via the $O(d \log d)$ **Fast Walsh-Hadamard Transform (FWHT)** smears outlier spikes uniformly without changing $Q K^T$, cutting FP8 **RMSE (Root Mean Square Error)**.
+
+---
+
 ## 1. Why Standard Attention Materializes $O(N^2)$ HBM Matrices
 
 For a single attention head with sequence length $N$ and head dimension $d$ (e.g., $d = 128$), scaled dot-product attention computes:

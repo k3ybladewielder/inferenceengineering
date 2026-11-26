@@ -2,13 +2,43 @@
 
 > **Navigation:** [Prev: 03 — KV State Transport](./03-kv-state-transport.md) | [Stage 9 Index](./README.md) | **Next:** [05 — Cluster Sizing & P/D Ratio](./05-cluster-sizing-and-pd-ratio.md)
 
-Frontier Mixture-of-Experts (MoE) architectures—such as DeepSeek-V3 (671B total parameters, 37B active, 256 routed experts, top-$k = 8$), Qwen3-235B-A22B, and Mixtral-8x22B—decouple model capacity (total parameter count) from per-token FLOPs. However, running 671B parameters in FP8 (~671 GB of weights alone, before KV Cache and activations) exceeds the HBM of a single 8x H100 server (640 GB total), requiring multi-node deployment.
+Modern frontier AI models save compute by activating only a small fraction of their neural network weights for each word they process, spreading specialized sub-networks across dozens of GPUs. This document explains how GPUs route tokens across the network to those sub-networks without stalling on slow CPUs, uneven traffic spikes, or idle compute cores.
 
-While Attention can use Data Parallelism (DP) or Tensor Parallelism (TP), replicating 256 experts on every node wastes massive HBM and forces skinny memory-bound GEMVs during Decode. **Expert Parallelism (EP)** shards the $E$ routed experts across $N_{\text{EP}}$ GPUs ($E / N_{\text{EP}}$ experts per GPU), transforming the FFN block into a **dynamic, data-dependent `All-to-All` distributed routing problem**.
+---
+
+## Core Concepts & Terminology
+
+Every model architecture detail, GPU kernel technique, and networking primitive used in this document is defined below in dependency order:
+
+### 1. Mixture-of-Experts (MoE) & Parallelism
+* **Mixture-of-Experts (MoE), Routed Experts ($E$), & Top-$K$ Gating:** Instead of one giant feed-forward network (FFN) per layer, an MoE layer has $E$ smaller **routed experts** (e.g., 256). A small **gating network** (`Softmax(W_g x_i)`) scores each token $x_i$ and activates only the top-$k$ experts (e.g., $k=8$), keeping per-token math (**FLOPs**) low despite huge total parameter counts.
+* **SwiGLU FFN (`Gate + Up` $\to$ `SiLU` $\to$ `Down`) & Residual Connection:** Each expert is a neural-network block that applies `Gate` and `Up` linear projections, a `SiLU` activation, and a `Down` projection. A **residual connection** adds the layer's original input directly to its output.
+* **Data Parallelism (DP), Tensor Parallelism (TP), & Expert Parallelism (EP, $N_{\text{EP}}$):** **DP** runs independent attention batches on different GPUs; **TP** splits matrices across GPUs; **EP** shards the $E$ experts across $N_{\text{EP}}$ GPUs ($E / N_{\text{EP}}$ experts per GPU) because 256+ experts exceed a single server's **HBM** (High Bandwidth Memory).
+* **FP8, BF16, FP32, & Scale Factors:** **FP8** (1 byte/number) halves token size compared to **BF16** (2 bytes/number) using small per-block **scale factors**; final weighted sums often use **FP32** (4 bytes) or BF16 for numerical accuracy.
+
+### 2. All-to-All Communication & DeepEP Kernels
+* **`All-to-All` Dispatch & Combine:** Because a token's top-$k$ experts may live on any GPU, **Dispatch** sends each token over the network to the GPUs hosting its chosen experts, and **Combine** returns the expert outputs to the originating GPU for weighted summation.
+* **Why `ncclAlltoAll` / `ncclAlltoAllv` Stalls:** NVIDIA's standard collective library (**NCCL**) provides `ncclAlltoAllv` for variable-size exchanges, but it requires the host CPU to know exact peer token counts in advance—forcing an extra `AllGather` + GPU-to-CPU `cudaMemcpy` synchronization stall before communication can start.
+* **DeepEP, Node-Limited Routing, NVLink, & RDMA:** **DeepEP** (DeepSeek Expert Parallelism) replaces NCCL with two GPU-native kernels. In Prefill, it exploits **node-limited routing** (capping each token to at most $M$ server nodes) to send **at most 1 copy** per target node over inter-node **RDMA** (direct NIC-to-memory network transfers), then broadcasts locally inside the node over ultra-fast **NVLink**.
+* **IBGDA (InfiniBand GPUDirect Async), NVSHMEM, `RDMA Put`, WQE, Doorbell, & PCIe MMIO:** In low-latency Decode, DeepEP uses **IBGDA** via **NVSHMEM**: GPU **SMs** (Streaming Multiprocessors) write RDMA work descriptors (**WQEs**) and ring the NIC's **Doorbell** directly via **PCIe MMIO** (Memory-Mapped I/O), bypassing the host CPU completely to write tokens directly into remote GPU memory (`RDMA Put`).
+
+### 3. Load Skew, Capacity Factor, & Dropless Kernels
+* **Auxiliary Load-Balancing Loss, Zipfian Skew, & Straggler:** Training uses an *auxiliary load-balancing loss* to encourage even expert usage, but real inference traffic exhibits **Zipfian skew** (a few "hot" experts receive most tokens—e.g., code or JSON boilerplate). Because `All-to-All Combine` is a synchronous barrier, all GPUs wait on the slowest **straggler** GPU.
+* **Capacity Factor ($CF$), Token Dropping, & Padding Waste:** Early MoE systems capped each expert's buffer at $CF \times \text{average load}$. Small $CF$ silently **drops** excess tokens (corrupting inference outputs); large $CF$ **pads** tensors with zeros (wasting HBM, network bandwidth, and FLOPs).
+* **Dropless MoE, MegaBlocks, `cub::DeviceScan::ExclusiveSum`, & Grouped GEMM:** **Dropless MoE** (e.g., *MegaBlocks*) avoids dropping and padding. A fast GPU prefix sum (`ExclusiveSum`) computes contiguous offsets to pack tokens by local expert ID (`gather`/`scatter`), and a single persistent **Grouped GEMM** kernel (in **CUTLASS** or **Triton**) executes variable-height matrix multiplications `(M_e, N, K)` across SMs, rounding `M_e` only up to the **Tensor Core** tile multiple.
+
+### 4. Expert Replication & Compute/Communication Overlap
+* **EPLB (Expert Parallelism Load Balancer), Logical Experts ($E$) vs. Physical Slots ($S > E$), EMA, & LPT Bin Packing:** **EPLB** eliminates stragglers without dropping tokens by provisioning extra **physical expert slots** ($S > E$), tracking hot experts via an **EMA (Exponential Moving Average)** of token counts, replicating hot experts across GPUs, and balancing slots via **LPT (Longest-Processing-Time-First)** bin packing.
+* **MFU & Dual-Microbatch Ping-Pong (Two-Batch Overlap / TBO):** **MFU (Model FLOPs Utilization)** drops when Tensor Cores sit idle during `All-to-All`. **TBO** splits a batch into Micro-Batch A and B across **`ComputeStream`** and **`CommStream`** so one micro-batch computes Attention/GEMM while the other transfers over the network.
+* **CUDA Green Contexts, `sm_count`, `CUDA_DEVICE_MAX_CONNECTIONS`, & `cudaStreamWaitEvent`:** **CUDA Green Contexts** (or explicit `sm_count` grid limits) reserve dedicated SMs for `CommStream` so GEMM does not starve communication. Setting `CUDA_DEVICE_MAX_CONNECTIONS >= 8` prevents CUDA from serializing `ComputeStream` and `CommStream` onto one hardware queue, while `cudaStreamWaitEvent` synchronizes them on the GPU.
 
 ---
 
 ## 1. Expert Parallelism & All-to-All Mechanics
+
+Frontier Mixture-of-Experts (MoE) architectures—such as DeepSeek-V3 (671B total parameters, 37B active, 256 routed experts, top-$k = 8$), Qwen3-235B-A22B, and Mixtral-8x22B—decouple model capacity (total parameter count) from per-token FLOPs. However, running 671B parameters in FP8 (~671 GB of weights alone, before KV Cache and activations) exceeds the HBM of a single 8x H100 server (640 GB total), requiring multi-node deployment.
+
+While Attention can use Data Parallelism (DP) or Tensor Parallelism (TP), replicating 256 experts on every node wastes massive HBM and forces skinny memory-bound GEMVs during Decode. **Expert Parallelism (EP)** shards the $E$ routed experts across $N_{\text{EP}}$ GPUs ($E / N_{\text{EP}}$ experts per GPU), transforming the FFN block into a **dynamic, data-dependent `All-to-All` distributed routing problem**.
 
 In an MoE layer with $E$ routed experts distributed across $N_{\text{EP}}$ GPUs (typically $N_{\text{EP}} = 16, 32, 64,$ or up to $320$ in large-scale deployments), each GPU processes a local batch of $T_{\text{local}}$ tokens from its Attention/DP group.
 
