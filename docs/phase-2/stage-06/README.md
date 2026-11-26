@@ -24,13 +24,13 @@ Stage 6 covers the end-to-end physics, algorithms, silicon execution paths, and 
 
 ## Topic Index
 
-| # | Topic | Core Concepts | Document |
-| :--- | :--- | :--- | :--- |
-| **01** | **Numerical Representation** | FP8 (E4M3/E5M2), FP4 (E2M1), NF4, OCP MXFP4/MXFP8 (E8M0), Symmetric/Asymmetric INT8/INT4, Scaling Granularities | [01-numerical-representation.md](./01-numerical-representation.md) |
-| **02** | **Outliers & Calibration** | Emergent Activation Outliers (>6.7B), SmoothQuant Scale Migration, AWQ Salience Scaling, GPTQ Inverse Hessian Compensation | [02-outliers-and-calibration.md](./02-outliers-and-calibration.md) |
-| **03** | **Hardware Execution** | W4A16 On-the-Fly Register Dequantization (Marlin) vs. W8A8 Native Tensor Core MMA, Roofline Crossover Batch Size $B^*$ | [03-hardware-execution-w4a16-vs-w8a8.md](./03-hardware-execution-w4a16-vs-w8a8.md) |
-| **04** | **Sparsity & Pruning** | NVIDIA 2:4 Structured Sparsity, 2-bit Metadata Overhead, Wanda & SparseGPT, Combining 2:4 with INT4/FP8 | [04-sparsity-and-pruning.md](./04-sparsity-and-pruning.md) |
-| **05** | **Scientific Quality Evaluation** | Sliding-Window Perplexity (WikiText-2/C4), Logit KL Divergence, `lm-evaluation-harness` (MMLU/GSM8K/HumanEval/IFEval), Hidden Failure Modes | [05-scientific-quality-evaluation.md](./05-scientific-quality-evaluation.md) |
+| # | Topic | Core Concepts |
+| :--- | :--- | :--- |
+| **01** | [**Numerical Representation**](./01-numerical-representation.md) | FP8 (E4M3/E5M2), FP4 (E2M1), NF4, OCP MXFP4/MXFP8 (E8M0), Symmetric/Asymmetric INT8/INT4, Scaling Granularities |
+| **02** | [**Outliers & Calibration**](./02-outliers-and-calibration.md) | Emergent Activation Outliers (>6.7B), SmoothQuant Scale Migration, AWQ Salience Scaling, GPTQ Inverse Hessian Compensation |
+| **03** | [**Hardware Execution**](./03-hardware-execution-w4a16-vs-w8a8.md) | W4A16 On-the-Fly Register Dequantization (Marlin) vs. W8A8 Native Tensor Core MMA, Roofline Crossover Batch Size $B^*$ |
+| **04** | [**Sparsity & Pruning**](./04-sparsity-and-pruning.md) | NVIDIA 2:4 Structured Sparsity, 2-bit Metadata Overhead, Wanda & SparseGPT, Combining 2:4 with INT4/FP8 |
+| **05** | [**Scientific Quality Evaluation**](./05-scientific-quality-evaluation.md) | Sliding-Window Perplexity (WikiText-2/C4), Logit KL Divergence, `lm-evaluation-harness` (MMLU/GSM8K/HumanEval/IFEval), Hidden Failure Modes |
 
 ---
 

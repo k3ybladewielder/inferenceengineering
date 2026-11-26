@@ -29,13 +29,13 @@ flowchart TD
 
 ## Topic Index
 
-| # | Topic | Core Technical Concepts | Document |
-| --- | --- | --- | --- |
-| **01** | **Triton Programming Model** | Block-level SPMD execution, `tl.program_id`, 2D/3D stride pointer arithmetic, boundary masks & neutral padding (`other`), compiler-managed TTGIR SRAM layouts & coalescing, `@triton.autotune` (`BLOCK_SIZE`, `num_warps`, `num_stages`), annotated fused RMSNorm kernel | [`01-triton-programming-model.md`](./01-triton-programming-model.md) |
-| **02** | **Kernel Memory Optimization** | 128B cache lines & 32B sectors, coalesced vs. strided HBM access, explicit SRAM tiling, 32-bank Shared Memory physics & XOR swizzling, 128-bit vectorized loads (`ld.global.v4.b32`), register pressure & HBM local-memory spilling, `cp.async` & TMA multi-stage software pipelining | [`02-kernel-memory-optimization.md`](./02-kernel-memory-optimization.md) |
-| **03** | **Operator Fusion & CUDA Graphs** | HBM byte-traffic reduction via kernel fusion (`Residual + RMSNorm + FP8/INT8 Quant`, `SwiGLU`), horizontal vs. vertical fusion, CPU launch overhead physics (~5–20 µs/kernel), `cudaStreamBeginCapture` / `torch.cuda.CUDAGraph`, static-shape constraints, batch bucketing & padding | [`03-operator-fusion-and-cuda-graphs.md`](./03-operator-fusion-and-cuda-graphs.md) |
-| **04** | **Exact Attention Algorithms** | Why standard attention materializes $O(N^2)$ HBM intermediates, single-pass Online Softmax ($m, \ell, \alpha$), FlashAttention-1 vs. FlashAttention-2 outer-$Q$ tiling, FlashAttention-3 Hopper warp-specialization (TMA Producers, WGMMA Consumers, Ping-Pong softmax overlap), FP8 Hadamard incoherent processing | [`04-exact-attention-algorithms-flashattention.md`](./04-exact-attention-algorithms-flashattention.md) |
-| **05** | **Profiling & Roofline Analysis** | `ncu --set full` kernel replay mechanics, SpeedOfLight (`Memory Throughput %` vs. `Compute (SM) Throughput %`), Warp Stall Reasons (`long_scoreboard`, `math_pipe_throttle`, `barrier`, `short_scoreboard`), occupancy vs. latency hiding & wave quantization, empirical H100 Roofline plotting | [`05-profiling-and-roofline-analysis.md`](./05-profiling-and-roofline-analysis.md) |
+| # | Topic | Core Technical Concepts |
+| --- | --- | --- |
+| **01** | [**Triton Programming Model**](./01-triton-programming-model.md) | Block-level SPMD execution, `tl.program_id`, 2D/3D stride pointer arithmetic, boundary masks & neutral padding (`other`), compiler-managed TTGIR SRAM layouts & coalescing, `@triton.autotune` (`BLOCK_SIZE`, `num_warps`, `num_stages`), annotated fused RMSNorm kernel |
+| **02** | [**Kernel Memory Optimization**](./02-kernel-memory-optimization.md) | 128B cache lines & 32B sectors, coalesced vs. strided HBM access, explicit SRAM tiling, 32-bank Shared Memory physics & XOR swizzling, 128-bit vectorized loads (`ld.global.v4.b32`), register pressure & HBM local-memory spilling, `cp.async` & TMA multi-stage software pipelining |
+| **03** | [**Operator Fusion & CUDA Graphs**](./03-operator-fusion-and-cuda-graphs.md) | HBM byte-traffic reduction via kernel fusion (`Residual + RMSNorm + FP8/INT8 Quant`, `SwiGLU`), horizontal vs. vertical fusion, CPU launch overhead physics (~5–20 µs/kernel), `cudaStreamBeginCapture` / `torch.cuda.CUDAGraph`, static-shape constraints, batch bucketing & padding |
+| **04** | [**Exact Attention Algorithms**](./04-exact-attention-algorithms-flashattention.md) | Why standard attention materializes $O(N^2)$ HBM intermediates, single-pass Online Softmax ($m, \ell, \alpha$), FlashAttention-1 vs. FlashAttention-2 outer-$Q$ tiling, FlashAttention-3 Hopper warp-specialization (TMA Producers, WGMMA Consumers, Ping-Pong softmax overlap), FP8 Hadamard incoherent processing |
+| **05** | [**Profiling & Roofline Analysis**](./05-profiling-and-roofline-analysis.md) | `ncu --set full` kernel replay mechanics, SpeedOfLight (`Memory Throughput %` vs. `Compute (SM) Throughput %`), Warp Stall Reasons (`long_scoreboard`, `math_pipe_throttle`, `barrier`, `short_scoreboard`), occupancy vs. latency hiding & wave quantization, empirical H100 Roofline plotting |
 
 ---
 
