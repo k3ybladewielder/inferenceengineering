@@ -69,10 +69,10 @@ In native CUDA C++, engineers write kernels using the **SIMT (Single Instruction
 3. Insert explicit `__syncthreads()` barriers between producer stores and consumer loads.
 4. Implement warp-level shuffle reductions (`__shfl_xor_sync`) followed by cross-warp shared-memory reductions.
 
-**Triton** elevates the programming abstraction by one level while retaining bare-metal control over HBM traffic and kernel fusion. Triton uses **block-level SPMD (Single Program, Multiple Data)** execution over **program instances** (tiles), not individual threads:
+**Triton** elevates the programming abstraction by one level while retaining bare-metal control over HBM traffic and kernel fusion. Triton uses **block-level SPMD (Single Program, Multiple Data)** execution over **program instances** (tiles), not individual threads. For a PyTorch user, the mental model is straightforward: instead of writing a Python `for row_idx in range(M):` loop that processes one row of a `torch.Tensor` at a time, you write the body of that loop as a `@triton.jit` function, and the GPU executes all `M` iterations simultaneously—each iteration running as an independent **Program Instance** on a Streaming Multiprocessor (SM).
 
 * **In CUDA (SIMT):** Each execution instance is a *scalar thread*; variables in the kernel hold scalar registers (`float`, `half`, `float4`), and parallelism across a tile is explicitly indexed by `threadIdx`.
-* **In Triton (Block-Level SPMD):** Each execution instance is an entire **Program Instance** (which compiles down to a CUDA Thread Block / Cooperative Thread Array, or CTA). Variables inside a Triton kernel are **multi-dimensional register/SRAM tiles** (`tl.tensor`) whose shapes must be compile-time powers of two (`tl.constexpr`).
+* **In Triton (Block-Level SPMD):** Each execution instance is an entire **Program Instance** (which compiles down to a CUDA Thread Block / Cooperative Thread Array, or CTA). Variables inside a Triton kernel are **multi-dimensional register/SRAM tiles** (`tl.tensor`) whose shapes must be compile-time powers of two (`tl.constexpr`). Requiring `tl.constexpr` shapes allows the Triton compiler to statically determine the exact number of hardware registers, SRAM buffers, and vectorized load instructions needed before generating GPU machine code—something impossible if tile shapes varied dynamically at runtime.
 
 | Architectural Dimension | CUDA C++ (Thread-Level SIMT) | Triton (Block-Level SPMD) |
 | --- | --- | --- |
@@ -86,6 +86,8 @@ In native CUDA C++, engineers write kernels using the **SIMT (Single Instruction
 
 Because there is **no `threadIdx` concept in Triton user code**, a Triton programmer cannot accidentally introduce intra-warp control-flow divergence inside a tile or mis-index a shared-memory bank. Instead, the programmer expresses **what tile of data** each program instance owns and **what mathematical operations** transform that tile; the Triton compiler decides *which* of the `num_warps * 32` hardware threads inside the CTA hold which elements in registers, how to stage them through SRAM, and when to emit `bar.sync`.
 
+In PyTorch terms, standard eager operations like `y = x + r` dispatch pre-compiled CUDA kernels where each scalar thread computes a single element `y[i] = x[i] + r[i]`. In Triton, your kernel looks like vectorized NumPy/PyTorch code operating on a slice—such as a `[4096]` token row or a `[128, 128]` matrix tile—while running across hundreds of SMs in parallel. Requiring tile dimensions to be compile-time power-of-two constants (`tl.constexpr`) lets the compiler map those tiles onto 32-thread warps, 128-byte cache lines, and fixed-size Tensor Core instructions using fast bit-shifts rather than slow runtime division.
+
 ### Impact on LLM Inference Engineering
 
 LLM inference kernels outside standard dense GEMMs—such as **fused RMSNorm + Residual Add + FP8 Quantization**, **fused RoPE + KV-Cache scatter**, **PagedAttention decode**, and **fused SwiGLU**—are overwhelmingly **memory-bandwidth-bound** or **launch-latency-bound**. Achieving 80–90% of theoretical HBM3/HBM3e bandwidth in pure CUDA requires hundreds of lines of boilerplate for vectorized loads, warp reductions, and architecture-specific `cp.async` pipelines. Triton lets an inference engineer express the exact fused HBM access pattern in ~30 lines of Python while generating SASS competitive with hand-tuned CUTLASS/CUDA C++.
@@ -94,7 +96,7 @@ LLM inference kernels outside standard dense GEMMs—such as **fused RMSNorm + R
 
 ## 2. `tl.program_id` and Launch Grid Mapping
 
-When launching a Triton kernel from Python, you specify a **launch grid**—a 1D, 2D, or 3D tuple `(grid_x, grid_y, grid_z)` (or a `lambda meta: (...)` callable evaluated against autotuned `BLOCK_SIZE` metadata). Inside the kernel, `tl.program_id(axis)` returns the zero-based integer index of the current program instance along `axis` (`0`, `1`, or `2`), directly analogous to CUDA's `blockIdx.x`, `blockIdx.y`, and `blockIdx.z`.
+When launching a Triton kernel from Python, you specify a **launch grid**—a 1D, 2D, or 3D tuple `(grid_x, grid_y, grid_z)` (or a `lambda meta: (...)` callable evaluated against autotuned `BLOCK_SIZE` metadata). Conceptually, a launch grid is equivalent to a nested Python `for` loop over `(pid_x, pid_y, pid_z)` where every iteration is independent and dispatched concurrently across the GPU's SMs. Inside the kernel, `tl.program_id(axis)` returns the zero-based integer index of the current program instance along `axis` (`0`, `1`, or `2`), directly analogous to CUDA's `blockIdx.x`, `blockIdx.y`, and `blockIdx.z`.
 
 ```python
 pid_m = tl.program_id(axis=0)  # analogous to blockIdx.x
@@ -107,10 +109,10 @@ pid_b = tl.program_id(axis=2)  # analogous to blockIdx.z
 1. **1D Row-Per-Program Mapping (Norms, Softmax, RoPE, Elementwise):**
    For a hidden activation tensor of shape $[M, N]$ where $M = B \cdot T$ (batch $\times$ sequence tokens) and $N = d_{\text{model}}$, a reduction kernel maps one program instance per token row:
    $$\text{grid} = (M,)$$
-   `row_idx = tl.program_id(0)`. If $N$ fits in SRAM/registers (typical LLM $d_{\text{model}} \in [2048, 8192]$), the entire row is loaded in one vectorized tile of size `BLOCK_N = triton.next_power_of_2(N)`. If $N$ is huge (e.g., vocabulary logits $V = 128,256$ or $151,936$ in fused Cross-Entropy / Top-K sampling), the kernel loops in chunks of `BLOCK_N` inside the single program instance.
+   `row_idx = tl.program_id(0)`. Conceptually, this is like launching $M$ parallel Python workers where worker `row_idx` processes `X[row_idx, :]`. If $N$ fits in SRAM/registers (typical LLM $d_{\text{model}} \in [2048, 8192]$), the entire row is loaded in one vectorized tile of size `BLOCK_N = triton.next_power_of_2(N)`. If $N$ is huge (e.g., vocabulary logits $V = 128,256$ or $151,936$ in fused Cross-Entropy / Top-K sampling), the kernel loops in chunks of `BLOCK_N` inside the single program instance.
 
 2. **2D L2-Cache-Friendly Grouped Mapping (GEMM / Linear Projections):**
-   In a naive 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`, CUDA dispatches CTAs sequentially along `blockIdx.x` (rows) or `blockIdx.y`. If row 0 spans 64 horizontal output tiles before advancing to row 1, the GPU reads the entire $B$ matrix (`[K, N]`) before reusing any tile of $A$, thrashing the L2 cache (~50 MB on H100).
+   In a naive 2D grid `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`, CUDA dispatches CTAs sequentially along `blockIdx.x` (rows) or `blockIdx.y`. If row 0 spans 64 horizontal output tiles before advancing to row 1, the SMs running row 0 stream all 64 column tiles of the $B$ matrix (`[K, N]`) through the 50 MB L2 cache, evicting earlier $B$ tiles before row 1 even starts. Every subsequent row then suffers L2 cache misses and re-fetches $B$ from slow HBM.
    Instead, Triton kernels group `GROUP_SIZE_M` rows together (`tl.swizzle2d` or manual group indexing):
 
    ```python
@@ -135,7 +137,7 @@ Unlike C arrays or PyTorch tensors where indexing is abstracted behind `tensor[i
 
 ### Constructing Address Tiles with `tl.arange` and Strides
 
-Consider a 2D activation tensor `X` of shape `(M, N)` with memory strides `(stride_xm, stride_xn)` (obtained in Python via `X.stride(0), X.stride(1)`—in *elements*, not bytes). Note that in PyTorch, a slice or transposed view can have arbitrary non-unit strides (`stride_xm != N`, or `stride_xn != 1`).
+Consider a 2D activation tensor `X` of shape `(M, N)` with memory strides `(stride_xm, stride_xn)` (obtained in Python via `X.stride(0), X.stride(1)`—measured in *elements*, not bytes). In PyTorch, every tensor is backed by a flat 1D buffer in GPU memory, and a sliced or transposed view (`X.transpose(0, 1)`) keeps the same buffer while changing its strides (`stride_xm != N`, or `stride_xn != 1`). Triton uses those exact strides via NumPy/PyTorch-style broadcasting (`[:, None]` and `[None, :]`) to compute a 2D tile of memory addresses in registers.
 
 Inside a Triton kernel:
 
@@ -194,7 +196,7 @@ Because Triton tile dimensions (`BLOCK_M`, `BLOCK_N`) **must be powers of two**,
 * Llama-3-8B / 70B vocabulary: $V = 128,256$ (requires `BLOCK_V = 131072` or chunked loop where the final chunk has partial valid elements).
 * Variable batch/sequence lengths $M = \sum_{r} L_r$ in continuous batching (arbitrary integer).
 
-Loading or storing out-of-bounds lanes without a mask causes CUDA `illegal memory access` faults (if crossing a virtual memory page boundary) or silently overwrites adjacent tensors in the PyTorch caching allocator!
+Loading or storing out-of-bounds lanes without a mask causes CUDA `illegal memory access` faults (if crossing a virtual memory page boundary) or silently overwrites adjacent tensors in the PyTorch caching allocator, because PyTorch packs multiple `torch.Tensor` allocations side-by-side inside a single pre-allocated GPU memory pool!
 
 ### Masking Mechanics and `other` Neutral Values
 
@@ -289,7 +291,7 @@ Optimal kernel hyperparameters vary dramatically across GPU generations (A100 vs
    * **Trade-off:** More warps per CTA (e.g., 8 or 16 warps = 256 or 512 threads) hide instruction/memory latency within a single block and speed up parallel elementwise ops. However, each CTA consumes a fixed SMEM allocation and shares the SM's 65,536-register pool (`65536 / (num_warps * 32)` max registers per thread if 1 CTA/SM, or fewer for 2+ CTAs/SM). For small rows (`N <= 1024`), `num_warps=4` avoids wasting threads on cross-warp barrier reductions; for `N >= 4096`, `num_warps=8` or `16` saturates HBM issue queues.
 
 3. **`num_stages` (Software Pipelining Ring-Buffer Depth):**
-   * **Governs:** How many loop tiles ahead the compiler prefetches asynchronously from HBM into circular Shared Memory buffers using `cp.async` (Ampere+) or TMA (Hopper+).
+   * **Governs:** How many loop tiles ahead the compiler prefetches asynchronously from HBM into circular Shared Memory buffers using `cp.async` (Ampere+) or TMA (Hopper+). Conceptually, `num_stages` works like `DataLoader(prefetch_factor=num_stages)` in PyTorch, overlapping slow data fetching with active compute so the compute units never sit idle waiting for the next batch.
    * **`num_stages=1`:** Synchronous load -> stall ~500 cycles waiting for HBM -> compute -> repeat.
    * **`num_stages=3` or `4`:** While the Tensor Cores / ALUs compute on tile $k$, `cp.async` engines are simultaneously streaming tiles $k+1$ and $k+2$ from HBM into separate SRAM ring buffers, completely hiding HBM latency.
    * **Cost:** Multiplies Shared Memory consumption by `num_stages`:

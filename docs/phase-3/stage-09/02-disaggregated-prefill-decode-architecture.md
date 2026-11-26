@@ -35,37 +35,39 @@ Every inference concept, hardware metric, and distributed-systems term used in t
 
 ## 1. The Co-Location Pathology: Physics of TTFT vs. ITL Interference
 
-In traditional LLM serving engines (early vLLM, TensorRT-LLM, TGI), **Prefill** and **Decode** execute **co-located** on the exact same GPU instances. While Continuous Batching eliminates head-of-line request blocking at the batch level, co-locating two fundamentally opposite physical regimes on shared silicon creates severe SLO violations, poor hardware utilization, and rigid parallelism compromises. **Prefill/Decode (P/D) Disaggregation** physically separates the inference cluster into two specialized pools—a **Prefill Pool** and a **Decode Pool**—connected over a high-speed KV Cache transport fabric.
+In traditional LLM serving engines (early vLLM, TensorRT-LLM, TGI), **Prefill** and **Decode** execute **co-located** on the exact same GPU instances. While Continuous Batching eliminates head-of-line request blocking at the batch level—allowing newly arrived requests to join at every token step rather than waiting for an entire batch to finish—co-locating two fundamentally opposite physical regimes on shared silicon creates severe SLO violations, poor hardware utilization, and rigid parallelism compromises. **Prefill/Decode (P/D) Disaggregation** physically separates the inference cluster into two specialized pools—a **Prefill Pool** and a **Decode Pool**—connected over a high-speed KV Cache transport fabric.
 
-Every LLM request consists of two sequential computational phases with opposite Roofline profiles:
+In PyTorch terms, every LLM request consists of two sequential computational phases with opposite Roofline profiles:
 
 | Phase | Dominant Operation | Arithmetic Intensity ($\text{FLOPs}/\text{Byte}$) | Hardware Bottleneck | Primary SLO Metric |
 | :--- | :--- | :--- | :--- | :--- |
 | **Prefill** | Large Matrix-Matrix Multiply (GEMM) over $L_{\text{in}}$ tokens | High ($\propto L_{\text{in}}$, often $> 200\text{ FLOP/B}$) | **Tensor Core Compute (`TFLOP/s`)** | **TTFT** (Time to First Token) |
 | **Decode** | Matrix-Vector / Skinny GEMM (GEMV) + KV Cache streaming | Low ($\approx B$ for weights, $\approx 1$ for KV cache) | **HBM Bandwidth (`TB/s`) & Capacity (`GB`)** | **ITL / TPOT** (Inter-Token Latency) |
 
+During **Prefill**, you multiply an input activation matrix of shape `[L_in, H]` (for a 4,096-token prompt) against a weight matrix `[H, D]`. Once the GPU loads a weight tile from HBM into on-chip SRAM, it reuses those weights across all 4,096 tokens—yielding high arithmetic intensity (hundreds of FLOPs per byte loaded) and saturating the Tensor Cores. During **Decode**, you process only 1 new token per active sequence: `[B, H] @ [H, D]`. Even at batch size $B=64$, the GPU must load the entire model's weights from HBM to do just 64 multiply-adds per weight, plus stream the entire KV cache of all 64 sequences from HBM just to compute a single attention step. That makes Decode strictly **HBM-bandwidth-bound**.
+
 ### Why Co-Location Breaks Under Production Traffic
 
 #### 1. Prefill Bursts Stall Ongoing Decodes (ITL Spikes)
 In an iteration-level scheduler without disaggregation, whenever a new prompt of length $L_{\text{in}} = 4,096$ arrives, the engine must either:
 * **Prefill-Prioritizing Scheduling (vLLM default):** Pause all 64 ongoing decode requests for one iteration to run the 4,096-token prefill forward pass. On an 8x H100 node running Llama-3.1-70B FP8, a pure decode step at $B=64$ takes **~22 ms**, whereas a 4,096-token prefill forward pass takes **~140 ms**. Every single one of those 64 active streaming users experiences a **140 ms generation freeze**—shattering a 30 ms P99 ITL SLO.
-* **Chunked Prefill (Sarathi-Serve):** Splits the 4,096-token prompt into smaller chunks (e.g., `max_num_batched_tokens = 512`) piggybacked onto decode steps. While this bounds the stall, piggybacking a 512-token prefill chunk onto a 64-token decode batch *still* shifts the iteration from memory-bound GEMV (~22 ms) to compute-heavy GEMM (~45–55 ms) for 8 consecutive steps! Thus, **chunked prefill trades catastrophic ITL spikes for chronic ITL inflation and degraded TTFT** (since the prompt now waits across 8 decode cycles).
+* **Chunked Prefill (Sarathi-Serve):** Splits the 4,096-token prompt into smaller chunks (e.g., `max_num_batched_tokens = 512`) piggybacked onto decode steps. While this bounds the worst-case single-step stall, piggybacking a 512-token prefill chunk onto a 64-token decode batch *still* shifts the iteration from memory-bound GEMV (~22 ms) to compute-heavy GEMM (~45–55 ms) for 8 consecutive steps! Thus, **chunked prefill trades catastrophic ITL spikes for chronic ITL inflation and degraded TTFT** (since the prompt now waits across 8 decode cycles).
 
 #### 2. Asymmetric Parallelism & Silicon Mismatch
-Co-location forces a single static parallelism strategy $(TP, PP)$ and a single GPU SKU for both phases:
-* **Tensor Parallelism (TP) Mismatch:** Prefill wants **high TP** (e.g., $TP = 8$ inside an NVLink domain) to split prompt GEMMs across maximum Tensor Cores and minimize single-request TTFT. Conversely, Decode at moderate batch sizes suffers diminishing returns from high TP because 160 `AllReduce` barriers per token add interconnect latency and duplicate KV reads/launch overhead—Decode often achieves higher **tokens/s per dollar** with lower TP ($TP = 2$ or $TP = 4$) + higher Data Parallelism or Pipeline Parallelism.
+Co-location forces a single static parallelism strategy $(TP, PP)$ and a single GPU SKU for both phases, even though they want opposite configurations:
+* **Tensor Parallelism (TP) Mismatch:** Prefill wants **high TP** (e.g., $TP = 8$ inside an NVLink domain) to split prompt GEMMs across maximum Tensor Cores and minimize single-request TTFT. Conversely, Decode at moderate batch sizes suffers diminishing returns from high TP because 160 `AllReduce` barriers per token add interconnect latency and duplicate kernel launch overhead—Decode often achieves higher **tokens/s per dollar** with lower TP ($TP = 2$ or $TP = 4$) + higher Data Parallelism or Pipeline Parallelism.
 * **Hardware SKU Mismatch:**
   * **Prefill Pool:** Needs extreme FP8/FP4 Tensor Core density (`H100 SXM` at 1,979 FP8 TFLOP/s, `B200` at 9,000 FP8 TFLOP/s) and requires very little KV VRAM because prompt KV state is transient—only kept long enough to transfer to Decode!
   * **Decode Pool:** Needs massive **HBM capacity** and **HBM bandwidth per dollar** to hold huge concurrent KV caches ($B \in [64, 512]$) without hitting KV OOM (`H200` with 141 GB HBM3e @ 4.8 TB/s, `L40S` with 48 GB GDDR6 at ~1/3 the hourly cost of H100 for smaller/quantized models, or `MI300X` with 192 GB HBM3 @ 5.3 TB/s).
 
 #### 3. Coupled Scaling Failure
-When prompt lengths suddenly double (e.g., RAG document upload burst), a co-located cluster cannot scale Prefill FLOP/s independently without also paying for idle Decode memory/instances, and vice versa when output generation bursts occur.
+When prompt lengths suddenly double (e.g., a RAG document upload burst), a co-located cluster cannot scale Prefill FLOP/s independently without also paying for idle Decode memory/instances, and vice versa when long output generation bursts occur.
 
 ---
 
 ## 2. Physical Disaggregation & Landmark Architectures
 
-Disaggregating Prefill and Decode decouples the serving graph into specialized pools coordinated by a lightweight control plane and a high-throughput RDMA KV transport plane.
+Disaggregating Prefill and Decode decouples the serving graph into specialized pools coordinated by a lightweight control plane (for routing and memory reservations) and a high-throughput RDMA KV transport plane (for moving computed KV tensors directly between GPU HBMs).
 
 | Architecture | Core Innovation | KV Transport & Storage Tiering | Scheduling & Parallelism Strategy |
 | :--- | :--- | :--- | :--- |
@@ -135,8 +137,8 @@ Understanding the **exact token-index boundary** between Prefill and Decode prev
    * *Why reserve before prefill?* If $D_2$ is out of KV memory, rejecting or re-routing **before** $P_1$ burns Tensor Core FLOPs prevents wasted compute (Mooncake's early rejection principle).
 3. **Prefill Execution & First-Token Generation ($t_1$):**
    * $P_1$ runs the forward pass across uncached suffix tokens $[x_{k+1} \dots x_{L_{\text{in}}}]$, producing KV tensors $K_l, V_l$ for every layer $l \in [0, L-1]$.
-   * At the final layer for position $L_{\text{in}}$, $P_1$ projects logits through the LM Head and samples the **first output token $t_1$**.
-   * *Critical Note:* $t_1$'s own KV vectors have **not** been computed yet! $P_1$ immediately sends $t_1$ back to the Client/Router (completing **TTFT**) and ensures KV for $[x_1 \dots x_{L_{\text{in}}}]$ is transferred to $D_2$.
+   * At the final layer for position $L_{\text{in}}$, $P_1$ projects logits through the LM Head (`[d_model, vocab_size]`) and samples the **first output token $t_1$**.
+   * *Critical Note:* $t_1$'s own KV vectors have **not** been computed yet (because $t_1$ was just sampled from the *output* of position $L_{\text{in}}$, not fed as an *input* token)! $P_1$ immediately sends $t_1$ back to the Client/Router (completing **TTFT**) and ensures KV for $[x_1 \dots x_{L_{\text{in}}}]$ is transferred to $D_2$.
 4. **KV State Transfer (`P1 -> D2`):**
    * Over GPUDirect RDMA (often pipelined layer-by-layer during step 3), $P_1$ writes the KV blocks for $[x_{k+1} \dots x_{L_{\text{in}}}]$ directly into $D_2$'s reserved GPU HBM pages, followed by an RDMA completion signal / immediate data notification containing `request_id` and sampled token ID $t_1$.
 5. **Decode Admission & Autoregressive Loop:**

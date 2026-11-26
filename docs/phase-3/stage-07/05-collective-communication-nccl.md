@@ -40,7 +40,7 @@ where:
 * **$k_{\text{steps}}(N)$:** Number of sequential communication steps (governs **small-message latency-bound decode**, e.g., $S = 16\text{ KB}$).
 * **$V_{\text{link}}(S, N)$:** Total bytes transmitted by each GPU over its egress link (governs **large-message bandwidth-bound prefill / AllToAll**, e.g., $S = 128\text{ MB}$).
 
-Understanding the exact split between **latency-bound ($S \to \text{KB}$)** and **bandwidth-bound ($S \to \text{MB}$)** collectives explains nearly every distributed LLM serving bottleneck.
+Understanding the exact split between **latency-bound ($S \to \text{KB}$)** and **bandwidth-bound ($S \to \text{MB}$)** collectives explains nearly every distributed LLM serving bottleneck. Just as downloading a 1 KB JSON API response is dominated by network round-trip handshake time ($\alpha_{\text{lat}}$) while downloading a 10 GB dataset is dominated by link speed ($BW_{\text{link}}$), a tiny $16\text{ KB}$ decode `AllReduce` spends almost all its time on $k_{\text{steps}} \cdot \alpha_{\text{lat}}$, whereas a $128\text{ MB}$ prefill `AllReduce` spends almost all its time on $V_{\text{link}} / BW_{\text{link}}$. Think of sending a single-page letter versus shipping a 10-ton freight container: the letter's delivery time is dominated by fixed postal handling and routing hops ($k_{\text{steps}} \cdot \alpha_{\text{lat}}$), whereas the freight container's time is dominated by highway capacity ($V_{\text{link}} / BW_{\text{link}}$). In PyTorch `torch.distributed`, calling `dist.all_reduce` during decode moves a tiny `16 KB` tensor (a letter), whereas calling it during long-context prefill moves tens of megabytes (a freight container).
 
 ---
 
@@ -49,13 +49,13 @@ Understanding the exact split between **latency-bound ($S \to \text{KB}$)** and 
 Let $N$ be the number of participating ranks and $S$ be the tensor byte size (specifically, the size of the full input tensor on each rank for `AllReduce`/`ReduceScatter`/`Broadcast`/`AllToAll`, or the size of the full *reconstructed* output tensor for `AllGather`).
 
 ### 2.1 `ReduceScatter`
-* **Semantics:** Each rank $r$ starts with a buffer of size $S$ bytes partitioned into $N$ chunks of size $S / N$. Sums (or reduces) element-wise across all ranks, leaving **only chunk $r$** of size $S / N$ (reduced) on rank $r$.
+* **Semantics:** Think of `ReduceScatter` as `sum(tensors, dim=0)` followed by `torch.chunk(..., N)[rank]`. Each rank $r$ starts with a buffer of size $S$ bytes partitioned into $N$ chunks of size $S / N$. It sums element-wise across all ranks, leaving **only chunk $r$** of size $S / N$ (reduced) on rank $r$.
 * **Optimal Ring Data Movement:**
   In a logical ring of $N$ GPUs, it takes $N - 1$ sequential ring steps; in each step, every GPU sends one chunk of size $S / N$ bytes to its right neighbor and accumulates the chunk received from its left neighbor.
   $$V_{\text{ReduceScatter}} = (N - 1) \cdot \frac{S}{N} = \mathbf{\frac{N - 1}{N} S \text{ bytes}}$$
 
 ### 2.2 `AllGather`
-* **Semantics:** Each rank $r$ starts with a unique shard of size $S / N$ bytes. After the collective, every rank holds the complete concatenated buffer of size $S$ bytes.
+* **Semantics:** Think of `AllGather` as `torch.cat([shard_0, ..., shard_{N-1}])` replicated onto every GPU. Each rank $r$ starts with a unique shard of size $S / N$ bytes. After the collective, every rank holds the complete concatenated buffer of size $S$ bytes.
 * **Optimal Ring Data Movement:**
   Takes $N - 1$ ring steps; each step forwards one chunk of size $S / N$ bytes around the ring without reduction.
   $$V_{\text{AllGather}} = (N - 1) \cdot \frac{S}{N} = \mathbf{\frac{N - 1}{N} S \text{ bytes}}$$
@@ -146,10 +146,10 @@ NCCL dynamically selects both an **Algorithm** (topology schedule) and a **Proto
 ### 4.2 Quantitative Calculation: Why TP Over PCIe/IB Destroys Decode ITL
 
 Consider serving **Llama-3-70B** ($L = 80$ layers, $d = 8192$, BF16) at batch size $B = 1$ across $\text{TP} = 8$ GPUs:
-* **Payload per `AllReduce`:** $S = B \cdot d \cdot 2\text{ bytes} = 1 \cdot 8192 \cdot 2 = \mathbf{16\text{ KB}}$.
-* **Number of `AllReduce` barriers per generated token:** $2 \times L = \mathbf{160}$.
+* **Payload per `AllReduce`:** $S = B \cdot d \cdot 2\text{ bytes} = 1 \cdot 8192 \cdot 2 = \mathbf{16\text{ KB}}$. This is tiny—smaller than a single L1 CPU cache!
+* **Number of `AllReduce` barriers per generated token:** $2 \times L = \mathbf{160}$ (one after Attention `O_proj`, one after MLP `Down_proj` in each of the 80 layers).
 * **HBM weight read time per token (compute/HBM baseline on 8x H100):**
-  Each GPU reads $140\text{ GB} / 8 = 17.5\text{ GB}$ at $3.35\text{ TB/s} \implies T_{\text{compute+HBM}} \approx \mathbf{5.2\text{ ms}}$.
+  Each GPU reads $140\text{ GB} / 8 = 17.5\text{ GB}$ at $3.35\text{ TB/s} \implies T_{\text{compute+HBM}} \approx \mathbf{5.2\text{ ms}}$. Because $S = 16\text{ KB}$ is so small, bandwidth transfer time is negligible; total communication time is dominated almost entirely by **network round-trip latency** ($\alpha_{\text{lat}}$) repeated 160 times per token.
 
 Now evaluate `AllReduce` overhead across three topologies (assuming 160 barriers):
 

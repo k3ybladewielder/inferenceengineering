@@ -36,7 +36,7 @@ For a single attention head with sequence length $N$ and head dimension $d$ (e.g
 
 $$S = \frac{Q K^T}{\sqrt{d}} \in \mathbb{R}^{N \times N}, \qquad P = \text{softmax}(S_{\text{masked}}) \in \mathbb{R}^{N \times N}, \qquad O = P V \in \mathbb{R}^{N \times d}$$
 
-where $Q, K, V, O \in \mathbb{R}^{N \times d}$. Although the inputs and outputs are strictly $O(Nd)$ in size, a **standard unfused PyTorch implementation** executes a sequence of distinct kernels (`bmm` -> `mask` -> `softmax` -> `bmm`), forcing the $N \times N$ score matrices $S$ and $P$ to be materialized in off-chip HBM:
+where $Q, K, V, O \in \mathbb{R}^{N \times d}$. Although the inputs and outputs are strictly $O(Nd)$ in size, a **standard unfused PyTorch implementation** (`S = Q @ K.T / sqrt(d); P = softmax(S + mask); O = P @ V`) executes a sequence of distinct kernels (`bmm` -> `mask` -> `softmax` -> `bmm`), forcing the $N \times N$ score matrices $S$ and $P$ to be materialized in off-chip HBM:
 
 1. **Kernel 1 (`QK^T` GEMM):** Reads $Q, K$ ($2Nd$ elements), **writes $S$ ($N^2$ elements) to HBM**.
 2. **Kernel 2 (Scale & Causal Mask):** Reads $S$ ($N^2$), applies $1/\sqrt{d}$ and $-\infty$ causal upper triangle, **writes masked $S$ ($N^2$) to HBM**.
@@ -64,7 +64,7 @@ $$\text{softmax}(x_i) = \frac{e^{x_i - m(x)}}{\sum_{k=1}^{N} e^{x_k - m(x)}}, \q
 
 Subtracting the global row maximum $m(x)$ ("safe softmax") is mandatory in FP16/BF16/FP32 to prevent $\exp(x_i)$ from overflowing to `inf` (e.g., $e^{89} > \text{FLT\_MAX}$ in FP32, $e^{11.1} > \text{HALF\_MAX}$ in FP16). Naively, computing $m(x)$ requires seeing **all $N$ columns** before computing $\exp(x_k - m(x))$, and seeing all $\exp$ terms before dividing by $\ell(x)$—a 3-pass dependency across the entire sequence!
 
-**Online Softmax** (Milakov & Gimelshein, 2018; extended to $O = PV$ by Dao et al., 2022) proves that both the normalizer $\ell(x)$ and the weighted output $O$ can be computed **exactly in a single streaming pass** over column tiles $j = 1, 2, \dots, T_c$.
+**Online Softmax** (Milakov & Gimelshein, 2018; extended to $O = PV$ by Dao et al., 2022) proves that both the normalizer $\ell(x)$ and the weighted output $O$ can be computed **exactly in a single streaming pass** over column tiles $j = 1, 2, \dots, T_c$. The key algebraic insight is that if you initially shift exponents by a local max $m^{\text{old}}$ and later encounter a larger max $m^{\text{new}}$ in a subsequent tile, multiplying the old running sum and output by $\alpha = \exp(m^{\text{old}} - m^{\text{new}})$ retroactively re-anchors every previously seen term to $m^{\text{new}}$ in one multiply, without ever re-reading past tiles from HBM.
 
 ### Exact Recurrence Equations
 
@@ -116,9 +116,9 @@ Both FlashAttention-1 and FlashAttention-2 achieve **$O(N)$ HBM memory** (only $
   * Moreover, parallelizing across $(B, H)$ only yielded $B \times H$ CTAs—starving an 108-SM A100 or 132-SM H100 whenever $B \cdot H < 108$.
 
 * **FlashAttention-2 (Outer loop over $Q_i$ across CTAs; Inner loop over $K_j, V_j$):**
-  * Each CTA is assigned one query tile $Q_i \in \mathbb{R}^{B_r \times d}$ (parallelized across $B \times H \times \lceil N / B_r \rceil$ independent CTAs—thousands of blocks!).
+  * Each CTA is assigned one query tile $Q_i \in \mathbb{R}^{B_r \times d}$ (parallelized across $B \times H \times \lceil N / B_r \rceil$ independent CTAs—thousands of blocks, keeping all 132 SMs busy even at small batch sizes).
   * $Q_i$ is loaded from HBM **once** into SRAM/registers and stays pinned for the entire inner loop.
-  * The accumulator $\tilde{O}_i$ and online softmax stats $(m_i, \ell_i)$ remain **100% resident in SM registers** across all $K_j, V_j$ iterations, and $O_i$ is written to HBM **exactly once** at the very end!
+  * The accumulator $\tilde{O}_i$ and online softmax stats $(m_i, \ell_i)$ remain **100% resident in SM registers** across all $K_j, V_j$ iterations, and $O_i$ is written to HBM **exactly once** at the very end! This eliminates the massive intermediate HBM traffic that bottlenecked FlashAttention-1.
 
 ### Cutting Non-Matmul FLOPs & Shared Memory Synchronization
 
@@ -156,7 +156,7 @@ Despite FA-2's improvements, benchmarking FA-2 on an **NVIDIA H100 SXM5** reveal
 
 ### 1. Warp-Specialization (Producer-Consumer Architecture)
 
-Instead of all warps doing identical work (homogeneous SIMT/SPMD), FA-3 partitions a 384-thread CTA into **3 specialized Warpgroups** (128 threads = 4 warps per warpgroup):
+Instead of all warps doing identical work (homogeneous SIMT/SPMD), FA-3 partitions a 384-thread CTA into **3 specialized Warpgroups** (128 threads = 4 warps per warpgroup). Conceptually, this mirrors a producer-consumer pipeline in Python: one dedicated I/O worker prefetches upcoming tiles into a shared ring buffer while two compute workers alternate between Tensor Core matrix math and SFU softmax without stalling on data movement:
 
 * **1 Producer Warpgroup (128 threads):**
   * Issues zero math instructions! Runs a lightweight loop issuing **TMA `cp.async.bulk.tensor`** commands to pull $K_j, V_j$ tiles from HBM into circular SRAM ring buffers, synchronized via hardware **`mbarrier`** objects (`mbarrier.arrive.expect_tx`).

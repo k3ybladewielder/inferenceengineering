@@ -50,7 +50,7 @@ GPU memory controllers do not fetch individual 2-byte (`bf16`) or 4-byte (`fp32`
 * **L1 Cache Line:** **128 bytes**, aligned to 128-byte virtual address boundaries (`addr & ~127`).
 * **L2 / HBM Memory Sector:** **32 bytes** (4 sectors per 128B cache line). On modern NVIDIA architectures (Volta through Blackwell), L1 misses forward only the touched **32-byte sectors** to L2/HBM, whereas an L1-cached hit serves the full 128-byte line.
 
-When a **Warp** (32 threads executing in lockstep SIMT) executes a global load (`LDG`) or store (`STG`), the Load/Store Unit (LSU) inspects the 32 virtual addresses generated across `lane_id = 0..31` and **coalesces** addresses falling into the same 32B sectors / 128B cache lines into the minimum number of memory transactions.
+When a **Warp** (32 threads executing in lockstep SIMT) executes a global load (`LDG`) or store (`STG`), the Load/Store Unit (LSU) inspects the 32 virtual addresses generated across `lane_id = 0..31` and **coalesces** addresses falling into the same 32B sectors / 128B cache lines into the minimum number of memory transactions. In PyTorch terms, iterating along the innermost contiguous dimension (`x[i, :]`, stride `1`) lets the warp pack 32 adjacent elements into a single cache-line request, whereas indexing a strided column slice (`x[:, j]`, stride `4096`) forces the memory controller to fetch 32 separate cache lines and discard 90%+ of the transferred bytes.
 
 ### Quantitative Comparison: Coalesced vs. Strided Access
 
@@ -91,7 +91,7 @@ Each GPU Streaming Multiprocessor (SM) contains a fast, programmer-managed **on-
 Suppose we compute a GEMM $C = A \times B$ where $A \in \mathbb{R}^{M \times K}$, $B \in \mathbb{R}^{K \times N}$ in BF16 (2 bytes/element). Without SRAM tiling, computing each element $C_{i,j}$ reads $K$ elements of $A$ and $K$ elements of $B$ directly from HBM:
 $$\text{Total HBM reads} \approx M N (2K) \cdot 2\text{ B} \implies I_{\text{naive}} = \frac{2MNK}{4MNK} = 0.5\text{ FLOPs/Byte}$$
 
-With **2D SRAM Tiling**, a Thread Block (CTA) loads a tile $A_{\text{tile}} \in \mathbb{R}^{B_M \times B_K}$ and $B_{\text{tile}} \in \mathbb{R}^{B_K \times B_N}$ into Shared Memory once, performs all outer-product MMA operations in registers/Tensor Cores, and accumulates into register-resident $C_{\text{tile}} \in \mathbb{R}^{B_M \times B_N}$:
+With **2D SRAM Tiling**, a Thread Block (CTA) exploits the fact that every element in `A[i, k]` is reused across `N` columns of `B` and every element in `B[k, j]` is reused across `M` rows of `A`. Instead of streaming `A` and `B` repeatedly from slow HBM, the CTA loads a small tile $A_{\text{tile}} \in \mathbb{R}^{B_M \times B_K}$ and $B_{\text{tile}} \in \mathbb{R}^{B_K \times B_N}$ into fast on-chip Shared Memory once, performs all outer-product MMA operations in registers/Tensor Cores, and accumulates into register-resident $C_{\text{tile}} \in \mathbb{R}^{B_M \times B_N}$:
 
 * **FLOPs per K-step:** $2 \cdot B_M \cdot B_N \cdot B_K$
 * **HBM bytes loaded per K-step:** $(B_M B_K + B_K B_N) \cdot 2\text{ B}$
@@ -108,7 +108,7 @@ While SRAM is orders of magnitude faster than HBM, poorly structured access patt
 
 ### Hardware Bank Architecture
 
-NVIDIA Shared Memory is physically organized into **32 independent memory banks**, each **4 bytes (32 bits) wide**. Successive 4-byte words map round-robin across banks:
+NVIDIA Shared Memory is physically organized into **32 independent memory banks**, each **4 bytes (32 bits) wide**—matching the 32 threads of a warp so that, like a 32-lane tollbooth, all 32 threads can read 32 separate 4-byte values simultaneously in a single clock cycle. Successive 4-byte words map round-robin across banks:
 $$\text{bank\_id} = \left\lfloor \frac{\text{byte\_offset}}{4} \right\rfloor \bmod 32$$
 
 In a single cycle, each of the 32 banks can service **one 32-bit read or write**:
@@ -119,9 +119,9 @@ In a single cycle, each of the 32 banks can service **one 32-bit read or write**
 
 ### Classic Failure Mode: 32-Stride Transpose Conflict
 
-Suppose a CTA stores a $32 \times 32$ `float32` tile `smem[32][32]` in SRAM:
-* Row access `smem[row][lane_id]`: thread `lane_id` accesses bank `(row * 32 + lane_id) % 32 = lane_id` -> **32 distinct banks -> 0 conflicts**.
-* Column access `smem[lane_id][col]`: thread `lane_id` accesses bank `(lane_id * 32 + col) % 32 = col` -> **ALL 32 threads hit bank `col` -> 32-way bank conflict (32x slowdown!)**.
+Suppose a CTA stores a $32 \times 32$ `float32` tile `smem[32][32]` in SRAM (conceptually a 2D NumPy/PyTorch array in fast on-chip memory):
+* Row access `smem[row][lane_id]`: thread `lane_id` accesses bank `(row * 32 + lane_id) % 32 = lane_id` -> **32 distinct banks -> 0 conflicts**, so all 32 threads finish in 1 clock cycle.
+* Column access `smem[lane_id][col]`: thread `lane_id` accesses bank `(lane_id * 32 + col) % 32 = col` -> **ALL 32 threads hit bank `col` -> 32-way bank conflict (32x slowdown!)**, because the hardware has to queue and serve the 32 requests one after another.
 
 ### Fix 1 (Naive): Row Padding (`smem[32][33]`)
 Adding 1 padding float per row shifts `col` bank by `+1` per row, making columns conflict-free. **Why production LLM kernels (CUTLASS, FlashAttention, Triton) avoid padding:**
@@ -143,9 +143,13 @@ Look at what happens across rows `0..7` for `logical_chunk_col = 0`:
 * ...
 * Row 7: physical chunk `0 ^ 7 = 7` -> Banks `28..31`
 
-Because $\oplus$ is a **bijection** on $\{0..7\}$:
+Because $\oplus$ is a **bijection** on $\{0..7\}$ (a one-to-one, reversible permutation with zero extra memory or division):
 1. **Row-wise `cp.async` (16-byte write along `logical_chunk_col = 0..7` for a fixed `row`):** Every `logical_chunk_col` maps to a distinct `phys_chunk_col`, spanning all 32 banks cleanly -> **0 bank conflicts**, 16-byte aligned!
 2. **Column-wise / `ldmatrix` read (8 threads reading `row = 0..7` at fixed `logical_chunk_col`):** Each row maps to a distinct physical chunk (4 banks each) -> **0 bank conflicts**!
+
+### Visual Overview: Coalescing & XOR Swizzling
+
+![Kernel Memory Optimization](./png/02-kernel-memory-optimization.png)
 
 ```mermaid
 flowchart TD
@@ -218,7 +222,7 @@ $$\text{Max Active Warps per SM} = \left\lfloor \frac{65,536}{R_{\text{thread}} 
 
 ### Silent Performance Killer: Register Spilling to Local Memory
 
-What happens when an aggressively unrolled kernel (e.g., an oversized FlashAttention accumulator tile `BLOCK_M=128, BLOCK_N=128` in FP32) requires **more than 255 registers per thread** (or exceeds the limit forced by `__launch_bounds__` / `-maxrregcount`)?
+What happens when an aggressively unrolled kernel (e.g., an oversized FlashAttention accumulator tile `BLOCK_M=128, BLOCK_N=128` in FP32, which holds 16,384 floats distributed across the CTA's threads) requires **more than 255 registers per thread** (or exceeds the limit forced by `__launch_bounds__` / `-maxrregcount`)? Each thread's private register file is physically capped at 255 32-bit slots, so any live intermediate variable that does not fit must be evicted.
 
 The `ptxas` compiler **spills** excess live variables into **CUDA Local Memory (`LDL` / `STL` instructions)**. Despite the reassuring name "Local", **Local Memory physically resides in off-chip HBM** (cached in L1/L2, with per-thread interleaved addressing)!
 
