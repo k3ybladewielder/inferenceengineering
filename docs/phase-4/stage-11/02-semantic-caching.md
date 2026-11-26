@@ -4,6 +4,29 @@
 
 ---
 
+Exact-match web caches rarely hit on natural-language prompts because users phrase the same question in slightly different ways. This document explains how AI gateways use dense vector embeddings, in-memory similarity indexes, strict verification guardrails, and tenant-scoped invalidation to serve repeated intents in milliseconds with zero GPU compute.
+
+## Core Concepts & Terminology
+
+* **Exact Byte Caching & `SHA-256`:** Traditional caching that keys responses on an exact cryptographic hash (`SHA-256`) of the raw input string, missing paraphrased requests.
+* **Dense Vector Embedding & Semantic Caching:** An **embedding** maps text into a fixed-length numerical vector in $\mathbb{R}^d$ representing its meaning. **Semantic Caching** indexes these vectors so paraphrased prompts can match previously answered requests without running GPU prefill or decode.
+* **TTFT & E2E Latency:** **TTFT (Time to First Token)** is the delay until the first output token arrives; **E2E (End-to-End) Latency** is the total time until the response finishes.
+* **ANN (Approximate Nearest Neighbor):** Search algorithms that find the closest vectors in a dataset in sublinear time with minimal accuracy loss, avoiding an exhaustive $O(N)$ scan.
+* **RAG (Retrieval-Augmented Generation) & PII:** **RAG** injects retrieved external documents into a prompt at query time. **PII (Personally Identifiable Information)** is sensitive user or tenant data that must never leak across organizational boundaries.
+* **Bi-Encoder vs. Cross-Encoder (and NLI):** A **bi-encoder** embeds a single prompt independently into a vector so cached entries can be pre-indexed. A **cross-encoder** processes a `(query, candidate)` pair together through full attention—ideal for borderline **NLI (Natural Language Inference)** entailment verification, but $O(N)$ and too slow for primary search.
+* **Matryoshka Representation Learning (MRL):** A training method that packs the most informative features into the leading dimensions of an embedding so vectors can be truncated (e.g., $d=768 \to 256$) to save RAM and compute.
+* **ONNX Runtime, TensorRT, INT8 Quantization, & AVX-512 VNNI:** **ONNX Runtime** executes models exported to the open ONNX format, often using **INT8 static quantization** (8-bit integers) accelerated on CPUs by **AVX-512 VNNI** vector instructions. **TensorRT** compiles and runs quantized models on GPU **Tensor Cores**. **Sequence unpadding** and **micro-batching** avoid wasted compute on padding tokens and amortize weight loads across concurrent requests.
+* **L2 Normalization, Cosine Similarity, SIMD, & FMA:** **L2 normalization** scales a vector by its Euclidean length ($\|u\|_2$) to unit length $1$. **Cosine similarity** measures the angle between two vectors; on unit-length vectors, it reduces to a dot product executed via **SIMD** (Single Instruction, Multiple Data) **FMA** (Fused Multiply-Add) CPU instructions.
+* **HNSW (Hierarchical Navigable Small World) & SQ8:** **HNSW** is an in-memory multi-layer proximity graph (like a skip list) enabling $O(\log N)$ ANN search, controlled by `M` (edges per node), `efConstruction` (build beam width), and `efSearch` (query beam width). **SQ8 (Scalar Quantization)** compresses `float32` coordinates (4 bytes) to `int8` (1 byte) for $4\times$ RAM savings. **Filtered HNSW** avoids dead-end graph traversals or empty top-$k$ results when combining vector search with tenant filters.
+* **IVF-PQ (Inverted File with Product Quantization) & ADC:** **IVF** clusters $\mathbb{R}^d$ into $K$ Voronoi cells (`nlist`) and searches only the nearest `nprobe` cells. **PQ** splits each vector into $m$ sub-vectors and encodes each chunk as a 1-byte centroid ID. **ADC (Asymmetric Distance Computation)** precomputes a small query-to-centroid distance table so candidate scoring takes $m$ table lookups.
+* **Anisotropy (Narrow Cone Phenomenon):** A property of transformer embeddings where unrelated sentences in the same domain already share $0.55\text{–}0.75$ cosine similarity, forcing semantic caches to operate at strict $0.98+$ thresholds.
+* **Lexical, Literal, & Polarity Guardrails:** Deterministic post-search checks verifying that numbers, dates, code identifiers, and negation words (`not`, `never`, `disable` vs. `enable`) match before serving a cached hit.
+* **SSE (Server-Sent Events):** An HTTP streaming format (`data: {...}\n\n` + `data: [DONE]\n\n`) that cached hits must replay when a client requests `stream=true`.
+* **TTL & Corpus Snapshot Versioning:** **TTL (Time-to-Live)** bounds how long cached entries remain valid. **Corpus snapshot versioning** (`corpus_version` / `doc_id:etag`) invalidates stale RAG answers in $O(1)$ when source documents update.
+* **Anaphora / Coreference & Contextual Query Rewriting:** **Anaphora** refers to pronouns or references (`"Why did it crash?"`) that depend on prior conversation turns and must be resolved (or bypassed) before semantic caching.
+
+---
+
 ## 1. Motivation: The Fastest, Cheapest Token Is the One Never Generated
 
 Traditional web caches key on exact byte equality (`SHA-256(URL + query_params)`). For natural-language LLM workloads, exact byte caching routinely achieves $<5\%$ hit rates because users express identical intents with minor lexical drift:

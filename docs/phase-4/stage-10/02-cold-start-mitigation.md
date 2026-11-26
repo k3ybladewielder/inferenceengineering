@@ -4,6 +4,48 @@
 
 ---
 
+When traffic spikes, an autoscaler creates new AI server containers, but those servers cannot handle user requests until their software environment, multi-gigabyte model files, and GPU optimizations finish loading. This startup delay—called a **cold start**—can take 3 to 8 minutes by default, which is far too slow for real-time applications; this chapter explains how to compress cold starts down to 10–25 seconds.
+
+## Core Concepts & Terminology
+
+Every technical term, hardware mechanism, and software tool referenced in this document is defined below in dependency order:
+
+### A. Cold Start, Hardware & GPU Runtime Basics
+* **Cold Start / Time-to-Ready:** The total elapsed time from requesting a new inference pod until it passes its `/health/ready` check and can serve its first token.
+* **BF16 (Brain Float 16):** A 16-bit (2-byte) floating-point number format widely used for LLM weights because it preserves a wide numerical range. A 70B-parameter model in BF16 occupies ~140 GB.
+* **VM (Virtual Machine), BIOS, & PCIe BAR1:** A cloud server instance (**VM**), its low-level boot firmware (**BIOS**), and **PCIe BAR1 (Base Address Register 1)**—the memory-mapped address window through which the CPU and other PCIe devices can address GPU VRAM.
+* **NVMe (Non-Volatile Memory Express) & RAID-0 (`mdadm`):** High-speed SSD storage connected directly over PCIe. **RAID-0** (configured via Linux `mdadm`) stripes data across multiple NVMe drives in parallel so their read speeds add together (e.g., 8 drives yielding >40 GB/s).
+* **NIC (Network Interface Card):** The hardware network adapter connecting a server to the network (typically 100–400 Gbps in GPU nodes).
+* **DaemonSet & `nvidia-device-plugin`:** A Kubernetes **DaemonSet** automatically runs one copy of a pod on every cluster node. The **`nvidia-device-plugin`** DaemonSet discovers physical GPUs and registers them with `kubelet` as allocatable `nvidia.com/gpu` resources.
+* **CUDA Runtime (`cuInit()`, `cudaMalloc`, `cudaMemcpyAsync`), cuDNN, & NCCL:** Low-level NVIDIA libraries: `cuInit()` initializes the GPU driver, `cudaMalloc` allocates GPU VRAM, `cudaMemcpyAsync` copies data asynchronously, **cuDNN** accelerates neural-network primitives, and **NCCL** coordinates multi-GPU communication (e.g., **all-gather** handshakes over **NVLink**) for **Tensor Parallel (TP)** sharding across GPUs.
+
+### B. Container Images, Lazy Pulling & Linux Filesystems
+* **OCI Container Image (`.tar.gz`), `containerd`, `runc`, & `execve()`:** Standard container images (**OCI**) package files as **gzip-compressed tarballs (`.tar.gz`)**. `containerd` pulls and unpacks them, `runc` starts the container, and `execve()` is the Linux system call that launches the Python process.
+* **Gzip / Zlib / LZ77 Sliding Window & HTTP `Range` Requests:** Standard `gzip`/`zlib` compression uses a continuous **LZ77 sliding dictionary** from byte 0 to the end, forcing sequential decompression from the start before reading any later byte. **HTTP `Range` requests** allow downloading specific byte slices of a remote file without downloading the whole file.
+* **SHA-256 Digest & Cosign / Notary:** A cryptographic hash (**SHA-256**) uniquely identifying a container layer, used by signing tools (**Cosign**, **Notary**) to verify image authenticity.
+* **`dlopen()`, `site-packages`, `stat` Syscalls, & IOPS:** `dlopen()` loads compiled C/CUDA shared libraries (`.so` files like `libtorch_cuda.so`) into Python; `site-packages` holds Python libraries; `stat` syscalls inspect file metadata; **IOPS** measures disk Input/Output Operations Per Second.
+* **FUSE, `overlayfs`, VFS, & Page Fault:** **VFS** is the Linux kernel's Virtual File System layer. **FUSE (Filesystem in Userspace)** routes file reads (`/dev/fuse`) to a user-space daemon instead of kernel code. **`overlayfs`** stacks read-only image layers under a writable container layer. A **page fault** occurs when a program accesses a memory/file page not yet loaded in RAM, triggering the OS to fetch it.
+* **eStargz (`stargz-snapshotter`, `stargzify`, `ctr-remote image optimize`):** Extended Seekable Tar.gz—rebuilds container layers so each file/4 MB chunk is an independent gzip stream with a **TOC (Table of Contents) JSON index** at the end, enabling lazy HTTP `Range` pulls via FUSE (at the cost of changing the layer's SHA-256 digest).
+* **AWS SOCI (`soci-snapshotter`, OCI Referrers, `inflate()`):** Seekable OCI—creates an external **SOCI Index** (stored as an OCI Referrers artifact) recording **zlib checkpoints** every 1–4 MB so `inflate()` can resume decompression mid-stream without modifying the original `.tar.gz` or breaking SHA-256 signatures.
+* **Nydus (RAFS v6), OverlayBD, EROFS, `fscache` / `cachefilesd`, & SquashFS (`.sqsh`):** Advanced image formats (**Nydus**, **OverlayBD**) and Linux kernel read-only filesystems (**EROFS**, **SquashFS**). Paired with kernel caching (`fscache`/`cachefilesd`), EROFS and SquashFS serve image blocks at native kernel speed with **zero FUSE user-space context switches**.
+
+### C. Host Memory, Model Weight Streaming & GPUDirect Storage
+* **`.safetensors`, `torch.load`, `pickle`, & `mmap`:** `.safetensors` is a fast, secure tensor file format with a JSON header mapping tensor byte offsets; `torch.load` relies on Python's slower `pickle` serialization; `mmap` maps a disk file directly into a process's virtual address space.
+* **POSIX Filesystem, BIO Buffer, OS Page Cache, `kswapd`, & cgroup OOM-Kill:** Standard Linux file I/O copies data through kernel block (**BIO**) buffers and the **OS Page Cache** (RAM used by Linux to cache disk files). If a 140 GB model fills host RAM, the kernel's **`kswapd`** daemon thrashes reclaiming pages, or Linux **cgroup OOM-Kill** terminates the pod because `ContainerMemoryUsage` includes page cache.
+* **Ephemeral Storage, `hostPath`, & LRU Cache:** **Ephemeral storage** is temporary local disk space erased when a pod dies. A **`hostPath`** volume mounts a persistent node directory (such as a local NVMe cache managed by an **LRU — Least Recently Used** eviction policy) directly into the pod.
+* **Pinned Host Memory (`cudaHostAlloc`), DMA, H2D, & `O_DIRECT`:** **Pinned memory** is page-locked CPU RAM that the OS cannot swap to disk, required for **DMA (Direct Memory Access)**—hardware transfers from RAM/devices straight to GPU VRAM (**H2D**, Host-to-Device) without CPU copying. **`O_DIRECT`** is a file-open flag that bypasses the OS Page Cache completely.
+* **GPUDirect Storage (GDS / `cuFile`, `nvidia-fs`, `libcufile`):** A direct DMA path from NVMe storage to GPU VRAM bypassing CPU and host RAM, enabled by the `nvidia-fs` kernel driver and `cuFileRead()` / `cuFileBufRegister()`. Also works over **NVMe-oF/RDMA** (NVMe over Fabrics).
+  * **PRP/SGL & TLP:** NVMe scatter-gather memory lists (**PRP/SGL**) and PCIe **Transaction Layer Packets (TLPs)** carrying data across the bus.
+  * **PCIe Switch, Root Complex, ACS, & IOMMU (`iommu=pt`):** A **PCIe switch** connects GPUs and NVMe drives locally on a motherboard; the **Root Complex** is the CPU's PCIe bridge. **ACS (Access Control Services)** forces peer-to-peer traffic through the Root Complex; disabling ACS and setting the **IOMMU** (I/O Memory Management Unit) to passthrough (`iommu=pt`) keeps NVMe-to-GPU DMA at full local switch speed.
+* **Object Storage (S3 / GCS / MinIO), AWS CRT, Run:ai Model Streamer, & CoreWeave Tensorizer:** Cloud blob stores (**S3/GCS/MinIO**). **Run:ai Model Streamer** uses multi-threaded **AWS CRT** C++ workers to stream S3 byte ranges into a tiny fixed pinned-memory ring buffer and straight to GPU VRAM. **CoreWeave Tensorizer** converts weights into an aligned **`.tensors`** binary format that streams directly into GPU buffers (optionally compressed with **LZ4/Zstd** and decompressed on-GPU via **`nvCOMP`**).
+
+### D. Warmup Caching & Standby Pools
+* **JIT Compilation, Triton, `torch.compile` / `torch_inductor`, PTX, `sm_90`, & TensorRT-LLM `.engine`:** **JIT (Just-In-Time)** compilers (`Triton`, `torch.compile`/`torch_inductor`) translate Python/graph code into NVIDIA **PTX** GPU assembly for a target GPU architecture (e.g., `sm_90` for H100) on first run. **TensorRT-LLM `.engine`** files are compiled ahead-of-time. Bounding **`--cuda-graph-sizes`** limits how many batch-size CUDA graphs are captured at startup.
+* **Balloon / Pause Pods (`PriorityClass`, `/pause`):** Ultra-low-priority dummy pods that hold a GPU idle (`0%` compute) on a warm, weight-cached node; when a real high-priority inference pod arrives, `kube-scheduler` evicts the balloon pod in <1 second.
+* **`cuda-checkpoint`, CRIU, & vLLM `sleep(level=1/2)`:** Tools that snapshot or suspend a live GPU inference process—offloading CUDA state/weights to host RAM or freeing VRAM—and restore it in 2–4 seconds without re-initializing Python or CUDA.
+
+---
+
 ## 1. Breaking Down the LLM Pod Cold-Start Timeline
 
 An autoscaling policy with a 10-second reaction loop is functionally useless if a newly scheduled GPU replica requires 5 minutes to serve its first token. Unlike stateless Go/Rust binaries (50 MB container, < 500 ms startup), an LLM inference pod carries two massive artifacts—a **10–25 GB CUDA/PyTorch container image** and **15–400 GB of model weights**—plus stateful GPU runtime compilation.

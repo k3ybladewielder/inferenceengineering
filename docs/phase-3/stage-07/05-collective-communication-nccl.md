@@ -2,6 +2,32 @@
 
 [Previous: Specialized Parallelism (EP & SP)](./04-specialized-parallelism-ep-and-sp.md) | [Stage 7 Index](./README.md) | [Complete Syllabus](../../syllabus.md)
 
+Splitting a model across multiple GPUs means those chips must constantly exchange partial results over wires and switches. This guide breaks down the physics of GPU-to-GPU communication, the exact data movement of every collective operation, and why hardware wiring dictates which parallelism strategy works in production.
+
+---
+
+## Core Concepts & Terminology
+
+Every hardware component, networking protocol, and collective communication primitive referenced in this document is defined below in dependency order:
+
+* **Rank ($N$ Ranks), Tensor, BF16, HBM, & SM:** A **rank** is an individual GPU process in a group of $N$ participating GPUs. A **tensor** is a multi-dimensional array of numbers (here stored in **BF16**, 2 bytes per number). **HBM** (High-Bandwidth Memory) is the GPU's fast on-package memory; an **SM** (Streaming Multiprocessor) is a GPU compute core cluster.
+* **Prefill, Decode, & ITL:** **Prefill** processes the prompt in parallel (moving large megabyte-scale tensors); **Decode** generates one token at a time (moving tiny kilobyte-scale tensors); **ITL** (Inter-Token Latency) is the real-world time between consecutive generated tokens.
+* **Egress, Ingress, & Unidirectional vs. Bidirectional Bandwidth:** **Egress** is data leaving a GPU; **ingress** is data arriving at a GPU. **Unidirectional bandwidth** ($BW_{\text{link}}$, in GB/s) is the one-way transfer rate; **bidirectional bandwidth** is send + receive combined.
+* **Hockney $\alpha\text{--}\beta$ Performance Model ($\alpha_{\text{lat}}, k_{\text{steps}}, V_{\text{link}}$):** Models communication time as $k_{\text{steps}} \cdot \alpha_{\text{lat}} + V_{\text{link}} / BW_{\text{link}}$, separating **latency-bound** small messages (governed by per-hop handshake latency $\alpha_{\text{lat}}$ and sequential step count $k_{\text{steps}}$) from **bandwidth-bound** large messages (governed by bytes transmitted $V_{\text{link}}$ divided by $BW_{\text{link}}$).
+* **NCCL & Collective Primitives (`ReduceScatter`, `AllGather`, `AllReduce`, `AllToAll`, `Broadcast`):** **NCCL** (NVIDIA Collective Communications Library) coordinates multi-GPU data exchanges:
+  * **`ReduceScatter`**: Sums tensors element-wise across all $N$ ranks and leaves each rank $r$ with only its unique $1/N$ reduced slice.
+  * **`AllGather`**: Collects unique $1/N$ slices from all ranks so every rank holds the full concatenated tensor.
+  * **`AllReduce`**: Sums tensors across all $N$ ranks and gives every rank the full sum (bandwidth-optimal Ring `AllReduce` = `ReduceScatter` + `AllGather`).
+  * **`AllToAll` (and `AllToAllv`)**: Personalized exchange where each rank sends a distinct chunk to every other rank (`AllToAllv` supports variable chunk sizes), with zero reduction math.
+  * **`Broadcast`**: Copies a tensor from one root rank to all other $N-1$ ranks.
+* **Algorithm Bandwidth (`algbw`) vs. Bus Bandwidth (`busbw`):** **`algbw`** ($S / t$) divides tensor size by elapsed time; **`busbw`** scales `algbw` by $2\frac{N-1}{N}$ (for `AllReduce`) to reflect actual link bytes moved, enabling fair comparison against raw hardware bandwidth.
+* **Full Bisection Bandwidth, Root Complex, & NUMA (QPI/UPI):** **Full bisection bandwidth** means any half of the GPUs can talk to the other half simultaneously at full link speed. A **PCIe root complex** connects motherboard PCIe slots to a CPU; **NUMA** (Non-Uniform Memory Access) over **QPI/UPI** refers to slower cross-socket links between two CPUs on one server board.
+* **NCCL Algorithms (Ring, Double Binary Tree, NVLS / SHARP):** **Ring** passes chunks sequentially around a loop ($2(N-1)$ steps for `AllReduce`), optimal for large messages. **Double Binary Tree** uses two complementary spanning trees ($2\log_2 N$ steps), optimal for small messages and multi-node clusters. **NVLS (NVLink SHARP)** uses **SHARP** (Scalable Hierarchical Aggregation and Reduction Protocol) **ALUs** (Arithmetic Logic Units) inside **NVSwitch ASICs** (custom switch chips) to sum vectors in-flight and **multicast** (one-to-many simultaneous send) the result in 1 hop.
+* **Oneshot / Twoshot P2P `AllReduce` & `cudaIpcMemHandle`:** Custom GPU kernels (in vLLM / TRT-LLM) that bypass NCCL for tiny decode tensors by mapping peer buffers via **`cudaIpcMemHandle`** (CUDA Inter-Process Communication) so a single SM kernel reads peers directly over NVLink.
+* **NCCL Protocols (LL, LL128, Simple):** **LL** (Low Latency) packs 4B data + 4B polling flag into 8B atomic writes (50% link efficiency, lowest latency); **LL128** packs 120B data + 8B flag into 128B packets (93.75% efficiency); **Simple** sends full chunks with a separate **memory fence** (ordering barrier) for ~100% efficiency on large tensors.
+* **Interconnect Fabrics (PCIe, NVLink, InfiniBand NDR, GPUDirect RDMA, RoCEv2):** **PCIe Gen4/Gen5 x16** are standard motherboard lanes. **NVLink 4.0/5.0 + NVSwitch** are ultra-fast intra-node GPU fabrics (inside SXM/HGX/DGX servers, up to 72 GPUs in Blackwell NVL72). **InfiniBand (IB) NDR (400 Gbps)** uses **GPUDirect RDMA** so a **NIC** (Network Interface Card) reads/writes GPU HBM directly across nodes. **RoCEv2 (400 GbE)** is Ethernet RDMA, sensitive to **ECN** (Explicit Congestion Notification) and **PFC** (Priority Flow Control) under `AllToAll` bursts.
+* **Parallelism Strategies (TP, PP, DP, EP, SP):** **TP** (Tensor Parallelism), **PP** (Pipeline Parallelism), **DP** (Data Parallelism), **EP** (Expert Parallelism), and **SP** (Sequence Parallelism) are the multi-GPU model-splitting patterns covered in Topics 3–4.
+
 ---
 
 ## 1. The Physics of Distributed Collectives: Hockney Model

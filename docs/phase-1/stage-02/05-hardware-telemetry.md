@@ -4,6 +4,35 @@
 
 ---
 
+This document explains how to measure what a GPU is actually doing in production, why common surface-level metrics can be deeply misleading, and how to diagnose LLM serving bottlenecks from hardware counters. Mastering these telemetry layers prevents wasted GPU capacity and misconfigured autoscaling.
+
+## Core Concepts & Terminology
+
+Every technical term, acronym, hardware counter, and inference concept used in this guide is defined below in dependency order:
+
+* **Telemetry & Monitoring Tiers (`nvidia-smi`, NVML, DCGM, `ncu`):**
+  * **NVML (NVIDIA Management Library) & `nvidia-smi`:** A lightweight driver API and CLI (`nvidia-smi dmon`) that polls coarse OS/driver state such as temperature, power, clocks, and whether a kernel is present.
+  * **DCGM (Data Center GPU Manager) & `nv-hostengine`:** NVIDIA's production telemetry daemon (`nv-hostengine`) and CLI (`dcgmi dmon`) that samples true silicon activity counters at low overhead (~0.2%–1%), often exported to **Prometheus** (an open-source time-series monitoring system).
+  * **Nsight Compute (`ncu`):** An offline kernel profiler that replays kernels to inspect warp stalls, cache hit rates, and **Roofline** (compute vs. memory-bandwidth ceiling) behavior—too slow ($10\times$–$50\times$ slowdown) for live traffic.
+* **PMC (Performance Monitoring Counter) / PMU & Driver IOCTL:** Dedicated hardware counters inside SMs, L2, HBM, and NVLink—collectively the **PMU (Performance Monitoring Unit)**—that DCGM reads and resets via an OS **IOCTL** (Input/Output Control system call to the GPU driver).
+* **`GPU-Util` (`sm`) vs. DCGM Profiling Fields (`DCP` / `DCGM_FI_PROF_*`):** `GPU-Util` only measures the percentage of time *at least one* kernel is active on the GPU (even a single thread!). True silicon utilization requires DCGM Profiling (`DCP`) counters:
+  * **`sm_active`:** Fraction of cycles where $\ge 1$ warp is resident on an SM, averaged across all SMs.
+  * **`sm_occupancy`:** Fraction of total warp slots (e.g., 64/SM) occupied across all SMs and cycles.
+  * **`tensor_active`:** Fraction of cycles Tensor Core matrix pipes are active.
+  * **`dram_active`:** Fraction of theoretical peak HBM read/write bus cycles actively transferring data.
+  * **`fp16/fp32/fp64_active`:** Fraction of cycles non-Tensor scalar CUDA Core ALU pipes are active.
+* **PCIe Root Complex, H2D, & P2P NVLink:** **PCIe** (Peripheral Component Interconnect Express) is the motherboard bus connecting CPU and GPUs; **H2D** means Host-to-Device memory copy; **P2P (Peer-to-Peer) NVLink** is direct high-speed GPU-to-GPU interconnect bypassing PCIe.
+* **TDP, Clocks (`pclk`, `mclk`), Temperatures (`gtemp`, `mtemp`), & Throttling (`nvmlClocksThrottleReasons`):** **TDP** (Thermal Design Power) is the max power budget (700 W on H100 SXM5). `pclk` is SM processor clock; `mclk` is HBM memory clock; `gtemp`/`mtemp` are GPU and HBM temperatures. **Clock Throttling** automatically lowers clocks on power cap (`SwPowerCap`), overheating (`HwThermalSlowdown`), or external **PSU** (Power Supply Unit) emergency signals (`HwPowerBrakeSlowdown`), whereas `SyncBoost` / `ApplicationsClocksSetting` (`nvidia-smi -ac`) locks clocks manually.
+* **ECC, SECDED, SBE/DBE, `Xid`, Row Remapping, & RMA:** **ECC (Error-Correcting Code)** protects HBM3/HBM3e against bit flips using **SECDED (Single Error Correction, Double Error Detection)**. An **SBE** (Single-Bit Error) is corrected automatically; a **DBE** (Double-Bit Error) is uncorrectable and triggers fatal **`Xid`** driver errors. **Row Remapping** permanently retires faulty HBM rows at GPU reset; if hardware spares run out, the GPU requires **RMA** (hardware replacement).
+* **LLM Inference & Systems Terms:**
+  * **Prefill vs. Decode, Chunked Prefill, & P/D Disaggregation:** **Prefill** processes prompt tokens in parallel (**GEMM**: dense matrix-matrix multiply, compute-bound); **Decode** generates one token per step (**GEMV**: matrix-vector multiply at low batch size, memory-bandwidth-bound). **Chunked Prefill** mixes prefill chunks with decode; **P/D Disaggregation** separates prefill and decode onto different GPUs.
+  * **TTFT & ITL:** **TTFT** (Time To First Token) is prefill latency; **ITL** (Inter-Token Latency) is time between consecutive decode tokens.
+  * **Continuous Batching, Speculative Decoding, & W4A16:** **Continuous Batching** packs active requests dynamically; **Speculative Decoding** verifies multiple draft tokens in one step; **W4A16** uses 4-bit weights with 16-bit activations.
+  * **CUDA Graphs, Python GIL, Operator Fusion, & NCCL Collectives:** **CUDA Graphs** replay recorded kernel sequences with minimal CPU overhead; the **Python GIL** (Global Interpreter Lock) can bottleneck CPU-side dispatch; **Operator Fusion** merges small kernels; **NCCL** executes **`AllReduce`** (for **Tensor Parallelism / TP**) and **`AllToAll`** (for **MoE Expert Parallelism / EP**).
+  * **Serving Engines & Kernels:** **vLLM / SGLang** (LLM serving frameworks), **FlashAttention**, **RoPE**, **Softmax**, and **Local Memory / 32B sector waste** (covered in Doc 02).
+
+---
+
 ## 1. Telemetry Tiers: NVML (`nvidia-smi`) vs. DCGM Profiling Counters
 
 Diagnosing LLM serving bottlenecks in production requires distinguishing **coarse OS/driver presence metrics** from **cycle-accurate silicon Performance Monitoring Counters (PMCs)**:

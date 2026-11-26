@@ -2,6 +2,44 @@
 
 [← Stage 3 Overview](./README.md) | [Complete Syllabus](../../syllabus.md) | [Next: 02. KV Cache Mathematics →](./02-kv-cache-mathematics.md)
 
+Every request to a modern language model splits into two physically opposite stages: an initial stage that reads your entire prompt at once, and a slower loop that generates your answer one piece at a time. Understanding why the same GPU runs at near-100% compute capacity in the first stage and stalls at under 1% in the second requires starting from the exact building blocks of hardware and matrix math.
+
+---
+
+## Core Concepts & Terminology
+
+Each term below is ordered so that later definitions build only on earlier ones:
+
+* **Token:** The basic unit of text (a word, sub-word, or punctuation mark) that a language model reads and writes. Internally, each token is mapped to a vector of numbers.
+* **Large Language Model (LLM) & Transformer:** A neural network architecture (the *Transformer*) used by modern LLMs that processes a sequence of tokens through stacked layers of *Self-Attention* (comparing tokens with one another) and *Feed-Forward Networks* (transforming each token's vector independently).
+* **Forward Pass:** One complete pass of input token vectors through all layers of the neural network to compute output probabilities for the next token.
+* **Autoregressive Generation:** Producing text one token at a time, where each newly chosen token is appended to the sequence and fed back into the next forward pass to predict the token after it.
+* **Causal Masking:** A rule inside decoder-only Transformers guaranteeing that token position $i$ can only read information from positions $1 \dots i$, never from future positions $> i$.
+* **Linear Projection, Weights, and Activations:** A linear projection multiplies a matrix of *activations* (temporary per-token vectors flowing through the model) by a learned *weight* matrix (fixed model parameters). In a Transformer, $W_Q, W_K, W_V, W_O$ are the Attention projection weights, and $W_{\text{gate}}, W_{\text{up}}, W_{\text{down}}$ are the weights of a **SwiGLU MLP / FFN** (a gated Feed-Forward Network block).
+* **KV (Key-Value) Cache:** Intermediate *Key* and *Value* vectors computed for every processed token and saved in GPU memory so they do not need to be recomputed on future generation steps.
+* **Prefill (Prompt Processing Phase):** The first phase of inference, where all $S_p$ tokens of the user's prompt are processed together in parallel in one forward pass to populate the initial KV Cache and produce the first output token.
+* **Decode (Token Generation Phase):** The second phase of inference, where the model runs one forward pass per step to generate **1 new token** per active request, reading all prior Keys and Values from the KV Cache and appending the new token's Key and Value.
+* **TTFT, ITL, TPOT, and E2E Latency:** User-facing speed metrics:
+  * **TTFT (Time to First Token):** Elapsed time from when a request starts executing (after queuing) until the first output token is produced.
+  * **ITL (Inter-Token Latency):** Elapsed time between consecutive output tokens during Decode.
+  * **TPOT (Time Per Output Token):** Average time spent generating each subsequent output token.
+  * **E2E (End-to-End) Latency:** Total time from request arrival until the **EOS (End-of-Sequence)** stop token or length limit finishes the stream.
+* **GEMM vs. GEMV:** **GEMM (General Matrix-Matrix Multiplication)** multiplies two 2D matrices ($M \times K$ by $K \times N$) with $M > 1$, allowing each weight to be reused across $M$ tokens. **GEMV (General Matrix-Vector Multiplication)** is the degenerate case $M = 1$ (a single vector times a matrix), where weights are read once for a single token with no reuse.
+* **Numerical Precision (BF16, FP16, FP8, INT4):** Formats for storing numbers in memory. **BF16** (Brain Float 16) and **FP16** (IEEE Half-Precision) use $b = 2$ bytes per number. **FP8** (8-bit float, $b = 1$ byte) and **INT4** (4-bit integer, $b = 0.5$ bytes) are compressed (*quantized*) formats. **Weight-only quantization** stores weights in compact FP8/INT4 while keeping activations in BF16/FP16.
+* **HBM (High Bandwidth Memory, e.g., HBM3 / HBM3e) & VRAM:** The large, off-chip main memory stacked next to a GPU (often called VRAM; e.g., 80 GB on an NVIDIA H100 SXM5 with $3.35\text{ TB/s}$ peak transfer rate). Weights, KV Caches, and activations are stored here.
+* **SRAM (On-Chip Shared Memory) & Tiling:** Tiny, ultra-fast memory built directly inside the GPU's compute cores. **Tiling** loads small rectangular blocks of matrices from HBM into SRAM so the GPU can reuse them repeatedly without re-reading HBM. (Cache misses or *split-$K$ writebacks* occur when partial results must be written back to HBM.)
+* **Tensor Cores & MMA:** Specialized hardware units inside NVIDIA GPUs built specifically to execute **MMA (Matrix Multiply-Accumulate)** operations at extreme speed.
+* **FLOP, FLOPs, FLOP/s, and FMA:** A **FLOP** is one floating-point arithmetic operation (add or multiply); **FLOPs** is a total count of operations; **FLOP/s** (e.g., $\text{TFLOP/s} = 10^{12}\text{ FLOP/s}$) is execution speed. An **FMA (Fused Multiply-Add)** computes $a \times b + c$ in one hardware instruction, equaling $2\text{ FLOPs}$.
+* **Arithmetic Intensity ($I$):** The ratio of math operations performed to HBM bytes transferred: $I = \text{FLOPs} / \text{Bytes}_{\text{HBM}}$ (in $\text{FLOPs/Byte}$).
+* **Roofline Model, Ridge Point ($I^*$), Compute-Bound vs. Memory-Bandwidth-Bound:** The **Roofline model** states that achieved compute speed cannot exceed either the GPU's peak math rate ($F_{\text{peak}}$) or its memory bandwidth ceiling ($I \times \text{BW}_{\text{peak}}$). The **Ridge Point** ($I^* = F_{\text{peak}} / \text{BW}_{\text{peak}}$) is the arithmetic intensity where both ceilings intersect:
+  * **Memory-Bandwidth-Bound ($I < I^*$):** Compute units sit partially idle waiting for data from HBM.
+  * **Compute-Bound ($I \ge I^*$):** HBM feeds data fast enough to saturate the Tensor Cores.
+* **GQA, Continuous Batching, Speculative Decoding, and SLA:**
+  * **GQA (Grouped-Query Attention):** An attention design where multiple Query heads share fewer Key/Value heads, shrinking KV projection and cache size.
+  * **Continuous Batching:** An engine scheduling policy that adds new requests and removes completed ones on every decode step rather than waiting for an entire static batch to finish.
+  * **Speculative Decoding:** Guessing multiple future tokens cheaply and verifying them in parallel in one forward pass to increase $M$ during Decode.
+  * **SLA (Service Level Agreement):** Latency or throughput targets (e.g., maximum allowed TTFT or TPOT) promised to users.
+
 ---
 
 ## 1. The Two Physical Phases of Autoregressive Inference

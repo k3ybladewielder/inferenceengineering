@@ -4,6 +4,39 @@
 
 ---
 
+A compressed language model can still write fluent English while silently failing at math, code generation, tool calling, or long-context retrieval. Evaluating compression scientifically requires measuring both subtle probability shifts and concrete task accuracy against the uncompressed baseline.
+
+## Core Concepts & Terminology
+
+Every technical term, evaluation metric, benchmark suite, and model mechanism used in this document is defined below in dependency order:
+
+1. **Model Formats, Architecture, & Inference Mechanisms:**
+   * **`FP16`, `BF16`, `FP32`, `FP8`, `FP4`, `INT4`, `W4A16`, `W8A8`, & `2:4`:** Numerical precision formats (16-bit, 8-bit, 4-bit, 32-bit), weight/activation bit-width schemes (`W4A16`, `W8A8`), and `2:4` structured sparsity (50% hardware-patterned zeros).
+   * **KV Cache, `Q`/`K`/`V` Projections, `RoPE`, & Attention Sink:** The KV Cache stores past Key and Value vectors; `Q`/`K`/`V` are Query, Key, and Value linear projections; `RoPE` (Rotary Position Embeddings) encodes token positions via vector rotations; attention sinks are early/anchor tokens that draw high attention mass.
+   * **`GPTQ`, `AWQ`, `SmoothQuant`, Group Size, $\alpha$, & Hessian ($H$):** Post-training calibration algorithms, their hyperparameters (group size, smoothing $\alpha$), and calibration statistics ($s_X, H$).
+   * **`SFT`, `RLHF`, `DPO`, & Chat Template Tokens (`<|start_header_id|>`, `<|eot_id|>`):** Post-training alignment methods—Supervised Fine-Tuning (`SFT`), Reinforcement Learning from Human Feedback (`RLHF`), and Direct Preference Optimization (`DPO`)—that rely on special chat-delimiter tokens.
+   * **Grammar-Constrained Decoding (`FSM` / `XGrammar`):** Finite-State Machine (`FSM`) decoding engines (such as `XGrammar`) that mask invalid tokens at each step so outputs strictly match a JSON or API schema.
+   * **Speculative Decoding:** An acceleration technique where a small draft model proposes multiple tokens that a larger target model verifies in parallel.
+   * **Pareto Benchmarking (`TTFT`, `ITL`):** Mapping the trade-off frontier between model quality and serving speed—specifically Time to First Token (`TTFT`) and Inter-Token Latency (`ITL`).
+
+2. **Probability, Loss, & Distributional Metrics:**
+   * **Logits, `softmax`, `argmax`, `temperature`, `top_p`, & Beam Search:** Logits are raw, unnormalized scores over vocabulary $V$; `softmax` turns logits into probabilities. Greedy `argmax` picks the top token, whereas `temperature > 0` / `top_p` (nucleus) sampling and beam search depend on the full probability distribution.
+   * **Negative Log-Likelihood (`NLL`), `CrossEntropyLoss` (`-100` mask), & Perplexity (`PPL`):** NLL is $-\log P(x_t \mid x_{<t})$; PyTorch's `CrossEntropyLoss` averages NLL while ignoring masked labels set to `-100`. Perplexity (`PPL`) is $\exp(\text{mean NLL})$ (lower is better).
+   * **Sliding-Window Protocol (`max_length` $L$, `stride` $S$, Teacher Forcing):** Evaluating long text in overlapping windows of length $L$ advancing by $S$, masking prefix context so each token is scored once. Teacher forcing feeds ground-truth prefixes $x_{<t}$ rather than generated tokens.
+   * **`WikiText-2`, `C4`, `PG-19`, & `The Stack`:** Standard evaluation corpora—Wikipedia prose (`WikiText-2`), web text (`C4`), long books (`PG-19`), and source code (`The Stack`).
+   * **KL Divergence ($D_{\text{KL}}$), `nats`, `P99` $D_{\text{KL}}$, & Top-1 Flip Rate:** Kullback–Leibler divergence ($D_{\text{KL}}$) measures how much a quantized probability distribution $Q$ diverges from the `FP16` baseline $P$ (in `nats` for natural logs). `P99` is the 99th-percentile spike across tokens; Top-1 Flip Rate is how often $\arg\max P \neq \arg\max Q$.
+   * **Total Variation Distance (`TVD`) & Pinsker's Inequality:** $\text{TVD}(P, Q) = \frac{1}{2}\sum_v |P(v)-Q(v)|$ governs speculative decoding acceptance and is bounded by $\sqrt{\frac{1}{2} D_{\text{KL}}(P \| Q)}$ via Pinsker's inequality.
+
+3. **Downstream & Long-Context Benchmarks:**
+   * **`lm-evaluation-harness` & `evalplus`:** Standard open-source LLM evaluation suites.
+   * **`MMLU` (5-shot):** Massive Multitask Language Understanding—multiple-choice questions across 57 subjects scored by log-likelihood over `{A, B, C, D}` given 5 examples ("5-shot").
+   * **`GSM8K` (CoT):** Grade School Math 8K—multi-step math problems scored via generative Chain-of-Thought (`CoT`) reasoning and exact numerical match.
+   * **`HumanEval` / `MBPP` (`pass@1`):** Python coding benchmarks scored by running generated functions against unit tests (`pass@1` = solved on first attempt).
+   * **`IFEval`:** Instruction-Following Evaluation—checks verifiable formatting rules (word limits, valid JSON, forbidden characters).
+   * **Needle-in-a-Haystack (`NIAH`) & `RULER`:** Long-context retrieval tests that hide target facts ("needles") inside 32K–128K tokens of distractor text ("haystack").
+
+---
+
 ## 1. Why Compression Evaluation Must Be Scientific, Not Anecdotal
 
 Chatting with a quantized model for three prompts ("Write a haiku about GPUs") is **not** quality validation. Compression artifacts are insidious: a broken `INT4` or `FP8` checkpoint can write fluent English prose while silently failing on multi-step math, emitting malformed tool-call arguments, ignoring negative constraints, or losing needle retrieval past 16K tokens.

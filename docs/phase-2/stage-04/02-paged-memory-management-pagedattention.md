@@ -4,6 +4,27 @@
 
 ---
 
+Continuous batching keeps GPU compute busy, but storing each request's attention history in a single unbroken memory buffer wastes most of the GPU's memory. This module explains how serving engines borrow virtual memory paging from operating systems to eliminate memory fragmentation and share prompt prefixes with zero copying.
+
+## Core Concepts & Terminology
+
+Every hardware, operating-system, and GPU kernel concept used in this module is defined below in dependency order:
+
+* **Continuous Batching & KV Cache:** **Continuous batching** schedules requests at every single token generation step. The **KV Cache** stores the intermediate Key and Value vectors computed by Attention layers for all prior tokens in a sequence.
+* **HBM / VRAM & OOM:** **HBM** (*High Bandwidth Memory*, also called **VRAM**) is the fast on-package GPU memory holding weights and KV caches. **OOM** (*Out-of-Memory*) is a fatal crash when an allocation exceeds available VRAM.
+* **Contiguous Buffer, `cudaMalloc`, & Caching Allocator:** A **contiguous buffer** is an unbroken, adjacent range of memory addresses. **`cudaMalloc`** is CUDA's low-level GPU memory allocator, and PyTorch's **caching allocator** manages a pool of contiguous GPU allocations.
+* **`max_model_len`, `max_tokens`, & `<EOS>`:** **`max_model_len`** is the model's maximum supported context length; **`max_tokens`** is a request's output cap; **`<EOS>`** (*End-of-Sequence*) is the stop token ending generation.
+* **Reservation Waste, Internal Fragmentation, & External Fragmentation:** **Reservation waste** is pre-allocating `max_model_len` slots for a request that finishes early. **Internal fragmentation** is unused space trapped *inside* an allocated chunk. **External fragmentation** occurs when free memory is split into non-adjacent gaps between active allocations so large new requests fail even when total free memory is sufficient.
+* **OS Virtual Memory Paging (Virtual Address Space, Page, Frame, Page Table, Page Fault):** Operating systems give each process a contiguous **virtual address space** divided into fixed-size **virtual pages** (e.g., 4 KB), mapped via a **page table** (`VPN -> PFN`) to non-adjacent **physical page frames** in CPU **DRAM** (main memory). A **page fault / lazy allocation** assigns a physical frame only when the program first writes to a virtual page.
+* **PagedAttention (Logical KV Block, Physical KV Block, Block Table):** **PagedAttention** applies OS paging to KV caches: a sequence's tokens are split into fixed-size **logical KV blocks** ($B$ tokens each) and mapped by a per-request **block table** to non-adjacent **physical KV blocks** in a pre-allocated HBM slab.
+* **Model & Dtype Parameters (`n_layers`, `n_kv_heads`, `d_head`, GQA, FP16/BF16/FP8/INT8):** Transformer depth (**`n_layers`**), Key/Value head count (**`n_kv_heads`**, reduced via **GQA** / *Grouped-Query Attention*), per-head vector size (**`d_head`**), and number formats (**FP16/BF16** = 2 bytes; **FP8/INT8** = 1 byte).
+* **GPU Execution Hierarchy (CUDA Kernel, SM, Thread Block, Warp, Registers, Shared Memory, Global/L2):** A **CUDA kernel** is a parallel GPU function. An **SM** (*Streaming Multiprocessor*) is an independent GPU core cluster (e.g., 132 SMs on H100). A **thread block** runs on one SM, sharing fast on-chip **Shared Memory (`__shared__`)** and private **registers**, while **warps** (32 lockstep threads) read from **Global Memory (HBM)** through the **L2 cache**.
+* **Coalesced Loads (`LDG.E.128`, `int4`/`uint4`) & Tensor Core MMA Tiles (`NHD`/`HND`):** **Coalesced loads** merge adjacent warp thread reads into wide 128-bit (16-byte) HBM bursts (`LDG.E.128`). **`NHD`/`HND`** are tensor dimension orderings (`[num_blocks, block_size, heads, dim]` vs. `[..., heads, block_size, dim]`) aligned to **Tensor Core MMA** (*Matrix Multiply-Accumulate*) hardware tiles.
+* **Parallel Sampling (`n > 1`), Beam Search (`beam_width > 1`), Reference Counting, & Copy-on-Write (CoW):** **Parallel sampling** generates $n$ independent completions from one prompt; **beam search** tracks top-$k$ candidate paths. **Reference counting (`ref_count`)** tracks how many sequences share a physical block; **Copy-on-Write (`fork()`, CoW)** shares read-only blocks (`ref_count > 1`) with zero copying until a sequence writes to one, copying only that block on demand.
+* **Online Softmax, Split-KV (PagedAttention v2), `reshape_and_cache`, `slot_mapping`, & 32-bit Overflow:** **Online Softmax** computes exact attention probabilities incrementally in registers (`max_logit`, `exp_sum`) without storing the $O(L)$ score matrix. **Split-KV** splits long contexts across multiple thread blocks and merges partial outputs via log-sum-exp rescaling. **`reshape_and_cache`** writes new K/V vectors to HBM using **`slot_mapping`**. **32-bit index overflow** is integer wraparound when byte/element offsets exceed $2^{31}$ on large-VRAM GPUs.
+
+---
+
 ## 1. The Contiguous KV Cache Fragmentation Problem
 
 Continuous batching eliminates compute bubbles, but without virtualized memory management it hits an immediate **VRAM capacity wall**.

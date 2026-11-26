@@ -4,6 +4,37 @@
 
 ---
 
+This guide explains how data moves between a GPU's off-chip memory and its compute units, and how memory layout choices determine the speed of Large Language Model (LLM) inference. Every hardware unit, memory tier, instruction, and optimization term used below is defined in dependency order before its first use.
+
+## Core Concepts & Terminology
+
+### 1. GPU Compute & Execution Basics
+* **GPU & SM (Streaming Multiprocessor):** A GPU contains many independent compute engines called **Streaming Multiprocessors (SMs)** (e.g., 132 SMs on an NVIDIA H100). Each SM has arithmetic units, warp schedulers, registers, and on-chip memory.
+* **Thread, Warp, SIMT, & CTA (Thread Block):** A **thread** is a single sequential instruction stream. A **warp** is 32 threads executing the same instruction in lockstep (**SIMT — Single Instruction, Multiple Threads**). Multiple warps form a **Thread Block / CTA (Cooperative Thread Array)** scheduled onto one SM.
+* **Tensor Cores & MMA (`mma.sync`, `FMA`, `ldmatrix`):** **Tensor Cores** are specialized SM hardware units that perform fast Matrix Multiply-Accumulate (**MMA**) operations (`mma.sync`), whereas standard CUDA cores perform scalar Fused Multiply-Add (**FMA**). `ldmatrix` is a warp-level instruction that loads matrix tiles from on-chip memory into Tensor Core registers.
+* **Precision Formats (`FP32`, `FP16`, `BF16`, `FP8`, `INT8`, `uint4`):** `FP32` (4 bytes) is standard single-precision float; `FP16` and `BF16` (2 bytes) are half-precision floats (`BF16` preserves FP32's wide range); `FP8` and `INT8` (1 byte) are compact 8-bit formats. In CUDA C++, `uint4` is a 16-byte (128-bit) vector type, and `__nv_bfloat162` / `float2` pack two values together.
+
+### 2. GPU Memory Hierarchy & Bandwidth Physics
+* **HBM (High Bandwidth Memory, e.g., HBM3):** The GPU's large off-chip main memory (e.g., 80 GB, ~3.35 TB/s bandwidth on H100), which has a long ~400–800 clock-cycle round-trip latency.
+* **L2 Cache & L1 Cache:** Hardware-managed caches that store recently accessed HBM data. **L2** is shared across all SMs; **L1** is small and private to each SM.
+* **SRAM (Static Random-Access Memory) / Shared Memory (`smem`):** Fast, programmer-managed on-chip memory (~20–30 cycles latency, up to 228 KB/SM on H100) physically unified with the L1 cache. Accessed via `LDS` (Load Shared) and `STS` (Store Shared) instructions.
+* **Register File, Occupancy, & Register Spilling (`Local Memory`, `LDL`, `STL`, `lmem`):** **Registers** are 0-cycle on-chip storage private to each thread (65,536 32-bit registers per SM, max 255/thread). **Occupancy** is the ratio of active warps on an SM to its hardware maximum. If a kernel exceeds the per-thread register limit (or caps set by `__launch_bounds__` / `-maxrregcount`), the **`ptxas`** compiler **spills** variables to **Local Memory (`lmem`)** via `LDL`/`STL` instructions—which physically live in slow off-chip HBM.
+* **GEMM, Arithmetic Intensity, & Ridge Point:** **GEMM** is General Matrix Multiplication ($C = A \times B$). **Arithmetic Intensity** is FLOPs (floating-point operations) performed per byte transferred from memory. The **Ridge Point** ($\text{Peak Compute} / \text{Peak Bandwidth}$, ~295 FLOPs/Byte for BF16 on H100) is the threshold separating memory-bandwidth-bound kernels from compute-bound kernels.
+* **Autoregressive Decode, KV Cache, PagedAttention, FlashDecoding, & ITL / TPOT:** During LLM text generation (**decode**), the model generates one token at a time, reading model weights and cached Key/Value vectors (**KV Cache**) from past tokens. **ITL (Inter-Token Latency)** / **TPOT (Time Per Output Token)** measures the time per generated token. **PagedAttention** stores the KV cache in fixed-size blocks; **FlashDecoding** splits attention over those blocks across SMs.
+
+### 3. Memory Transactions, Coalescing, & Bank Conflicts
+* **128B Cache Line, 32B Memory Sector, Stride, & Coalescing:** Memory controllers fetch HBM in **32-byte sectors** and **128-byte cache lines**. **Stride** is the element step between consecutive accesses. When a warp's **Load/Store Unit (LSU)** executes a global load (`LDG`) or store (`STG`), **coalescing** merges adjacent thread addresses into the minimum number of 32B sectors / 128B lines.
+* **Vectorized Loads (`ld.global.v4.b32` / `LDG.E.128`), MLP, & MIO Queue:** A **128-bit vectorized load** fetches 16 bytes per thread in one instruction, increasing **Memory-Level Parallelism (MLP)** (bytes in flight) while consuming fewer slots in the LSU's **Memory Input/Output (MIO)** queue. It requires 16-byte address alignment (`addr % 16 == 0`), otherwise hardware raises `CUDA_ERROR_MISALIGNED_ADDRESS`.
+* **2D SRAM Tiling:** Loading small rectangular sub-matrices ($B_M \times B_K$, $B_K \times B_N$) from HBM into SRAM once and reusing them across many MMA operations to amplify arithmetic intensity.
+* **Shared Memory Bank Conflicts (32 Banks) & XOR Swizzling:** SRAM is divided into **32 independent 4-byte banks**. Reading the exact same word broadcasts cleanly (**multicast**), and reading 32 distinct banks takes 1 cycle. If $k$ threads read *different* words in the *same* bank, hardware serializes them into $k$ passes (**$k$-way bank conflict**). **XOR swizzling** permutes column coordinates with a bitwise XOR of the row index to eliminate conflicts while keeping 16-byte alignment.
+
+### 4. Asynchronous Data Movement & Pipelining
+* **DMA (Direct Memory Access), `cp.async`, `commit_group`, & `wait_group`:** `cp.async` is an Ampere+ hardware copy instruction that transfers data directly from HBM/L2 into SRAM (like a **DMA** engine), bypassing registers. Batches are tracked with `cp.async.commit_group` and synchronized with `cp.async.wait_group N`.
+* **TMA (Tensor Memory Accelerator) & `mbarrier`:** Hopper's dedicated hardware unit (`cp.async.bulk.tensor`) where a single thread transfers an entire multi-dimensional tile between HBM and SRAM with automatic bounds checking and swizzling, signaling completion via a hardware **`mbarrier`** object.
+* **Software Pipelining (`num_stages = S`):** Allocating a circular ring buffer of $S$ tile slots in SRAM so `cp.async`/TMA prefetches future tiles from HBM concurrently while Tensor Cores compute on the current tile.
+
+---
+
 ## 1. The GPU Memory Physics Bottleneck in LLM Inference
 
 On an NVIDIA H100 SXM5, Tensor Cores deliver **989 TFLOP/s** in BF16/FP16, while HBM3 delivers **3.35 TB/s** (~$3.35 \times 10^{12}$ bytes/s). Dividing these two numbers yields a **ridge point** of $\sim 295\text{ FLOPs/Byte}$. Yet during autoregressive LLM decode (`batch_size=1..16`), loading weights and KV-cache tensors executes roughly **1 to 16 FLOPs per byte moved**—two orders of magnitude below the compute roof.

@@ -4,6 +4,26 @@
 
 ---
 
+Once a grammar recognizer knows which tokens are valid at the current step, the GPU must enforce that rule without stalling on CPU-GPU transfers or wasting forward passes on predictable syntax. This module explains how bitmasks are applied in GPU memory, how sampling order prevents crashes, and how deterministic schema boilerplate is skipped via Jump-Forward Decoding.
+
+## Core Concepts & Terminology
+
+Every math, GPU-kernel, and decoding concept used in this module is defined below in dependency order:
+
+* **Vocabulary ($V$, $|V|$), `LM Head`, & Logits ($\mathbf{z}$):** The **vocabulary** is the full set of $|V|$ tokens a model can generate (e.g., $128{,}256$ in Llama-3). The **`LM Head`** is the final linear layer producing raw, unnormalized scores called **logits** ($\mathbf{z} \in \mathbb{R}^{|V|}$).
+* **Grammar Engine, Parser State ($q$), & Validity Mask ($\mathbf{m}$):** The grammar recognizer (DFA/PDA from Module 04) tracks the current syntax state $q$ and outputs a binary **validity mask** $\mathbf{m} \in \{0, 1\}^{|V|}$ (`1` = allowed, `0` = forbidden).
+* **Temperature ($T$), Softmax, Greedy `argmax`, & Multinomial Sampling (`torch.multinomial`):** **Softmax** converts logits into probabilities summing to $1.0$. **Temperature ($T > 0$)** scales logits before Softmax to control randomness. **Greedy `argmax`** picks the single highest-probability token, while **multinomial sampling** draws a random token weighted by those probabilities.
+* **IEEE-754 `-INFINITY`, FP16/BF16, & `NaN` Dead State:** **`-INFINITY`** is standard IEEE-754 negative infinity ($\exp(-\infty) = 0$). **FP16/BF16** are 16-bit floats (FP16's finite minimum is $-65{,}504$). If all tokens are masked ($\sum m_j = 0$, a **dead state**), Softmax produces **`NaN`** (*Not a Number*), crashing GPU sampling.
+* **Bit-Packed `uint32` Bitmask vs. Dense Mask:** A **bitmask** packs 32 token validity flags (1 bit each) into one 32-bit unsigned integer (`uint32`), making it $32\times$ smaller than a dense `float32` mask.
+* **HBM, PCIe, Pinned Host Memory (`cudaHostAlloc`), `cudaMemcpyAsync`, & `cudaStreamSynchronize()`:** **HBM** is GPU memory; **PCIe** is the CPU-GPU bus; **pinned memory** is page-locked CPU RAM enabling non-blocking **H2D** (*Host-to-Device*) transfers via **`cudaMemcpyAsync`**. **`cudaStreamSynchronize()`** forces the CPU to halt until the GPU finishes, destroying overlap and inflating **ITL** (*Inter-Token Latency*).
+* **CUDA Kernel, Grid, Block, Thread, & `__restrict__`:** A **CUDA kernel** launches a **grid** of thread **blocks**; each **thread** processes one `uint32` word (32 tokens) directly in HBM (`__restrict__` promises pointers do not overlap).
+* **Sampling Pipeline (Penalties, Top-$k$, Top-$p$ / Nucleus, Non-Commutativity):** **Presence/frequency/repetition penalties** down-weight already-generated tokens; **Top-$k$** keeps only the $k$ most likely tokens; **Top-$p$ (nucleus)** keeps the smallest top prefix whose probabilities sum to $\ge p$. Because these steps are **non-commutative** (order matters), grammar masking must run *before* Top-$k$/Top-$p$.
+* **Entropy ($H = 0$) & Jump-Forward Decoding (Singular-Transition Compression):** **Entropy ($H$)** measures uncertainty; $H = 0$ means only one valid next string exists (e.g., `", "currency": "`). **Jump-Forward Decoding** compresses chains of **out-degree = 1** DFA/CFG states (no branching, no early `<EOS>`) into a single deterministic string $S_{\text{det}}$ emitted without sampling.
+* **KV Cache, `RoPE`, `BlockManager`, & Mini-Prefill (GEMM):** Even when skipping sampling, later tokens must attend to $S_{\text{det}}$ with accurate **`RoPE`** (*Rotary Position Embedding*) positions. A **mini-prefill** allocates KV blocks in **`BlockManager`** and processes all $k$ jumped tokens in **1 parallel GEMM forward pass** (1 HBM weight read) instead of $k$ sequential decode steps.
+* **BPE Retokenization, Token Healing, `logprobs`, & Ragged Attention (`FlashInfer`/`FlashAttention varlen`):** Because **BPE** (*Byte-Pair Encoding*) is not homomorphic ($\text{encode}(A) + \text{encode}(B) \neq \text{encode}(A+B)$), **suffix retokenization / token healing** re-merges tokens across the jump boundary (rolling back 1–2 KV tokens if needed) to avoid out-of-distribution splits. **`logprobs`** are per-token log-probabilities, and **ragged attention** mixes a $k$-token mini-prefill with 1-token decodes in the same continuous batch.
+
+---
+
 ## 1. Pre-Softmax Logit Masking Mathematics
 
 Once the grammar engine determines the binary validity mask $\mathbf{m} \in \{0, 1\}^{|V|}$ for the current parser state $q$, the sampler enforces the constraint directly on the raw unnormalized logit vector $\mathbf{z} \in \mathbb{R}^{|V|}$ produced by the `LM Head`:

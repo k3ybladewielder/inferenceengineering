@@ -4,6 +4,36 @@
 
 ---
 
+This guide explains how to measure a GPU kernel's hardware efficiency using NVIDIA's profiling tools and the **Roofline Model**, turning performance bottlenecks from guesswork into exact engineering fixes. Every profiling tool, hardware counter, stall metric, and Roofline term used below is defined in dependency order before its first use.
+
+## Core Concepts & Terminology
+
+### 1. Profiling Tools & Hardware Measurement
+* **Nsight Systems (`nsys`) vs. Nsight Compute (`ncu`):** **`nsys`** is a system-wide timeline profiler (microseconds to seconds) for CPU threads, kernel launch gaps, CUDA Streams, and PCIe/NVLink transfers. **`ncu`** is a single-kernel microarchitectural profiler that inspects hardware counters inside the GPU.
+* **PMU (Hardware Performance Monitoring Unit), Counter Multiplexing, & Kernel Replay:** **PMUs** are physical event counters inside each **SM (Streaming Multiprocessor)**, cache, and memory controller. Because an SM has only 8–32 physical counter slots, `ncu` collects hundreds of metrics via **Kernel Replay**: it snapshots GPU memory, re-runs the kernel 15–45+ times with different counter groups, and restores memory between passes.
+
+### 2. GPU Execution, Memory Tiers, & Instructions
+* **Warp, CTA (Thread Block), Warp Scheduler, & PC (Program Counter):** A **warp** is 32 threads executing together; a **CTA** is a thread block on one SM. Each cycle, an SM's **Warp Scheduler** checks each warp's **PC** (current instruction address) and picks an **eligible** (ready) warp to issue, or logs why it is **stalled**.
+* **GPU Memory Tiers (`HBM/DRAM`, `L2`, `L1/TEX`, `SRAM`, `Local Memory`):** Off-chip **HBM/DRAM** (~3.35 TB/s, ~500 cycles latency), shared **L2 Cache** (~12 TB/s), per-SM **L1/TEX Cache & Shared Memory (SRAM)** (~30+ TB/s, ~25 cycles, 32 banks), and **Local Memory (`lmem`)** (off-chip HBM used when thread registers spill).
+* **SM Compute Pipelines (`Tensor Pipe`, `FP32 FMA`, `INT32`, `SFU / XU`, `LSU`):** **Tensor Cores** (`HMMA`/`GMMA`) execute matrix math; **FP32 `FMA`** and **INT32** run scalar float/integer math; **SFU / XU** (Special Function Unit) runs `exp2f` (`MUFU.EX2`) and reciprocal square root (`RSQ`); **LSU** (Load/Store Unit) handles memory ops.
+* **Key Instructions & Techniques (`LDG.E.128`, `LDL`/`STL`, `LDS`, `ldmatrix`, `SHFL`, `S2R`, `cp.async`, `TMA`, `bar.sync`, `mbarrier`, `XOR Swizzling`):** 128-bit global load (`LDG.E.128`), register spill load/store (`LDL`/`STL`), shared memory load (`LDS`, `ldmatrix`), warp shuffle (`SHFL`), special register read (`S2R`), async HBM-to-SRAM DMA (`cp.async`, Hopper **TMA**), barriers (`bar.sync`, `mbarrier`), and bank-conflict-free **XOR swizzling**.
+
+### 3. SpeedOfLight, Warp Stalls, Occupancy & Wave Effects
+* **SpeedOfLight (`SOL`), `Compute (SM) %`, & `Memory %`:** `ncu`'s top-level summary showing the kernel's peak utilization across SM compute pipelines (`sm__throughput...`) and memory subsystems (`gpu__compute_memory_throughput...`).
+* **Critical Warp Stall Reasons (`Warp State Statistics`):**
+  * **`stall_long_scoreboard`:** Warp is waiting for a slow off-SM load (`LDG` to L2/HBM, or `LDL` register spill).
+  * **`stall_math_pipe_throttle`:** Operands are ready, but the target math unit (Tensor Core, FP32, or SFU) is 100% busy.
+  * **`stall_barrier`:** Warp is waiting at `__syncthreads()` / `bar.sync` / `mbarrier` for sibling warps in its CTA.
+  * **`stall_short_scoreboard`:** Warp is waiting on a fast SM-local op (`LDS`/`ldmatrix`, L1 hit, `SHFL`, `S2R`), often spiked by SRAM bank conflicts.
+* **Theoretical vs. Achieved Occupancy, Little's Law, & ILP:** **Theoretical occupancy** is the max fraction of SM warp slots a kernel's CTA/register/SRAM footprint allows; **achieved occupancy** (`sm__warps_active...`) is the time-averaged active fraction. By **Little's Law** ($\text{Concurrency} = \text{Bandwidth} \times \text{Latency}$), kernels with high **ILP (Instruction-Level Parallelism)** and `LDG.E.128` saturate HBM at just 25–50% occupancy.
+* **Wave Quantization, Persistent Kernels, & Split-K:** Launching a CTA grid that is not a multiple of the GPU's SM count (e.g., 133 CTAs on 132 SMs) leaves SMs idle in the final wave (**tail effect**). **Persistent Kernels** (1 CTA/SM pulling from a work queue) and **Split-K** (splitting matrix reduction across CTAs) eliminate tail waves.
+
+### 4. Roofline Model & LLM Inference Regimes
+* **Roofline Model, Arithmetic Intensity ($I$), Ridge Point ($I^*$), & Hierarchical Roofline:** Plots $I = \text{FLOPs} / \text{Bytes}$ against performance $P = \min(P_{\text{peak}}, \text{BW}_{\text{peak}} \times I)$ on a log-log chart. The **Ridge Point** ($I^* = P_{\text{peak}} / \text{BW}_{\text{peak}}$) separates the memory-bound slope from the compute-bound plateau. **Hierarchical Roofline** plots separate roofs for HBM (`dram__bytes.sum`), L2 (`lts__t_bytes.sum`), and L1/SMEM (`l1tex__t_bytes.sum`) using SASS FLOP counters (`FADD`, `FMUL`, `FFMA`, `TensorOps`) and `gpu__time_duration.sum`.
+* **LLM Regimes & Fixes (`Prefill GEMM`, `Decode GEMV`, `W4A16`/`FP8`, `2:4 Sparsity`, `Operator Fusion`, `Split-Q`, `FA-3 Ping-Pong`):** **Prefill GEMM** is compute-bound; **Decode GEMV** is HBM-bound. **W4A16/FP8 quantization** and **Operator Fusion** raise $I$; **2:4 Sparsity** doubles Tensor Core peak via 50% structured pruning; **Split-Q** and **FlashAttention-3 Ping-Pong** cut barriers and overlap WGMMA with SFU Softmax.
+
+---
+
 ## 1. NVIDIA Nsight Compute (`ncu --set full`) Mechanics
 
 When optimizing an LLM inference pipeline, you use two complementary NVIDIA tools at different time scales:

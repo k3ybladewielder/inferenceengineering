@@ -4,6 +4,40 @@
 
 ---
 
+This guide explains two complementary techniques for speeding up Large Language Model (LLM) inference: **Operator Fusion** (combining multiple GPU operations to avoid slow memory round-trips) and **CUDA Graphs** (recording an entire sequence of GPU operations so the CPU can launch them all in a single call). Every hardware, compiler, and serving term used below is defined in dependency order before its first use.
+
+## Core Concepts & Terminology
+
+### 1. GPU Architecture & Execution Overhead
+* **HBM (High Bandwidth Memory), L2 Cache, & Registers:** **HBM** is the GPU's large off-chip main memory (high bandwidth, ~400–800 cycles latency). **L2 Cache** (~50 MB on H100) is shared across all **SMs (Streaming Multiprocessors)**. **Registers** are 0-cycle private on-chip storage inside each SM.
+* **CTA (Thread Block), Warp, & Wave Quantization:** A **warp** is 32 threads executing together; a **CTA** is a group of warps scheduled onto one SM. **Wave quantization** occurs when a kernel launches fewer CTAs than the GPU's SM count (e.g., 132 SMs on H100), leaving remaining SMs idle.
+* **Eager Execution & ATen Dispatcher:** PyTorch's default mode where Python and its C++ tensor dispatcher (**ATen**) submit each GPU kernel one at a time.
+* **CPU Kernel Launch Path (`cudaLaunchKernel`, QMD, Pinned Memory, PCIe MMIO, GigaThread):** Every eager launch requires the CPU and CUDA driver to build a **QMD (Queue Meta Data)** command packet in host **pinned** (non-pageable) memory and ring a **PCIe MMIO (Memory-Mapped I/O)** doorbell so the GPU's **GigaThread** scheduler dispatches the kernel. This takes ~5–20 microseconds (µs) of CPU time per kernel; when GPU kernels finish faster than 5–20 µs, the GPU stalls waiting for the CPU (**CPU-launch-bound**).
+
+### 2. LLM Building Blocks, Precision, & Fusion Concepts
+* **Transformer Block, Attention, MLP, & Linear Projections (`QKV`, `O_proj`, `Gate/Up`, `Down`, `LM head`):** Each Transformer layer runs **Attention** (`QKV` projections for Query/Key/Value, followed by `O_proj`) and a feed-forward **MLP** (`Gate/Up` and `Down` projections). The final **`LM head`** projects hidden states to vocabulary probabilities. **GQA (Grouped-Query Attention)** shares Key/Value heads across multiple Query heads.
+* **GEMM, GEMV, FLOPs, & Arithmetic Intensity:** **GEMM** is General Matrix Multiplication; **GEMV** is Matrix-Vector Multiplication (small-batch decode). **FLOPs** are floating-point operations. **Arithmetic Intensity** is FLOPs per byte moved from HBM; **memory-bound** ops wait on HBM bandwidth.
+* **Precision Formats (`FP32`, `BF16`, `FP8` E4M3, `INT8`, `W8A8`):** `FP32` (4 bytes), `BF16` (2 bytes), `FP8` E4M3 (1 byte, max value 448.0), `INT8` (1-byte integer), and `W8A8` (8-bit weights and 8-bit activations).
+* **Non-GEMM Inference Ops (`Residual Add`, `RMSNorm`, `RoPE`, `KV Cache Scatter`, `SwiGLU` / `SiLU`, `AbsMax`):**
+  * **Residual Add:** Adding the skip-connection ($h = x + r$).
+  * **RMSNorm:** Root Mean Square Layer Normalization ($\frac{h}{\text{rms}(h)} \odot \gamma$).
+  * **RoPE:** Rotary Position Embedding (rotating Q/K vectors by token position).
+  * **KV Cache Scatter:** Writing new Key/Value vectors into the **KV Cache** (stored past tokens).
+  * **SwiGLU (`SiLU * Gate`):** Gated MLP activation where $\text{SiLU}(z) = z / (1 + e^{-z})$.
+  * **Dynamic Quantization (`AbsMax`):** Computing a row's maximum absolute value (`amax`) at runtime to scale BF16 values into FP8/INT8.
+* **Low-Level GPU Instructions (`LDG.E.128`, `STG.E.128`, `shfl.sync.bfly`, `MUFU.EX2`):** 128-bit coalesced global load/store, intra-warp butterfly shuffle reduction (exchanging register values without HBM/SRAM), and Special Function Unit base-2 exponential (`2^x`).
+* **Operator Fusion (Vertical vs. Horizontal), Epilogue Fusion, & Grouped GEMM:**
+  * **Vertical (Producer-Consumer) Fusion:** Merging sequential ops into one kernel so intermediates stay in registers instead of being written to and read from HBM (**intermediate HBM materialization**). **Epilogue fusion** attaches elementwise ops onto the end of a GEMM.
+  * **Horizontal (Sibling) Fusion:** Merging parallel branches sharing an input (e.g., `Q/K/V` or `Gate/Up`) into one wider GEMM, or batching independent GEMMs across **MoE (Mixture-of-Experts)** experts or **Multi-LoRA** adapters (**Grouped GEMM**).
+
+### 3. Compilers, Serving Engines, & CUDA Graphs
+* **Compilers & Libraries (`torch.compile` / TorchInductor, XLA, TensorRT, Triton JIT, cuBLAS, NCCL, TP, AllReduce):** Graph compilers (`TorchInductor`, `XLA`, `TensorRT`) and **Triton JIT** fuse kernels automatically; **cuBLAS** runs vendor GEMMs; **TP (Tensor Parallelism)** splits layers across GPUs using **NCCL `AllReduce`** collectives.
+* **Serving Engines & Attention Kernels (`vLLM`, `SGLang`, `TensorRT-LLM`, `PagedAttention`, `FlashDecoding`, `FlashInfer`):** Production LLM serving runtimes; **PagedAttention** stores KV cache in fixed-size blocks indexed by `block_tables`, while **FlashDecoding** and **FlashInfer** parallelize attention over those blocks.
+* **CUDA Stream, DAG, & CUDA Graph (`cudaStreamBeginCapture`, `cudaGraph_t`, `cudaGraphInstantiate`, `cudaGraphExec_t`, `cudaGraphLaunch`, `torch.cuda.CUDAGraph`):** A **CUDA Stream** is an ordered GPU command queue; a **DAG** is a Directed Acyclic Graph of kernel/memory dependencies. A **CUDA Graph** records operations during `cudaStreamBeginCapture` into a `cudaGraph_t` DAG, compiles fixed addresses/pushbuffers via `cudaGraphInstantiate` into `cudaGraphExec_t`, and replays all kernels in one CPU call (`cudaGraphLaunch`).
+* **Graph Pool & Piecewise CUDA Graphs:** **`graph_pool_handle()`** lets multiple batch-size bucketed graphs share one private GPU memory pool. **Piecewise (hybrid) CUDA Graphs** capture static linear/norm blocks into graphs while running dynamic-length attention eagerly between graph segments.
+
+---
+
 ## 1. The Dual Tax of Eager Transformer Execution
 
 In a modern Transformer block (e.g., Llama-3, Qwen2.5, Mistral), the dense matrix multiplications (`QKV`, `O_proj`, `Gate/Up`, `Down`) perform >99% of the arithmetic FLOPs. Yet when you profile an unfused PyTorch decode step (`batch_size=1..16`), the **non-GEMM memory-bound operations** (`Residual Add`, `RMSNorm`, `RoPE`, `KV Cache Scatter`, `SiLU * Gate`, `Dynamic FP8/INT8 Quantization`) frequently consume **30% to 60% of total wall-clock latency**.

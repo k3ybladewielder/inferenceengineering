@@ -4,6 +4,46 @@
 
 ---
 
+When multiple teams or paying customers share a single AI cluster, the platform must prevent any one user from hogging GPU memory, slowing down others, seeing another user's cached data, or racking up unbilled compute costs. This chapter covers how to count every type of token accurately, enforce fair rate limits and GPU scheduling isolation, and build a reliable billing pipeline that never slows down live inference.
+
+## Core Concepts & Terminology
+
+Every governance, scheduling, security, and billing term used in this document is defined below in dependency order:
+
+### A. Multi-Tenancy, Auth & Token Accounting Taxonomy
+* **Multi-Tenant Platform & Tenant:** A shared inference cluster serving multiple independent teams, products, or external customers (**tenants**).
+* **AuthN (Authentication), API Key, JWT, & ACL:** **AuthN** verifies who a caller is using an **API Key** or **JWT (JSON Web Token)**; an **ACL (Access Control List)** enforces which models or adapters that tenant is allowed to invoke.
+* **Token Cost Classes:** Because different tokens consume vastly different GPU resources, governance classifies them separately:
+  * **Uncached Prompt Tokens ($N_{\text{in, miss}}$):** New input tokens requiring full parallel prefill matrix math (**GEMMs**) and KV cache writes to HBM.
+  * **Cached Prefix Tokens ($N_{\text{in, hit}}$):** Repeated prompt prefixes matched in **Automatic Prefix Caching (APC)** or **RadixAttention**, skipping prefill math and costing only KV reads.
+  * **Visible Completion Tokens ($N_{\text{out, vis}}$):** Generated output tokens streamed to the user.
+  * **Reasoning / Hidden Tokens ($N_{\text{out, reason}}$):** Internal chain-of-thought tokens generated inside `<think>...</think>` blocks by reasoning models (e.g., DeepSeek-R1, QwQ) before the final answer; they consume full decode bandwidth and VRAM.
+  * **Tool-Call & Grammar FSM Masking:** Structured JSON outputs enforced by a **Finite-State Machine (FSM)** grammar mask that restricts allowed next tokens at each step.
+  * **Speculative Rejected Draft Tokens (EAGLE head):** Candidate tokens guessed by a fast draft model/head that fail verification and are discarded.
+* **Tokenizer Divergence & `stream_options: {"include_usage": true}`:** Different models split text into different token counts (e.g., OpenAI's `cl100k_base` vs. Llama-3's tokenizer). Passing `include_usage: true` on **SSE (Server-Sent Events)** streams instructs the serving engine to report authoritative token counts at stream end.
+
+### B. Rate Limiting & Two-Phase Quota Control
+* **RPM, TPM (ITPM / OTPM / Weighted TPM), & Max Concurrency:** **RPM** limits Requests Per Minute; **TPM** limits Tokens Per Minute (split into Input **ITPM** and Output **OTPM**, or combined as **Weighted TPM** where output tokens carry a multiplier $\alpha \in [3, 5]$); **Max Concurrency** caps simultaneous active requests/KV tokens.
+* **Redis, Lua (`EVALSHA`), Token-Bucket / Sliding-Window, & TTL:** **Redis** is an in-memory key-value store. Executing a **Lua script (`EVALSHA`)** runs quota checks and updates as one **atomic** (indivisible) operation, preventing race conditions. A **TTL (Time-To-Live)** automatically expires leaked concurrency locks if a gateway crashes.
+* **Two-Phase Quota Accounting & HTTP `429`:** **Phase 1 (Pre-Flight)** reserves worst-case tokens before forwarding to the GPU (rejecting over-limit callers with **`429 Too Many Requests`** and `Retry-After` headers); **Phase 2 (Post-Flight)** reconciles actual engine `usage` and refunds unused headroom.
+* **Guaranteed Tier vs. Opportunistic Burst Tier:** Paid baseline capacity (**Guaranteed**) versus temporary extra throughput (**Burst**) granted only when cluster KV and queue pressure are low.
+
+### C. Fair Scheduling, VRAM Isolation & Multi-LoRA
+* **FCFS & Head-of-Line (HoL) Blocking:** **First-Come, First-Served** queuing lets one tenant's huge batch stall all later interactive users behind it (**HoL blocking**).
+* **Deficit Round Robin (DRR) & Virtual Token Counter (VTC):** Fair-queuing schedulers that maintain separate virtual sub-queues per tenant and interleave admissions based on weighted token work consumed (`virtual_work[i] / w_i`) so bursty tenants cannot starve interactive ones.
+* **Chunked Prefill (`max_num_batched_tokens`):** Splitting long prompt prefills into bounded slices interleaved with decode steps to protect other tenants' Inter-Token Latency (ITL).
+* **Per-Tenant KV Block Caps & Prefix-Cache Side-Channel (`namespace_isolation`):** Limiting how many PagedAttention KV blocks one tenant can occupy, and salting KV prefix hashes with `(tenant_id, prefix_hash)` so one tenant cannot probe whether another tenant queried secret text or **PII (Personally Identifiable Information)** by measuring TTFT cache-hit speedups.
+* **S-LoRA / Punica & SGMV Kernels:** Techniques for hosting 50–500 fine-tuned **LoRA** adapters ($W = W_{\text{base}} + B_i A_i$) on one shared base model. **SGMV (Segmented Gather Matrix-Vector/Matrix-Multiply)** kernels execute heterogeneous tenant adapters in one batched pass, backed by a tiered **LRU (Least Recently Used)** cache (`--max-loras` in VRAM, `--max-cpu-loras` in host RAM).
+
+### D. Chargeback, Showback & Asynchronous Metering
+* **Showback vs. Chargeback, GL Codes, & ERP:** **Showback** reports per-team token/dollar usage for visibility; **chargeback** deducts real spend against team budgets, accounting General Ledger (**GL**) codes, or **ERP**/Stripe invoices.
+* **Hot Path & Idempotent Asynchronous Metering:** The **hot path** is the latency-sensitive request loop; billing writes must happen **asynchronously** off the hot path and be **idempotent** (safe to retry without double-charging).
+* **Kafka / Redpanda / NATS JetStream, Protobuf, & UUIDv7:** Durable message queues that buffer immutable `UsageEvent` records (serialized in JSON or binary **Protobuf**) tagged with a time-ordered unique **`UUIDv7`** ID for **exactly-once deduplication**.
+* **ClickHouse (`ReplacingMergeTree`), Apache Flink, Materialized Views, & Rate Card:** High-speed stream processors (**Flink**) and analytical databases (**ClickHouse**) that deduplicate events, multiply token counts by a versioned **Rate Card** (`$/1M tokens`), and maintain pre-aggregated rollups.
+* **Cloud Cost Reconciliation (AWS CUR, GCP BigQuery, Kubecost) & Fleet Recovery Ratio:** Comparing attributed tenant bills against actual cloud invoices (**AWS Cost & Usage Report**, **GCP BigQuery**, **Kubecost**) to measure how much paid GPU capacity was recovered versus lost to idle time ($1 - U_{\text{avg}}$).
+
+---
+
 ## 1. Granular Token Accounting Taxonomy
 
 In a multi-tenant inference platform (internal enterprise AI gateway or commercial API), naive token counting (`len(prompt) + len(completion)`) creates severe billing inaccuracies, arbitrage exploits, and margin leaks. Modern governance pipelines classify every token into distinct cost classes matching its true silicon footprint:

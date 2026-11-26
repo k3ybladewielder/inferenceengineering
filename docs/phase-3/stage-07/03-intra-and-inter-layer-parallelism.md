@@ -2,6 +2,26 @@
 
 [Previous: Drafting Architectures](./02-drafting-architectures.md) | [Stage 7 Index](./README.md) | [Next: Specialized Parallelism (EP & SP)](./04-specialized-parallelism-ep-and-sp.md)
 
+When a language model's weights or memory demands exceed what a single chip can hold or read quickly, the model must be split across multiple GPUs. This guide explains the two primary ways to partition Transformer layers—splitting *inside* each layer to cut latency, or splitting *across* layers to scale capacity and throughput.
+
+---
+
+## Core Concepts & Terminology
+
+Every hardware, model, and distributed systems term used in this document is defined below in logical dependency order:
+
+* **Weights, Activations, & KV Cache:** **Weights** are the model's learned parameters; **activations** are the intermediate token vectors flowing between layers; the **KV cache** stores past Key and Value attention vectors to avoid recomputing them during generation.
+* **BF16, FP8, HBM, & VRAM:** **BF16** (2 bytes/number) and **FP8** (8-bit floating point, 1 byte/number) are compact numeric formats. **HBM** (High-Bandwidth Memory) is the GPU's ultra-fast on-package memory, also referred to as **VRAM** (Video RAM).
+* **Transformer Layer, Attention, MLP, SwiGLU, GeLU/SiLU, & RMSNorm:** Each **Transformer layer** contains a **Self-Attention** block (four linear projections: $W_Q, W_K, W_V, W_O$) and an **MLP** (Multi-Layer Perceptron) feedforward block ($W_1, W_2$, or gated **SwiGLU** with $W_{\text{gate}}, W_{\text{up}}, W_{\text{down}}$). **GeLU** and **SiLU** are element-wise nonlinear activation functions; **RMSNorm** (Root Mean Square Normalization) normalizes activation vectors; a **residual connection** adds a block's input directly to its output ($X + Y$).
+* **MHA, GQA, MQA, FlashAttention, & PagedAttention:** In **Multi-Head Attention (MHA)**, every query head ($H$) has its own Key/Value head ($H_{\text{kv}} = H$). **Grouped-Query Attention (GQA)** shares fewer KV heads ($H_{\text{kv}} < H$) across query head groups to save KV cache memory; **Multi-Query Attention (MQA)** uses $H_{\text{kv}} = 1$. **FlashAttention** and **PagedAttention** are fast, memory-tiled GPU attention kernels.
+* **Prefill, Decode, Continuous Batching, Chunked Prefill, TTFT, & ITL:** **Prefill** processes the prompt in parallel (**TTFT** = Time-To-First-Token); **Decode** generates tokens sequentially (**ITL** = Inter-Token Latency). **Continuous batching** dynamically swaps finished requests out of a running batch; **chunked prefill** splits long prompts into fixed-size chunks so prefill does not stall decode.
+* **NCCL & Collective Primitives (`AllReduce`, `ReduceScatter`, `AllGather`, `Send/Recv`):** **NCCL** (NVIDIA Collective Communications Library) orchestrates multi-GPU communication across **ranks** (individual GPU IDs $0 \dots P-1$). **`AllReduce(SUM)`** sums tensors across all GPUs and returns the full sum to every GPU; **`ReduceScatter(SUM)`** sums and splits the result so each GPU keeps a unique $1/P$ slice; **`AllGather`** reassembles $1/P$ slices into the full tensor on every GPU; **`Send/Recv`** performs point-to-point (**P2P**) transfers between two specific GPUs.
+* **Interconnects (NVLink, NVSwitch, PCIe, InfiniBand, RoCEv2):** **NVLink** and **NVSwitch** are ultra-fast, low-latency GPU-to-GPU fabrics inside a single server node. **PCIe** is the standard motherboard bus (much slower for frequent GPU syncs). **InfiniBand** and **RoCEv2** (RDMA over Converged Ethernet) are high-speed network fabrics linking *separate* server nodes.
+* **Tensor Parallelism (TP, Megatron-LM Column-Parallel & Row-Parallel):** **Intra-layer parallelism** that splits individual weight matrices *inside* every layer across $P$ GPUs. **Column-Parallel** splits a matrix vertically along its output columns; **Row-Parallel** splits the following matrix horizontally along its input rows so partial results can be summed with a single `AllReduce`, cutting both VRAM per GPU and single-request ITL.
+* **Sequence Parallelism (SP):** An extension of TP that shards replicated activations along the sequence length $S$ during `RMSNorm` and residual-add steps by decomposing `AllReduce` into `ReduceScatter` + local norm + `AllGather`, reducing activation memory by $P\times$ with zero extra communication bytes.
+* **Pipeline Parallelism (PP), Stages ($p$), Micro-Batches ($m$), & Pipeline Bubble:** **Inter-layer parallelism** that assigns contiguous groups of layers to $p$ GPU **stages**, forwarding hidden states via P2P `Send/Recv`. Splitting a batch into $m$ **micro-batches** lets stages overlap work, while idle waiting slots during pipeline fill/drain form the **pipeline bubble** ($\frac{p-1}{m+p-1}$).
+* **GPipe, 1F1B, & Interleaved 1F1B (Virtual Stages):** **GPipe** executes all $m$ forward passes ($F$) before any backward pass ($B$), requiring $O(m)$ activation memory in training. **1F1B** (One-Forward-One-Backward) alternates $F$ and $B$ in steady state, cutting activation memory to $O(p)$. **Interleaved 1F1B** assigns each GPU $v$ non-contiguous layer chunks (**virtual stages**), shrinking the bubble by $v\times$ at the cost of $v\times$ more P2P transfers.
+
 ---
 
 ## 1. Why Single-GPU Serving Hits Hard Limits

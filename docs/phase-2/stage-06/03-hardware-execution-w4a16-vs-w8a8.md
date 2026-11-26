@@ -4,6 +4,41 @@
 
 ---
 
+Choosing between 4-bit and 8-bit quantization is not just an accuracy trade-off—it depends on whether the GPU is bottlenecked by moving model weights from memory or by doing math. This document derives the exact batch-size threshold where 8-bit native math overtakes 4-bit weight compression and explains how specialized GPU kernels execute both at near-hardware limits.
+
+## Core Concepts & Terminology
+
+Every technical term, numerical format, Roofline metric, and GPU kernel mechanism used in this document is defined below in dependency order:
+
+1. **Inference Regimes & Serving Systems:**
+   * **Prefill, Decode, & Continuous Batching:** Prefill processes all prompt tokens in parallel; decode generates one output token per step per active user. Continuous batching packs tokens from multiple concurrent requests into a single matrix-multiply batch of size $B$.
+   * **`vLLM`, `SGLang`, `TensorRT-LLM`, `DeepSeek-V3`, & `MoE`:** Widely used LLM serving engines (`vLLM`, `SGLang`, `TensorRT-LLM`), and `DeepSeek-V3`, a frontier Mixture-of-Experts (`MoE`) model that routes tokens to specialized sub-networks.
+   * **GEMM, Reduction Dimension ($K$), & Epilogue:** General Matrix Multiply ($Y = XW$ for $X \in \mathbb{R}^{B \times K}, W \in \mathbb{R}^{K \times N}$) summing along inner dimension $K$. The epilogue is the final step after the $K$-loop finishes where scales are applied and outputs are written.
+
+2. **Precision Schemes & Quantization Operations:**
+   * **`FP32`, `FP16`, `BF16`, `FP8` (`E4M3`), `INT8`, `INT4`, `UINT4`, `FP4`, `MXFP8`, & `MXFP4`:** 32-bit, 16-bit, 8-bit, and 4-bit floating-point and integer number formats (`MXFP8`/`MXFP4` use 32-element hardware block scales).
+   * **`W4A16` vs. `W8A8`:** Weight/activation bit-width schemes (`W4A16` = 4-bit weights, 16-bit activations; `W8A8` = 8-bit weights, 8-bit activations).
+   * **Group Size ($g=128$), Scale ($s_X, s_W$), Zero-Point ($z_w$), `RMSNorm`, & `SwiGLU`:** Group-wise scaling shares one scale/zero-point per $g$ weights along $K$; `RMSNorm` (normalization) and `SwiGLU` (gated MLP activation) are Transformer layers immediately preceding linear projections.
+   * **Dequantization vs. Online Activation Quantization (Static vs. Dynamic):** Dequantization unpacks 4-bit weights to `FP16`/`BF16` before math; online activation quantization converts activations $X$ to 8-bit at runtime using either a pre-calibrated fixed scale (`static per-tensor`) or a scale computed per token row on-the-fly (`dynamic per-token`).
+
+3. **GPU Architecture & Roofline Performance Model:**
+   * **HBM Bandwidth ($BW$), L2 Cache, Shared Memory (`SMEM`), & Registers:** The GPU memory hierarchy from off-chip main memory (HBM/HBM3) to on-chip L2 cache, per-block `SMEM`, and per-thread registers.
+   * **FLOPs, TFLOPS, TOPS, & Peak Compute ($P_{16}, P_8$):** Floating-point operations (FLOPs), trillions of FLOPs/sec (TFLOPS), and trillions of integer ops/sec (TOPS). $P_{16}$ and $P_8$ denote peak 16-bit and 8-bit Tensor Core throughput.
+   * **Arithmetic Intensity ($I$), Ridge Point ($I_{\text{ridge}}$), & Roofline Model:** Arithmetic intensity is FLOPs per byte moved from HBM. The Ridge Point ($P/BW$) separates memory-bound execution from compute-bound execution; the Roofline model bounds kernel time by $\max(\text{Memory Time}, \text{Compute Time})$.
+   * **Compute Knee ($B_{\text{knee}}$) & Crossover Batch Size ($B^*$):** $B_{\text{knee}}$ is the batch size where a kernel hits its compute ceiling; $B^*$ is the batch size where `W8A8` becomes faster than `W4A16`.
+   * **NVIDIA A100, H100 (Hopper), & B200 (Blackwell):** Successive NVIDIA data-center GPU architectures.
+
+4. **GPU Kernel & Low-Level Instruction Mechanics:**
+   * **SM, Threadblock, Warp, Lane, & Occupancy:** A Streaming Multiprocessor (SM) is an independent GPU compute cluster (132 on H100); a threadblock runs on one SM; a warp is 32 threads (each thread is a "lane") executing in lockstep; occupancy measures how well active warps keep SMs busy.
+   * **`cublasGemmEx` & Marlin Kernel:** `cublasGemmEx` is NVIDIA's standard matrix-multiply library call. Marlin is a fused `W4A16` kernel that dequantizes `INT4` weights inside registers without writing temporary `FP16` tensors to HBM.
+   * **Tensor Core Fragments, `HMMA` (`m16n8k16`), `IMMA` (`m16n8k32`), & `wgmma`:** Hardware matrix-multiply instructions: `HMMA` (16-bit float), `IMMA` (8-bit integer), and `wgmma` (Hopper warp-group asynchronous MMA reading operands straight from `SMEM`).
+   * **`LDG.E.128`, `ld.shared.v4.u32`, `shfl.sync` (`__shfl_xor_sync`), & Bank Conflicts:** 128-bit vectorized memory loads (`LDG`/`ld.shared`), intra-warp register shuffles (`shfl.sync`), and `SMEM` bank conflicts (access collisions that serialize threads).
+   * **ALU, `I2F.F16.S32`, `LOP3.B32` Magic-Bias (`0x6400`), `HSUB2`, `HFMA2`, `half2`, & `ULP`:** CUDA-core arithmetic logic units (ALU); `I2F` is the slow integer-to-float instruction. `LOP3.B32` is a 3-input bitwise logic instruction that packs `INT4` nibbles into `FP16` (`1024.0 + q` via hex `0x6400`, where ULP = `1.0`), followed by 2-way packed `FP16` subtraction (`HSUB2`) and fused multiply-add (`HFMA2`) on `half2` registers.
+   * **`cp.async` Double-Buffering, `TMA`, & Split-K:** Asynchronous HBM-to-`SMEM` copies (`cp.async` and Hopper's hardware `TMA` engine) that overlap data movement with math; Split-K partitions the $K$ dimension across multiple threadblocks so small batches saturate all SMs.
+   * **`FP22` Internal Accumulation:** Hopper `FP8` Tensor Cores truncate intermediate dot-product mantissas to 14 bits (`FP22`) inside each step, requiring periodic `FP32` CUDA-core promotion on long reductions.
+
+---
+
 ## 1. Two Regimes, Two Quantization Paradigms
 
 A single quantization scheme cannot simultaneously optimize **low-batch decode** and **high-batch prefill**. To understand why, examine how a linear projection $Y = X W$ ($X \in \mathbb{R}^{B \times K}$, $W \in \mathbb{R}^{K \times N}$, where $B$ is the total tokens in the GEMM batch—either prompt tokens in prefill or concurrent requests in continuous-batching decode) maps onto GPU silicon:

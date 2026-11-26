@@ -4,6 +4,38 @@
 
 ---
 
+Cloud providers sell spare, unused GPU servers—called **Spot** or **Preemptible** instances—at 60% to 85% discounts, but they can take those servers back with only 30 to 120 seconds of warning. This chapter explains how to run AI inference on Spot GPUs reliably so that when a server is reclaimed, active user streams finish cleanly or continue seamlessly on another machine without dropped connections.
+
+## Core Concepts & Terminology
+
+Every cloud, networking, Kubernetes, and LLM mechanism referenced in this document is defined below in dependency order:
+
+### A. Cloud GPU Capacity, Pricing & Regions
+* **COGS (Cost of Goods Sold) & Gross Margin:** **COGS** is the direct infrastructure cost required to deliver AI tokens; **gross margin** is the profit remaining after subtracting COGS from revenue.
+* **Hyperscalers & Neoclouds:** Major general-purpose cloud providers (**AWS**, **GCP**, **Azure**) and specialized GPU-focused cloud providers.
+* **On-Demand, Reserved Instances / Savings Plans, & Spot / Preemptible GPUs:** **On-Demand** GPUs are rented at full price with no planned interruption. **Reserved Instances / Savings Plans** offer 30–45% discounts for 1–3 year commitments. **Spot Instances / Spot VMs** are spare capacity sold at 60–85% off that the provider can reclaim on short notice.
+* **Region, Availability Zone (AZ), GPU SKU, & `InsufficientInstanceCapacity` (ICE):** A **Region** is a geographic area (e.g., `us-east-1`), split into isolated datacenters called **Availability Zones (AZs)** (`us-east-1a/b/c`). A **SKU** is a specific server/GPU model (e.g., AWS `g6e`, `p4d`, `p5`; GCP `a2`, `a3`, `g2`; Azure `ND`, `NC`). **ICE** is the error returned when a pool has no spare Spot GPUs available.
+
+### B. Interruption Signals, OS Signals & Kubernetes Draining
+* **IMDS / IMDSv2 (`169.254.169.254`), Metadata Server, & Scheduled Events:** Every cloud VM exposes a local **Instance Metadata Service (IMDS)** at the link-local IP `169.254.169.254` (or `metadata.google.internal` on GCP). Polling it detects reclamation notices 120 seconds early on AWS (**IMDSv2**), 30 seconds early on GCP (**Metadata Server** / **ACPI G2 Soft Off** power signal), or 30 seconds early on Azure (**Scheduled Events**).
+* **AWS Rebalance Recommendation, EventBridge, & SQS:** An early AWS warning sent *before* the 120-second countdown when a Spot pool is at high risk of reclamation, routed via **EventBridge** (event bus) into an **SQS** message queue.
+* **Karpenter, `NodePool`, & AWS Node Termination Handler (NTH):** **Karpenter** is a Kubernetes node autoscaler that provisions replacement GPUs and prioritizes pools by **`weight`** (e.g., Spot `weight: 100`, On-Demand fallback `weight: 10`), later **consolidating** workloads back onto Spot via a **descheduler** when Spot returns. **NTH** is a cluster controller/DaemonSet that listens to IMDS/SQS and initiates graceful draining.
+* **`kubectl cordon` (`node.spec.unschedulable`), `SIGTERM`, `SIGKILL`, & `terminationGracePeriodSeconds`:** **Cordoning** marks a node unschedulable so no new pods land on it. **`SIGTERM`** is the polite Unix shutdown signal; **`SIGKILL`** forcefully terminates the process if it has not exited after **`terminationGracePeriodSeconds`** (must be `110s` on AWS or `25s` on GCP/Azure instead of Kubernetes's default `30s`).
+
+### C. Networking, Proxies & Ingress Cut-Off
+* **TCP Socket, TLS, & SSE (`text/event-stream`):** A **TCP socket** is a persistent network connection (encrypted with **TLS**). **SSE** is an HTTP streaming format that pushes generated tokens one by one over a single long-lived connection.
+* **HTTP Status Codes (`200`, `502`, `503`), `EOF`, & `Retry-After`:** `200 OK` indicates success; `502 Bad Gateway` / `EOF` (End-of-File) indicate a broken mid-stream connection; `503 Service Unavailable` with `Retry-After: 0` tells the proxy to immediately retry an unstarted request on another server.
+* **`readinessProbe`, `EndpointSlice`, `kube-proxy` (`iptables`/`IPVS`), & Envoy `xDS` / `ALB`:** Kubernetes checks pod health via **`readinessProbe`**. When a pod becomes `NotReady`, Kubernetes updates **`EndpointSlice`** records, which propagate to **`kube-proxy`** (kernel `iptables`/`IPVS` routing rules) and load balancers (**Envoy `xDS`** or AWS **ALB**) to stop sending new traffic.
+* **Thundering-Herd Retry Storm:** A failure cascade where dozens of severed clients retry full prompts simultaneously on surviving pods, saturating their KV caches.
+
+### D. Token Continuation & Live KV-State Migration
+* **Autoregressive Decoding, `token_ids`, `max_tokens`, `temperature`, & RNG `seed`:** LLMs generate one token at a time based on all preceding tokens (`token_ids`), stopping at `max_tokens`, with randomness controlled by `temperature` and a Random Number Generator **`seed`**.
+* **Token-State Continuation (`event: drain_handoff`):** A pattern where the **AI Gateway** buffers tokens already sent to the user; if a Spot pod must exit early, it sends `drain_handoff` and the gateway transparently re-prefills `prompt + emitted_tokens` on a healthy pod while keeping the client's SSE socket open.
+* **GQA (Grouped-Query Attention), `KV heads`, & FP16:** An attention design where multiple query heads share fewer Key/Value heads (`n_kv = 8`), shrinking the FP16 (2 bytes/number) KV cache footprint.
+* **GPUDirect RDMA, InfiniBand / RoCEv2, & Disaggregated KV Transfer (NIXL / Mooncake / LMCache):** **RDMA** (Remote Direct Memory Access) copies memory directly from one server's GPU VRAM to another's over ultra-fast **InfiniBand** or **RoCEv2** (RDMA over Converged Ethernet) networks (200 Gbps = 25 GB/s), orchestrated by KV transfer engines like **NIXL**, **Mooncake**, or **LMCache**.
+
+---
+
 ## 1. Spot / Preemptible GPU Economics & Volatility
 
 Cloud GPU infrastructure is the dominant COGS (Cost of Goods Sold) line item for any LLM inference platform. Hyperscalers and neoclouds sell spare, unreserved GPU capacity as **Spot Instances (AWS)**, **Spot VMs (GCP)**, or **Spot Virtual Machines (Azure)** at steep discounts in exchange for the right to reclaim the VM on short notice.
