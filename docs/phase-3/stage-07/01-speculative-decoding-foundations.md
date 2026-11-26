@@ -34,9 +34,11 @@ Before diving into equations and algorithms, here is every term, hardware concep
 
 ### 1.1 Why Autoregressive Decode Underutilizes Silicon
 
-During autoregressive generation with batch size $B = 1$ (or small $B$), generating a single token requires executing a full forward pass across all $L$ Transformer layers for $1$ query vector per sequence. Every linear projection $W \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}}$ becomes a **matrix-vector multiplication (GEMV)** rather than a matrix-matrix multiplication (GEMM).
+During autoregressive generation with batch size $B = 1$ (or small $B$), generating a single token requires executing a full forward pass across all $L$ Transformer layers for $1$ query vector per sequence. In PyTorch terms, every `nn.Linear(d_in, d_out)` layer multiplies an activation tensor of shape `[1, d_in]` by a weight matrix $W$ of shape `[d_in, d_out]`. Mathematically and physically, this is a **matrix-vector multiplication (GEMV)** rather than a matrix-matrix multiplication (GEMM).
 
-Consider an H100 SXM5 GPU serving a dense 70B parameter model in BF16 ($2\text{ bytes/param}$):
+Why is a GEMV so slow on a modern GPU? A GPU's Tensor Cores can perform hundreds of trillions of multiply-adds per second, but only if the numbers are already sitting in fast on-chip registers. Before any math can happen, the GPU must stream the entire weight matrix $W$ from **HBM** (the GPU's main off-chip memory) across the memory bus. At $B = 1$, each weight number read from HBM is used for only **one** multiply-add before being discarded.
+
+Consider an H100 SXM5 GPU serving a dense 70B parameter model in BF16 ($2\text{ bytes/param}$, totaling $140\text{ GB}$ of weights):
 * **H100 Peak BF16 Tensor Core Compute:** $989\text{ TFLOP/s}$ ($9.89 \times 10^{14}\text{ FLOP/s}$)
 * **H100 Peak HBM3 Bandwidth:** $3.35\text{ TB/s}$ ($3.35 \times 10^{12}\text{ bytes/s}$)
 * **Hardware Ridge Point:**
@@ -57,9 +59,9 @@ The core insight of **Speculative Decoding** (Leviathan et al., 2023; Chen et al
 Suppose a fast mechanism (the **draft** model $M_q$) proposes $\gamma$ candidate future tokens $x_1, x_2, \dots, x_\gamma$ given prefix $x_{\le 0}$. Instead of calling the heavy **target** model $M_p$ $\gamma$ times serially, we concatenate the last accepted token $x_0$ and the $\gamma$ draft tokens into a single input sequence of length $\gamma + 1$:
 $$[x_0, x_1, x_2, \dots, x_\gamma]$$
 
-Using a **causal attention mask** over these $\gamma + 1$ query tokens attending to the existing KV cache $x_{<0}$ plus each other causally:
-1. The target model reads its weights $W$ from HBM **once** (not $\gamma + 1$ times).
-2. All $\gamma + 1$ token representations travel through the layers as a tiny matrix of shape $[B(\gamma + 1), d_{\text{model}}]$.
+If you have trained Transformers in PyTorch, this is identical to **teacher-forced training**: instead of feeding one token at a time, you pass a mini-sequence of $\gamma + 1$ tokens in a single `model(tokens)` call and apply a **causal attention mask** (a lower-triangular mask) so that position $i$ can attend to all historical tokens in the KV cache $x_{<0}$ plus candidate tokens $x_0 \dots x_i$, but never to future candidate tokens $x_{i+1} \dots x_\gamma$:
+1. The target model reads its weights $W$ from HBM **once** (not $\gamma + 1$ times) and reuses those loaded weights across all $\gamma + 1$ token vectors in on-chip registers.
+2. All $\gamma + 1$ token representations travel through the layers together as a small 2D matrix of shape `[B * (gamma + 1), d_model]`, turning GEMVs into a small GEMM.
 3. In a single forward pass, the target model produces $\gamma + 1$ logit vectors and probability distributions simultaneously:
    $$p_1(\cdot) = P_{M_p}(\cdot \mid x_{\le 0}), \quad p_2(\cdot) = P_{M_p}(\cdot \mid x_{\le 0}, x_1), \quad \dots, \quad p_{\gamma+1}(\cdot) = P_{M_p}(\cdot \mid x_{\le 0}, x_1, \dots, x_\gamma)$$
 
@@ -80,6 +82,13 @@ If decoding is strictly **greedy** ($T = 0$), verification is trivial: accept th
 However, production LLM inference frequently uses **stochastic sampling** (temperature $T > 0$, top-$k$, top-$p$ / nucleus sampling). Requiring exact token equality $x_i = \text{sample}(p_i)$ would reject valid high-probability tokens and collapse throughput, while naively accepting draft tokens whenever $q(x) > 0$ would corrupt the target distribution $p(x)$ into $q(x)$.
 
 Speculative decoding solves this via **modified rejection sampling** (also known as speculative sampling), which guarantees **exact, lossless preservation** of the target distribution $p(x)$ for every token position.
+
+The intuition is straightforward:
+* Whenever the draft model **under-predicts** a token ($q(x) < p(x)$), we should **always accept** it if proposed ($\min(1, p(x)/q(x)) = 1$), and make up the missing probability mass $p(x) - q(x)$ later when another token gets rejected.
+* Whenever the draft model **over-predicts** a token ($q(x) > p(x)$), we should **sometimes reject** it—accepting only a fraction $p(x)/q(x)$ of the time—so that the total probability of emitting $x$ equals $q(x) \cdot (p(x)/q(x)) = p(x)$ and never exceeds $p(x)$.
+* Whenever a rejection happens, we resample a replacement token from the **residual distribution** $\text{norm}(\max(0, p - q))$, which puts probability mass *exclusively* on the tokens that the draft model under-predicted. The intuition is simple:
+* If the target model likes the proposed token $x_i$ **at least as much** as the draft model ($p_i(x_i) \ge q_i(x_i)$), we always accept $x_i$ (acceptance probability $1$).
+* If the draft model was **overconfident** on $x_i$ ($q_i(x_i) > p_i(x_i)$), we accept $x_i$ only with probability $p_i(x_i) / q_i(x_i)$ to trim back the draft's over-sampling, and whenever we reject, we draw a replacement from the **residual distribution**—which shifts probability mass onto the tokens where the target model was *under-represented* ($p_i(x) > q_i(x)$).
 
 ### 2.2 Step-by-Step Algorithm
 
@@ -153,7 +162,7 @@ def speculative_verify_step(
 1. **Logit Processing Symmetry:** If temperature $T$, `top_k`, `top_p`, or grammar masks are applied to $M_p$, the **exact transformed target distribution** $p_i(x)$ must be used in rejection sampling. Applying temperature/top-$p$ to $q_i(x)$ as well increases alignment (higher $\alpha$) without ever compromising exactness—because exactness depends *only* on $p_i(x)$ being the desired target distribution.
 2. **Numerical Stability ($q_i(x) = 0$):** If $x_i$ was genuinely sampled from $q_i$, then $q_i(x_i) > 0$. However, in FP16/BF16 arithmetic or after top-$p$ truncation bugs, $q_i(x_i)$ can underflow to $0$. Always compute probabilities and `residual = max(0, p - q)` in **FP32**.
 3. **Guaranteed Forward Progress:** Every round emits **at least 1 token** (even if $x_1$ is rejected immediately, $x'_1$ is resampled from $p'_1$ and emitted) and **at most $\gamma + 1$ tokens**.
-4. **KV Cache Rollback:** During verification of $[x_0, x_1, \dots, x_\gamma]$, the target model writes KV entries for positions $\text{pos}_0, \text{pos}_0 + 1, \dots, \text{pos}_0 + \gamma$. If $x_k$ is the first rejected token ($1 \le k \le \gamma$), only $x_0, \dots, x_{k-1}$ are valid prefix tokens; KV entries for $x_k, \dots, x_\gamma$ must be discarded (by rolling back the sequence length pointer / freeing physical PagedAttention blocks), and $x'_k$ will be fed as the next round's $x_0$. Note that even if all $\gamma$ tokens are accepted, the KV entry for $x_\gamma$ *was* computed during verification, while the bonus token $x_{\gamma+1}$ has not yet had its KV entry computed—so $x_{\gamma+1}$ becomes the next round's $x_0$!
+4. **KV Cache Rollback:** During verification of $[x_0, x_1, \dots, x_\gamma]$, the target model writes KV entries for positions $\text{pos}_0, \text{pos}_0 + 1, \dots, \text{pos}_0 + \gamma$. Think of the KV cache as a pre-allocated PyTorch buffer `k_cache[:, :max_len, :]` paired with an integer cursor `seq_len` that marks how many tokens are currently valid. Rolling back does not require zeroing out GPU memory; it simply decrements `seq_len` back to the last accepted position so future steps overwrite the rejected tail slots (or, in PagedAttention, decrements reference counts and frees any physical memory blocks that belong exclusively to the rejected suffix). Specifically, if $x_k$ is the first rejected token ($1 \le k \le \gamma$), only $x_0, \dots, x_{k-1}$ are valid prefix tokens; KV entries for $x_k, \dots, x_\gamma$ must be discarded, and $x'_k$ will be fed as the next round's $x_0$. Note that even if all $\gamma$ tokens are accepted, the KV entry for $x_\gamma$ *was* computed during verification, while the bonus token $x_{\gamma+1}$ has not yet had its KV entry computed—so $x_{\gamma+1}$ becomes the next round's $x_0$!
 
 ---
 

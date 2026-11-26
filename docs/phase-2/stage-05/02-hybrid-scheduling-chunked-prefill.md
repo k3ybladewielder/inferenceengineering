@@ -26,7 +26,7 @@ When an LLM server handles many users at once, a single huge incoming prompt can
 
 ## 1. The Prefill–Decode Interference Problem
 
-Continuous batching (iteration-level scheduling) eliminates waiting until every request in a batch hits `<EOS>`, allowing new requests to join mid-generation. However, naive continuous batching still suffers from **prefill-decode interference** because prefill and decode have fundamentally incompatible latency footprints.
+Continuous batching (iteration-level scheduling) eliminates waiting until every request in a batch hits `<EOS>`, allowing new requests to join mid-generation. In a standard PyTorch `model(input_ids)` call, every sequence in the batch must finish the forward pass before sampling can emit the next token. Because prefill and decode have fundamentally incompatible compute durations, naive continuous batching still suffers from **prefill-decode interference**.
 
 ### 1.1 Why Unchunked Prefill Causes "Generation Stalls" (ITL Spikes)
 
@@ -84,7 +84,7 @@ In BF16 ($b_{\text{w}} = 2$ bytes):
 * **Pure Decode ($B_{\text{dec}} = 32$):** $I_{\text{GEMM}} \approx 32\text{ FLOPs/byte}$. Tensor Cores sit at **$\sim 10.8\%$ utilization** ($32 / 295$); the GPU spends ~89% of its cycle budget stalled waiting on HBM weight fetches!
 * **Mixed Batch ($32\text{ decode} + 256\text{ prefill chunk} = 288\text{ tokens}$):** $I_{\text{GEMM}} \approx 288\text{ FLOPs/byte} \approx I_{\text{ridge}}$.
 
-Because weight matrices $W$ are already streamed from HBM once per forward step for the 32 decode tokens, processing an extra $256$ prefill tokens **reuses those exact same fetched weights in SRAM/registers**. Therefore, adding $256$ prefill tokens saturates otherwise idle Tensor Cores while adding minimal marginal latency to the step—creating a **compute-saturated ("stall-free") schedule** where ITL stays bounded (e.g., $30$–$55\text{ ms}$) across all iterations!
+Because weight matrices $W$ of shape `[d_in, d_out]` are already streamed from HBM into on-chip SRAM/registers once per forward step for the 32 decode tokens, processing an extra $256$ prefill tokens **reuses those exact same fetched weights in SRAM/registers**. Conceptually, once `W` is loaded onto the chip, multiplying `[288, d_in] @ [d_in, d_out]` takes nearly the same wall-clock time as `[32, d_in] @ [d_in, d_out]` until the GPU hits its compute ceiling (`I_ridge`). Therefore, adding $256$ prefill tokens saturates otherwise idle Tensor Cores while adding minimal marginal latency to the step—creating a **compute-saturated ("stall-free") schedule** where ITL stays bounded (e.g., $30$–$55\text{ ms}$) across all iterations!
 
 > [!TIP]
 > **Tuning `max_num_batched_tokens`:**
@@ -100,9 +100,9 @@ Mixing decode tokens (which each attend to 1 query against $S_i$ past KV tokens)
 ### 3.1 Linear Projections vs. Attention Splitting
 
 1. **QKV, Output Projection, MLP, RMSNorm, Residual Add (Token-Independent):**
-   These operators act identically on every token regardless of whether it came from a prefill chunk or a decode sequence. They execute as **one fused GEMM** over the concatenated $[T_{\text{batch}}, d_{\text{model}}]$ activation matrix—maximizing Tensor Core tile efficiency (`128x256` MMA tiles).
+   These operators act identically on every token regardless of whether it came from a prefill chunk or a decode sequence. Instead of padding sequences into a 3D `[B, max_seq_len, d_model]` PyTorch tensor (which wastes compute and memory on `<pad>` zeros), the engine packs all active tokens end-to-end into a 2D ragged matrix of shape `[T_batch, d_model]` and executes **one fused GEMM**—maximizing Tensor Core tile efficiency (`128x256` MMA tiles).
 2. **RoPE (Rotary Position Embeddings):**
-   RoPE depends on each token's exact `position_id` (e.g., a decode token at position $4{,}091$, or a 3rd prefill chunk covering positions $[1024, 1535]$). The fused RoPE kernel indexes a 1D `positions[T_batch]` metadata array.
+   RoPE depends on each token's exact `position_id` (e.g., a decode token at position $4{,}091$, or a 3rd prefill chunk covering positions $[1024, 1535]$). Because tokens are flattened into `[T_batch, d_model]`, the fused RoPE kernel indexes a parallel 1D `positions[T_batch]` metadata array to apply the right rotation angle to each row.
 3. **Self-Attention (Sequence-Dependent — Must Handle Asymmetric $L_q \neq L_{kv}$):**
    Unlike initial unchunked prefill (where $L_q = L_{kv}$) or pure decode (where $L_q = 1, L_{kv} = S$), a **chunked prefill step** has:
    $$L_q = c \quad \text{and} \quad L_{kv} = S_{\text{prefix}} + c \quad (\text{with } S_{\text{prefix}} > 0\text{ for chunk } \ge 2)$$
@@ -113,7 +113,7 @@ In Chunk 2 of a 2048-token prompt with chunk size $512$:
 * Tokens $[0, 511]$ were already written into physical KV blocks during Chunk 1.
 * Chunk 2 passes query tokens $[512, 1023]$ ($L_q = 512$) and attends over KV positions $[0, 1023]$ ($L_{kv} = 1024$).
 * Query index $q_{\text{local}} \in [0, 511]$ corresponds to absolute sequence position $p = S_{\text{prefix}} + q_{\text{local}} = 512 + q_{\text{local}}$.
-* Therefore, the **causal mask** must allow query $q_{\text{local}}$ to attend to all KV positions $k \in [0, S_{\text{prefix}} + q_{\text{local}}]$—i.e., **bottom-right aligned causal masking** (standard in FlashAttention-2/3 via `causal=True` when `q_len <= kv_len`, where diagonal shifts by `kv_len - q_len`). If a kernel erroneously uses top-left causal masking (`k <= q_local`), Chunk 2's queries would fail to attend to Chunk 1's cached prefix `[0..511]`, silently destroying model accuracy!
+* In standard PyTorch, `torch.tril(torch.ones(512, 1024))` aligns the diagonal at the **top-left** (`k <= q_local`), which would restrict Chunk 2's first token ($q_{\text{local}} = 0$) to see only KV position `0` and blind it to `[1..511]`! Instead, the **causal mask** must allow query $q_{\text{local}}$ to attend to all KV positions $k \in [0, S_{\text{prefix}} + q_{\text{local}}]$—i.e., **bottom-right aligned causal masking** (standard in FlashAttention-2/3 via `causal=True` when `q_len <= kv_len`, where the diagonal shifts right by `kv_len - q_len`).
 
 ### 3.3 Write-Before-Read KV Cache Semantics & Kernel Dispatch
 

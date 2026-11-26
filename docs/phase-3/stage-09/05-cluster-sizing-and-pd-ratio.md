@@ -82,11 +82,11 @@ $$N_D^{\text{bw}} = \left\lceil \frac{\lambda \cdot \bar{L}_{\text{out}}}{\eta_D
 
 Decode GPUs are frequently **HBM capacity-bound** before they are HBM bandwidth-bound—especially on long-context workloads ($L_{\text{in}} = 32\text{k}$) where each active decode sequence holds a multi-gigabyte KV cache for seconds!
 
-By **Little's Law**, the average number of concurrent active requests in the Decode Pool is:
+By **Little's Law**, the average number of concurrent active requests sitting in the Decode Pool equals the arrival rate multiplied by how long each request stays in Decode ($\bar{T}_{\text{decode}}$):
 
 $$N_{\text{conc}} = \lambda \cdot \bar{T}_{\text{decode}} = \lambda \cdot \left(\bar{L}_{\text{out}} \cdot \text{ITL}_{\text{avg}}\right)$$
 
-During its lifetime in Decode, an average request occupies KV memory for all prompt tokens plus half of its generated tokens ($\bar{L}_{\text{in}} + \frac{1}{2}\bar{L}_{\text{out}}$), plus any prefix cache retention buffer factor $\gamma_{\text{cache}} \ge 1$ (e.g., $\gamma_{\text{cache}} = 1.25$ to retain warm prefixes):
+For example, if $\lambda = 20\text{ req/s}$ and each request generates $\bar{L}_{\text{out}} = 800$ tokens at $\text{ITL}_{\text{avg}} = 25\text{ ms}$, each request occupies Decode HBM for $20\text{ s}$, meaning $N_{\text{conc}} = 20 \times 20 = 400$ active KV caches must reside in HBM simultaneously. During its lifetime in Decode, an average request occupies KV memory for all prompt tokens plus half of its generated tokens ($\bar{L}_{\text{in}} + \frac{1}{2}\bar{L}_{\text{out}}$), plus any prefix cache retention buffer factor $\gamma_{\text{cache}} \ge 1$ (e.g., $\gamma_{\text{cache}} = 1.25$ to retain warm prefixes):
 
 $$N_D^{\text{mem}} = \left\lceil \frac{\gamma_{\text{cache}} \cdot \lambda \cdot \bar{L}_{\text{out}} \cdot \text{ITL}_{\text{avg}} \cdot \left(\bar{L}_{\text{in}} + \frac{1}{2}\bar{L}_{\text{out}}\right) \cdot \text{KV}_{\text{bytes/tok}}}{\text{VRAM}_{\text{KV\_per\_GPU}}} \right\rceil$$
 
@@ -108,7 +108,9 @@ Why can't we simply set $\eta_P = \eta_D = 0.95$? By **Kingman's M/G/1 Queueing 
 
 $$W_q \approx \left(\frac{\eta}{1 - \eta}\right) \cdot \left(\frac{C_a^2 + C_s^2}{2}\right) \cdot \bar{S}_{\text{service}}$$
 
-* **Prefill has extreme service-time variance ($C_s^2 \gg 1$):** Prompts vary from 100 tokens (~8 ms) to 64,000 tokens (~5,000 ms). A single 64k prompt blocks a Prefill instance for seconds, creating massive queueing spikes for small prompts behind it unless $\eta_P$ is kept conservative (**$\eta_P \approx 0.60\text{–}0.75$**) or long prompts are routed to a dedicated long-context prefill lane.
+Notice two multiplicative traps in this equation: first, $\frac{\eta}{1 - \eta}$ explodes hyperbolically as utilization $\eta \to 1$ (moving from $\eta = 0.70$ to $\eta = 0.95$ multiplies queue wait by **8.1x**); second, $C_a^2 + C_s^2$ amplifies wait time whenever traffic arrives in bursts ($C_a^2$) or requests have wildly different execution times ($C_s^2$):
+
+* **Prefill has extreme service-time variance ($C_s^2 \gg 1$):** Prompts vary from 100 tokens (~8 ms) to 64,000 tokens (~5,000 ms). A single 64k prompt acts like a slow truck blocking a single-lane road, stalling small prompts behind it for seconds unless $\eta_P$ is kept conservative (**$\eta_P \approx 0.60\text{–}0.75$**) or long prompts are routed to a dedicated long-context prefill lane.
 * **Decode has low per-step variance ($C_s^2 \ll 1$):** Continuous Batching smooths iteration steps to ~20–30 ms each, allowing higher sustainable utilization (**$\eta_D \approx 0.80\text{–}0.85$**) without blowing P99 ITL.
 
 ---
@@ -174,7 +176,7 @@ Modern disaggregated control planes (NVIDIA Dynamo Planner, Splitwise Mixed/Elas
 
 ### Why Role-Switching Is Fast (Seconds vs. Minutes)
 
-Loading a 70B–671B model checkpoint from S3/NVMe into GPU HBM takes **30–180 seconds** (cold start). However, Prefill and Decode instances hold the **exact same model weights** in GPU HBM! Converting a Decode worker into a Prefill worker (or vice versa) requires **zero weight reloading**—only reconfiguring the scheduler mode, CUDA Graph batch shapes, and KV block allocator reservation.
+Loading a 70B–671B model checkpoint (`safetensors`) from S3/NVMe into GPU HBM takes **30–180 seconds** (cold start). However, Prefill and Decode instances hold the **exact same model weights** (`state_dict`) in GPU HBM! Converting a Decode worker into a Prefill worker (or vice versa) requires **zero weight reloading**—only reconfiguring the scheduler mode, CUDA Graph batch shapes, and KV block allocator reservation in memory.
 
 ### Step-by-Step Elastic Rebalancing Protocol
 

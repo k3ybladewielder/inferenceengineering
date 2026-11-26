@@ -37,7 +37,7 @@ If you apply pure **Tensor Parallelism ($\text{TP} = 8$ or $16$)** to an MoE lay
 
 **Expert Parallelism (EP)** solves this by partitioning the $E$ experts **across $N_{\text{EP}}$ GPUs** without slicing individual expert weight matrices along $d_{\text{expert}}$:
 * Each GPU rank $r \in \{0, \dots, N_{\text{EP}}-1\}$ holds $E / N_{\text{EP}}$ complete experts (e.g., for $E = 256, N_{\text{EP}} = 64$, each GPU holds $4$ full experts).
-* Instead of replicating tokens and reducing weights, **tokens move to the GPUs holding their selected experts** via two `AllToAll` collectives per MoE layer.
+* Instead of keeping tokens stationary and splitting each expert's weights across GPUs (which produces tiny, inefficient matrix slices), **tokens dynamically travel across the network to whichever GPUs hold their selected experts**, execute full-width matrix multiplications locally, and return via two `AllToAll` collectives per MoE layer.
 
 ### 1.2 Token Dispatch & Combine Lifecycle (`AllToAll`)
 
@@ -46,10 +46,10 @@ Consider a batch of $T$ tokens on each DP/attention rank (with hidden dimension 
 1. **Local Gate & Routing Metadata:** Each GPU computes router logits $g = \text{softmax}(X W_{\text{gate}})$ and selects top-$k$ experts $(e_{i,1}, \dots, e_{i,k})$ with gating weights $(w_{i,1}, \dots, w_{i,k})$ for every local token $i \in \{1, \dots, T\}$.
 2. **Metadata Exchange (`AllGather` or small `AllToAll`):** Ranks exchange per-rank token destination counts `send_counts[r]` so every GPU knows how many variable-length tokens it will receive from each peer (required for `ncclAllToAllv` / dynamic buffer allocation, unless fixed capacity padding is used).
 3. **Token Permute & Dispatch (`AllToAll` #1):**
-   * Each rank packs tokens contiguous by destination GPU rank (duplicating token $i$ up to $k$ times—once for each selected expert on a distinct rank, or deduplicating per destination node in hierarchical node-limited routing!).
-   * Executes `AllToAll` (specifically `AllToAllv` for variable counts) to route token hidden states $[T \cdot k, d]$ across the $N_{\text{EP}}$ GPUs.
+   * Each rank packs tokens contiguous by destination GPU rank (like sorting a tensor by `dest_rank` so each peer's slice is contiguous in memory, duplicating token $i$ up to $k$ times—once for each selected expert on a distinct rank, or deduplicating per destination node in hierarchical node-limited routing!).
+   * Executes `AllToAll` (specifically `AllToAllv` for variable counts, analogous to `torch.distributed.all_to_all_single` with uneven splits) to route token hidden states $[T \cdot k, d]$ across the $N_{\text{EP}}$ GPUs.
 4. **Local Grouped GEMM (Expert Execution):**
-   * Each GPU receives all tokens assigned to its local $E/N_{\text{EP}}$ experts from across the entire cluster and runs a single **Grouped GEMM** (`torch._grouped_mm` / CUTLASS Grouped GEMM) over its local experts.
+   * Each GPU receives all tokens assigned to its local $E/N_{\text{EP}}$ experts from across the entire cluster and runs a single **Grouped GEMM** (`torch._grouped_mm` / CUTLASS Grouped GEMM)—which executes many differently sized `[n_tokens_e, d] @ [d, d_expert]` matrix multiplications in a single GPU kernel launch rather than looping in Python.
    * Because tokens from $N_{\text{EP}}$ different GPUs are pooled together, each expert receives $N_{\text{EP}}\times$ more tokens per batch—raising GEMM arithmetic intensity dramatically!
 5. **Token Combine (`AllToAll` #2) & Weighted Reduction:**
    * A second `AllToAll` sends computed expert outputs back to their originating GPUs.
@@ -95,15 +95,15 @@ Two dominant algorithms solve cross-chunk attention: **DeepSpeed-Ulysses** and *
 
 ### 2.1 DeepSpeed-Ulysses (`AllToAll` Head-Switch)
 
-**DeepSpeed-Ulysses** (Jacobs et al., 2023) avoids distributed attention math completely by **transposing the sharding axis** from *sequence* to *attention heads* right before FlashAttention:
+**DeepSpeed-Ulysses** (Jacobs et al., 2023) avoids writing custom distributed attention math completely by **transposing the sharding axis across GPUs**—analogous to calling `tensor.transpose(1, 2)` across machines—switching from *sequence-sharded* to *head-sharded* right before FlashAttention:
 
-1. **Sequence-Sharded Input:** Each of the $P$ GPUs holds a local sequence shard of length $S/P$, shape $[B, S/P, d]$, and computes local Q, K, V projections independently:
+1. **Sequence-Sharded Input:** Each of the $P$ GPUs holds a local sequence shard of length $S/P$, shape `[B, S/P, d]`, and computes local Q, K, V projections independently (`nn.Linear` operates token-by-token, so it needs no cross-GPU communication):
    $$Q^{(r)}, K^{(r)}, V^{(r)} \in \mathbb{R}^{B \times (S/P) \times H \times d_h}$$
 2. **Pre-Attention `AllToAll` (Sequence-Split $\to$ Head-Split):**
-   * Execute `AllToAll` on $Q, K, V$ across the $P$ GPUs.
+   * Execute `AllToAll` on $Q, K, V$ across the $P$ GPUs: each GPU splits its `[B, S/P, H, d_h]` tensor into $P$ head-groups of size $H/P$ and sends group $j$ to GPU $j$, while receiving the remaining sequence chunks for its own $H/P$ heads. In PyTorch terms, this is a distributed tensor transpose swapping the sequence dimension with the head dimension.
    * Each GPU transitions from holding *(part of sequence, all $H$ heads)* to holding ***(entire sequence $S$, only $H/P$ heads)***:
      $$Q_{\text{head}}^{(r)}, K_{\text{head}}^{(r)}, V_{\text{head}}^{(r)} \in \mathbb{R}^{B \times S \times (H/P) \times d_h}$$
-3. **Local Exact FlashAttention:** Because each GPU now possesses the **full sequence $S$** for its $H/P$ heads, it runs standard single-GPU FlashAttention-2/3 locally with **zero custom distributed attention kernels** and native causal masking!
+3. **Local Exact FlashAttention:** Because each GPU now possesses the **full sequence $S$** for its $H/P$ heads, it runs standard single-GPU FlashAttention-2/3 locally (just like `F.scaled_dot_product_attention`) with **zero custom distributed attention kernels** and native causal masking!
 4. **Post-Attention `AllToAll` (Head-Split $\to$ Sequence-Split):**
    * Execute one more `AllToAll` on the attention output $O_{\text{head}}^{(r)} \in \mathbb{R}^{B \times S \times (H/P) \times d_h}$ to switch back to sequence-sharded layout $[B, S/P, d]$ for the Row/MLP layers.
 
@@ -119,6 +119,8 @@ Two dominant algorithms solve cross-chunk attention: **DeepSpeed-Ulysses** and *
 **Ring Attention** (Liu et al., 2023) keeps **queries $Q^{(r)} \in \mathbb{R}^{B \times (S/P) \times H \times d_h}$ stationary** on GPU $r$ and circulates the $K, V$ blocks in a **logical ring** across all $P$ GPUs using asynchronous point-to-point `Send`/`Recv` overlapped with FlashAttention compute.
 
 #### Mathematical Mechanics (Blockwise Online Softmax)
+Why can't each GPU just compute `softmax(Q_r @ K_j.T) @ V_j` on each chunk and average the results? Because `softmax` normalizes by $\sum_j \exp(\cdot)$ across the **entire** sequence—you cannot know the true denominator until you have seen every $K_j$ chunk! **Online Softmax** solves this by tracking a running maximum $m_r$ and running exponential sum $l_r$ so previous partial outputs can be mathematically rescaled whenever a new chunk arrives with a larger maximum score.
+
 Suppose GPU $r$ holds local query chunk $Q^{(r)}$ and receives block $K^{(j)}, V^{(j)}$ at ring step $t$:
 1. **Local Tile Attention:** GPU $r$ runs FlashAttention on $(Q^{(r)}, K^{(j)}, V^{(j)})$ to obtain local block output $\tilde{O}_{r,j}$, local row-wise max $m_{r,j}$, and local log-sum-exp denominator $l_{r,j} = \sum \exp(S_{r,j} - m_{r,j})$.
 2. **Exact Online Softmax Merge:** GPU $r$ updates its running accumulators $(O_r, m_r, l_r)$ using exact FlashAttention rescaling:

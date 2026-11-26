@@ -4,7 +4,7 @@
 
 ---
 
-When serving Large Language Models (LLMs), different users and multi-turn conversations often send requests that start with the exact same opening text—such as system instructions or shared documents. This lesson explains how inference engines save and reuse the intermediate math from those shared openings so the GPU does not have to recompute them from scratch.
+When serving Large Language Models (LLMs), different users and multi-turn conversations often send requests that start with the exact same opening text—such as system instructions or shared documents. This lesson explains how inference engines save and reuse the intermediate Key and Value tensors from those shared openings so the GPU does not have to recompute them anew on every request.
 
 ## Core Concepts & Terminology
 
@@ -34,17 +34,17 @@ When serving Large Language Models (LLMs), different users and multi-turn conver
 
 During autoregressive LLM serving, request execution splits into two phases with opposite hardware bottlenecks:
 
-1. **Prefill:** Processes all $N_{\text{prompt}}$ input tokens in parallel. Because all tokens are known upfront, linear projections ($Q, K, V, O$, and MLP up/gate/down) execute as large GEMMs (`[N_prompt, d_model] x [d_model, d_out]`). Prefill is **compute-bound** on Tensor Cores; its latency scales roughly linearly with $N_{\text{prompt}}$ (and quadratically $O(N_{\text{prompt}}^2)$ in the attention score matrix $QK^\top$ at ultra-long contexts).
-2. **Decode:** Generates 1 token per sequence per forward pass, reading all model weights and all cached KV blocks from HBM. Decode is **memory-bandwidth-bound**.
+1. **Prefill:** Processes all $N_{\text{prompt}}$ input tokens in parallel. In PyTorch terms, all token embeddings are stacked into a single matrix of shape `[N_prompt, d_model]`, so linear projections ($Q, K, V, O$, and MLP up/gate/down) execute as large dense matrix multiplications (`[N_prompt, d_model] @ [d_model, d_out]`). Because the GPU performs many math operations for every weight byte loaded from memory, prefill is **compute-bound** on Tensor Cores; its latency scales roughly linearly with $N_{\text{prompt}}$ (and quadratically $O(N_{\text{prompt}}^2)$ in the attention score matrix $QK^\top$ at ultra-long contexts).
+2. **Decode:** Generates 1 token per sequence per forward pass. With $B$ active requests, the input matrix has shape `[B, d_model]` (typically a thin matrix), yet the GPU must still stream all model weights and all cached KV blocks from HBM for every single step. Because data movement dominates arithmetic, decode is **memory-bandwidth-bound**.
 
 In real production traffic, requests rarely start from an empty, unique context:
 
 * **System Prompts & Tool Schemas:** Enterprise agents prepend $2\text{K}$–$16\text{K}$ tokens of instructions, JSON schemas, and safety policies to *every* API call.
 * **Few-Shot / In-Context Learning:** Static exemplars ($1\text{K}$–$8\text{K}$ tokens) precede variable user queries.
-* **Multi-Turn Conversations & Tool-Calling Loops:** A 10-turn agent trajectory sends $[P_0, U_1, A_1, T_1, U_2, A_2, \dots, U_{10}]$. Without prefix caching, Turn 10 recomputes the KV tensors of turns $1\dots 9$ from scratch.
+* **Multi-Turn Conversations & Tool-Calling Loops:** A 10-turn agent trajectory sends $[P_0, U_1, A_1, T_1, U_2, A_2, \dots, U_{10}]$. Without prefix caching, Turn 10 recomputes the KV tensors of turns $1\dots 9$ all over again.
 * **Tree-of-Thoughts / Best-of-$N$ / Beam Search:** Multiple candidate continuations branch from an identical root prompt.
 
-Because Transformer attention is **causal** (token $t$ depends only on tokens $0 \dots t$), the Key and Value tensors $K_l[0:P], V_l[0:P]$ at every layer $l \in [0, L-1]$ for a prefix of length $P$ are **pure, deterministic functions of the prefix tokens $[t_0, t_1, \dots, t_{P-1}]$** (plus model weights and active LoRA adapter ID). If those KV tensors are retained in memory and keyed by the exact prefix identity, any subsequent request sharing the first $P$ tokens skips prefill computation for $[0, P)$ entirely and computes only the **delta suffix** $[P, N_{\text{prompt}})$.
+Because Transformer attention is **causal** (each token $t$ is masked from seeing any token $> t$, so row $t$ of the attention output depends *only* on rows $0 \dots t$), the Key and Value tensors $K_l[0:P], V_l[0:P]$ at every layer $l \in [0, L-1]$ for a prefix of length $P$ are **pure, deterministic functions of the prefix tokens $[t_0, t_1, \dots, t_{P-1}]$** (plus model weights and active LoRA adapter ID). Changing or appending tokens after position $P-1$ cannot retroactively alter $K_l[0:P]$ or $V_l[0:P]$. Therefore, if those KV tensors are retained in memory and keyed by the exact prefix identity, any subsequent request sharing the first $P$ tokens skips prefill computation for $[0, P)$ entirely and computes only the **delta suffix** $[P, N_{\text{prompt}})$.
 
 ### Quantitative TTFT Collapse
 
@@ -61,7 +61,7 @@ Prefix reuse achieves a **$\sim 42\times$ reduction in TTFT** and frees $3.23\te
 
 ## 2. Paradigm A: Block-Hash Automatic Prefix Caching (vLLM APC)
 
-vLLM builds prefix reuse directly atop **PagedAttention**, where KV memory is partitioned into fixed-size physical blocks of $B$ tokens (typically $B = 16$ or $B = 32$ tokens per block). A sequence's logical KV cache is an ordered array of physical block IDs (`block_table`).
+vLLM builds prefix reuse directly atop **PagedAttention**, where KV memory is partitioned into fixed-size physical blocks of $B$ tokens (typically $B = 16$ or $B = 32$ tokens per block). Instead of allocating one giant contiguous `torch.empty(S, H_kv, d_head)` tensor per request—which fragments memory and prevents sharing—the engine pre-allocates one global KV pool tensor of shape `[num_blocks, B, H_kv, d_head]` per layer. Each sequence's logical KV cache is simply an ordered list of integer indices into that global pool (`block_table`, e.g., `[42, 87, 103]`). Because `block_table` is just a list of pointers, two requests can include the same physical block ID `42` in their `block_table` without copying a single byte of tensor data (**zero-copy sharing**).
 
 ### 2.1 Why Naive Block Hashing Fails (The False-Match Hazard)
 
@@ -97,10 +97,10 @@ Earlier vLLM versions used `hash()` (Python's SipHash, unstable across processes
 
 ### 2.4 Lookup & Allocation Mechanics in vLLM
 
-1. **Sequential Prefix Walk:** When a request arrives with tokens $T[0:N]$, the scheduler slices $T$ into $\lfloor N/B \rfloor$ full blocks and computes `hash_0, hash_1, ...` sequentially.
-2. **Contiguous Prefix Hit Rule:** Lookup stops at the **first miss** at block index $k$. Even if `hash_{k+1}` somehow existed in the table (impossible unless a collision occurred), you cannot reuse block $k+1$ without block $k$'s prefix intact—Wait: actually, if block $k$ misses, every subsequent chained hash `hash_{k+1}` differs from any previously cached block unless `hash_k` itself matched, OR unless an earlier prefix `[0..k]` was evicted while `[0..k+1]` stayed! Because LRU eviction removes **leaf** blocks before parent blocks (or tracks dependency), a contiguous prefix walk from $i = 0$ guarantees that if block $k$ is missing, we stop immediately at $k$ and mark `[kB : N]` for prefill computation.
-3. **Copy-on-Write / Refcount Pinning:** Hit blocks $[0 \dots k-1]$ have their `ref_count` incremented and are appended directly to the request's `block_table`. Their physical VRAM frames are shared zero-copy across all concurrent requests using that prefix.
-4. **Edge Case — Last Token Logit Requirement:** If **100%** of the prompt hits in cache ($N = kB$, all blocks cached), the attention kernel still needs to produce the logits for token $N-1$ to sample the *first* generated token! Therefore, vLLM (and SGLang) intentionally recomputes at least the **final 1 token** (or final partial block) if the entire prompt is an exact cached match, ensuring the model executes one forward pass to emit `logits[N-1]`.
+1. **Sequential Prefix Walk:** When a request arrives with tokens $T[0:N]$, the scheduler slices $T$ into $\lfloor N/B \rfloor$ full blocks and computes `hash_0, hash_1, ...` sequentially in Python/C++ before launching any GPU kernel.
+2. **Contiguous Prefix Hit Rule:** Lookup checks `cached_blocks` from $i = 0$ upward and stops at the **first miss** at block index $k$. Because each hash chains from the previous block (`hash_{i} = H(hash_{i-1}, ...)`), a miss at block $k$ means every subsequent chained hash `hash_{k+1}` will also differ from any unrelated prefix, and leaf-first eviction guarantees that an earlier prefix `[0..k]` is never evicted while `[0..k+1]` remains cached. Thus, a single sequential walk from $i = 0$ safely identifies the exact longest cached prefix `[0 : kB)` and marks only `[kB : N)` for GPU prefill computation.
+3. **Copy-on-Write / Refcount Pinning:** Hit blocks $[0 \dots k-1]$ have their `ref_count` incremented (analogous to Python's reference counter keeping a shared `torch.Tensor` storage alive) and are appended directly to the request's `block_table`. Their physical VRAM frames are shared zero-copy across all concurrent requests using that prefix, and the memory allocator cannot overwrite them while `ref_count > 0`.
+4. **Edge Case — Last Token Logit Requirement:** If **100%** of the prompt hits in cache ($N = kB$, all blocks cached), skipping the forward pass entirely would leave the engine with no `logits[:, -1, :]` tensor for token $N-1$ from which to sample the *first* generated token! Therefore, vLLM (and SGLang) intentionally recomputes at least the **final 1 token** (or final partial block) whenever the entire prompt is an exact cached match, ensuring the model executes one forward pass to emit `logits[N-1]`.
 
 ---
 

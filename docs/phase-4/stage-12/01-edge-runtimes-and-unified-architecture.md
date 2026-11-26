@@ -53,7 +53,8 @@ Moving autoregressive LLM inference from data-center accelerators (H100/B200 wit
 
 ## 2. `llama.cpp` and the GGUF Binary Format
 
-`llama.cpp` (built atop the `ggml` tensor library) is the canonical C/C++ edge inference runtime engineered to execute quantized transformers across heterogeneous CPU SIMD (`AVX2`, `AVX-512`, `AMX`, `ARM NEON`/`i8mm`/`SME`) and GPU backends (`CUDA`, `Metal`, `Vulkan`, `SYCL`).
+
+`llama.cpp` (built atop the `ggml` tensor library) is the canonical C/C++ edge inference runtime engineered to execute quantized transformers across heterogeneous CPU SIMD (`AVX2`, `AVX-512`, `AMX`, `ARM NEON`/`i8mm`/`SME`) and GPU backends (`CUDA`, `Metal`, `Vulkan`, `SYCL`). Unlike server GPUs that hold the entire model in dedicated HBM, consumer laptops and browsers must either split layers between CPU RAM and discrete GPU VRAM or share a single unified memory pool on Apple Silicon:
 
 ### 2.1 GGUF Binary Layout & Zero-Copy `mmap()` Mechanics
 
@@ -114,7 +115,7 @@ Introduced to eliminate outlier sensitivity without exploding scale overhead, **
 
 #### IQ-Quants (`IQ2_XXS`, `IQ3_S`, `IQ4_XS`, `IQ4_NL`) — Lattice & Importance-Matrix Quantization
 Below 4 bits per weight, scalar uniform grids degrade severely. **IQ-quants** combine two techniques:
-1. **Importance Matrix (`imatrix`):** Computed beforehand by running a short calibration corpus through the FP16 model and recording activation squared magnitudes $I_j = \sum_t x_{t,j}^2$ per input channel $j$. Quantization minimizes weighted reconstruction error $\sum_j I_j (W_{ij} - \hat{W}_{ij})^2$, protecting salient weight channels.
+1. **Importance Matrix (`imatrix`):** Computed beforehand by running a short calibration corpus through the FP16 model and recording activation squared magnitudes $I_j = \sum_t x_{t,j}^2$ per input channel $j$ (conceptually measuring which columns of `x` carry the largest signal energy in `y = x @ W.T`). Quantization minimizes weighted reconstruction error $\sum_j I_j (W_{ij} - \hat{W}_{ij})^2$, protecting salient weight channels.
 2. **Non-Linear & Vector Lattice Codebooks:**
    * **`IQ4_NL` / `IQ4_XS` ($\sim 4.25\text{ bpw}$):** Replaces uniform 4-bit integers with a fixed 16-entry non-linear Gaussian-optimal lookup table (`kvalues_iq4nl = [-127, -104, ..., 113]`) indexed by 4-bit nibbles, trading negligible LUT latency in registers/shared memory for lower quantization MSE.
    * **`IQ2_XXS` ($\sim 2.06\text{ bpw}$) / `IQ3_XXS` ($\sim 3.06\text{ bpw}$):** Uses **vector quantization over an E8-lattice-inspired codebook**. Groups of 8 weights are encoded jointly as an index into a compact precomputed grid of normalized 8D vectors plus packed sign bits and super-block FP16 scales—enabling 70B models ($\sim 19\text{ GB}$) to fit inside a single $24\text{ GB}$ consumer GPU.

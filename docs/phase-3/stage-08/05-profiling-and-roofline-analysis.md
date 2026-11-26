@@ -36,7 +36,7 @@ This guide explains how to measure a GPU kernel's hardware efficiency using NVID
 
 ## 1. NVIDIA Nsight Compute (`ncu --set full`) Mechanics
 
-When optimizing an LLM inference pipeline, you use two complementary NVIDIA tools at different time scales:
+When optimizing an LLM inference pipeline, PyTorch's built-in `torch.profiler` only shows operator names and total kernel durations—it cannot tell you *why* a kernel is slow inside the GPU. For that, you use two complementary NVIDIA tools at different time scales:
 * **Nsight Systems (`nsys`):** System-wide timeline profiler (microseconds to seconds). Captures CPU Python/C++ threads, CUDA driver launch calls, stream concurrency, PCIe/NVLink transfers, and inter-kernel launch gaps—ideal for diagnosing CUDA Graph opportunities and host-device synchronization stalls.
 * **Nsight Compute (`ncu`):** Single-kernel microarchitectural profiler. Intercepts individual CUDA kernels and queries the GPU's **Hardware Performance Monitoring Units (PMUs)** inside every SM, L1/TEX cache, L2 slice, and HBM controller to report exact cycle counts, warp stall distributions, bank conflicts, and Roofline utilization.
 
@@ -111,7 +111,7 @@ The first panel in any `ncu` report is **GPU Speed Of Light Throughput (SOL)**, 
 
 ## 3. Warp Stall Reasons (`Warp State Statistics`)
 
-On every clock cycle, an SM Warp Scheduler inspects all resident warps allocated to its partition. A warp is either **Eligible** (ready to issue an instruction), **Issued** (one eligible warp is picked per cycle), or **Stalled** (blocked on a hardware dependency). Nsight Compute samples PC (Program Counter) stall reasons via `smsp__pcsamp_warps_issue_stalled_*` and reports average cycles per instruction spent in each stall state.
+On every clock cycle, an SM Warp Scheduler inspects all resident warps allocated to its partition. A warp is either **Eligible** (all input operands are ready in registers so it can issue an instruction immediately), **Issued** (picked by the scheduler for this clock cycle), or **Stalled** (blocked waiting for memory, math hardware, or a barrier). Nsight Compute samples PC (Program Counter) stall reasons via `smsp__pcsamp_warps_issue_stalled_*` and reports average cycles per instruction spent in each stall state.
 
 Understanding the **four critical stall reasons** turns kernel optimization from guesswork into deterministic engineering:
 
@@ -157,9 +157,9 @@ Understanding the **four critical stall reasons** turns kernel optimization from
 
 ### Debunking the "100% Occupancy" Myth (Little's Law)
 
-A pervasive misconception among beginners is that maximizing occupancy to 100% maximizes speed. **In reality, top-performing GEMM and FlashAttention-3 kernels routinely run at 25% to 50% occupancy (16–32 warps/SM)!**
+A pervasive misconception in GPU optimization is that maximizing occupancy to 100% maximizes speed. **In reality, top-performing GEMM and FlashAttention-3 kernels routinely run at 25% to 50% occupancy (16–32 warps/SM)!**
 
-By **Little's Law** applied to an SM's memory pipeline, the bytes (or independent requests) in flight required to saturate HBM bandwidth is:
+By **Little's Law** applied to an SM's memory pipeline (analogous to keeping enough concurrent async I/O requests open to saturate a high-latency network link), the bytes (or independent requests) in flight required to saturate HBM bandwidth is:
 $$\text{Required Concurrency} = \text{Bandwidth}_{\text{SM}} \times \text{Latency}_{\text{HBM}}$$
 
 Consider an H100 SM:
@@ -181,7 +181,7 @@ This is why production Triton/CUDA kernels tune `BLOCK_M`/`BLOCK_N` or use **Per
 
 ## 5. Empirical Roofline Plotting & Hierarchical Roofs
 
-The **Roofline Model** (Williams et al., 2009) plots a kernel's empirical **Arithmetic Intensity** ($I$, x-axis) against **Attainable Performance** ($P$, y-axis) on a **log-log scale**, bounded by the physical silicon ceilings of the GPU.
+The **Roofline Model** (Williams et al., 2009) plots a kernel's empirical **Arithmetic Intensity** ($I$, x-axis) against **Attainable Performance** ($P$, y-axis) on a **log-log scale**, bounded by the physical silicon ceilings of the GPU. Physically, total kernel runtime is bounded by the slower of two resources: $T_{\min} = \max(\text{FLOPs} / P_{\text{peak}}, \; \text{Bytes} / \text{BW}_{\text{peak}})$. Dividing $\text{FLOPs}$ by $T_{\min}$ yields the Roofline equation below:
 
 ### Exact Roofline Equations & H100 Concrete Numbers
 

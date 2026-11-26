@@ -35,7 +35,8 @@ A tenant capped at `1,000 RPM` sending Request B consumes **$104,000,000\text{ T
 
 ## 2. Token-Bucket & Sliding-Window Admission with Post-Completion Reconciliation
 
-Because output length $N_{\text{out}}$ is unknown at admission time (generation terminates unpredictably at `EOS` or `max_tokens`), token-based rate limiting requires a **Two-Phase Reservation & Reconciliation Protocol**.
+
+Because output length $N_{\text{out}}$ is unknown at admission time (generation terminates unpredictably at `EOS` or `max_tokens`), token-based rate limiting requires a **Two-Phase Reservation & Reconciliation Protocol**—reserving the worst-case `max_tokens` budget up front and refunding unused tokens once generation stops:
 
 ### 2.1 Token-Bucket vs. Sliding-Window Algorithms
 

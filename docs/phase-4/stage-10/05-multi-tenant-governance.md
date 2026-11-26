@@ -108,7 +108,8 @@ Static hard caps waste paid GPU capacity during off-peak hours (hurting $U_{\tex
 
 ## 3. Noisy-Neighbor Isolation Inside the Engine & Cluster
 
-Gateway rate limits stop aggregate over-consumption, but **they cannot prevent micro-scale interference inside the GPU continuous batching scheduler**.
+
+Gateway rate limits stop aggregate over-consumption, but **they cannot prevent micro-scale interference inside the GPU continuous batching scheduler**. Even if two tenants stay within their per-minute token budgets, a single tenant submitting 200 long-context requests simultaneously can monopolize the FIFO queue and shared VRAM KV pool unless the scheduler isolates queues, memory blocks, and LoRA weights per tenant.
 
 ### 3.1 Fair Queuing via Deficit Round Robin (DRR)
 
@@ -129,8 +130,8 @@ Standard serving engines default to **FCFS (First-Come, First-Served)** scheduli
 
 ### 3.3 Multi-Tenant LoRA Adapter Isolation (S-LoRA / Punica)
 
-Enterprise platforms frequently host **50–500 fine-tuned LoRA adapters** ($W = W_{\text{base}} + B_i A_i$, rank $r \in [8, 64]$) per tenant on top of a single shared frozen base model ($W_{\text{base}}$):
-* **Batched Heterogeneous Execution (Punica / SGMV Kernels):** Instead of dedicating separate GPUs per tenant adapter (which destroys $U_{\text{avg}}$), Segmented Gather Matrix-Vector/Matrix-Multiply (`SGMV`) kernels batch requests targeting *different* LoRA adapters into the same base GEMM pass, then apply each request's respective low-rank $(A_i, B_i)$ slice in parallel.
+Enterprise platforms frequently host **50–500 fine-tuned LoRA adapters** ($W = W_{\text{base}} + B_i A_i$, rank $r \in [8, 64]$) per tenant on top of a single shared frozen base model ($W_{\text{base}}$). Conceptually, every request computes `y = W_base @ x + B_i @ (A_i @ x)`:
+* **Batched Heterogeneous Execution (Punica / SGMV Kernels):** Instead of dedicating separate GPUs per tenant adapter (which destroys $U_{\text{avg}}$), Segmented Gather Matrix-Vector/Matrix-Multiply (`SGMV`) kernels batch requests targeting *different* LoRA adapters into the same base GEMM pass (`W_base @ X`), then apply each request's respective low-rank $(A_i, B_i)$ slice in parallel.
 * **Bounded Adapter Cache & Eviction:** Keep top-$K$ hot LoRA weights pinned in a reserved GPU VRAM pool (`--max-loras 16`), spill warm adapters to a pinned CPU RAM LRU cache (`--max-cpu-loras 128`), and stream cold adapters on demand from NVMe/S3—bounding worst-case LoRA VRAM overhead to < 2–4 GB.
 * **Strict Cryptographic ACLs:** Gateway enforces `tenant_id` ownership before passing `model="lora-tenant-A"` to the engine so no tenant can invoke another tenant's proprietary weights.
 

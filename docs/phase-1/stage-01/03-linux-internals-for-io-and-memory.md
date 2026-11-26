@@ -40,11 +40,11 @@ This document explains how the Linux operating system maps program memory addres
 
 ## 1. Virtual Memory, Multi-Level Page Tables, and TLB Mechanics
 
-Every user-space process in Linux (including Python, PyTorch, and vLLM workers) operates inside an isolated **Virtual Address (VA)** space. On x86-64, standard hardware uses **4-level paging** (48-bit virtual addresses = 256 TB addressable) or **5-level paging** (57-bit VA = 128 PB).
+Every user-space process in Linux (including Python, PyTorch, and vLLM workers) operates inside an isolated **Virtual Address (VA)** space. If two Python processes both allocate a tensor at virtual address `0x7f00_1000_0000`, they never overwrite each other because the Linux kernel and CPU hardware transparently translate each process's virtual addresses into separate **Physical Addresses (PAs)** in DDR5 RAM. This abstraction also lets a process see a 100 GB tensor as a single contiguous address range even when its underlying 4 KB physical page frames are scattered across RAM. On x86-64, standard hardware uses **4-level paging** (48-bit virtual addresses = 256 TB addressable) or **5-level paging** (57-bit VA = 128 PB).
 
 ### 1.1 Anatomy of a 4-Level Page Walk (4 KB Base Pages)
 
-A 48-bit virtual address is partitioned into five fields:
+Think of virtual-to-physical translation as a 4-level tree of 512-entry lookup arrays stored in system RAM. A 48-bit virtual address is partitioned into five fields:
 
 $$\text{VA}[47:0] = [\underbrace{\text{PGD}}_{9\text{b}} \mid \underbrace{\text{PUD}}_{9\text{b}} \mid \underbrace{\text{PMD}}_{9\text{b}} \mid \underbrace{\text{PTE}}_{9\text{b}} \mid \underbrace{\text{Page Offset}}_{12\text{b}}]$$
 
@@ -110,14 +110,14 @@ flowchart TD
 
 ### 3.1 Standard Buffered `read()` Path (2 Copies + 2x RAM)
 
-When a Python or C++ program calls standard `read(fd, buf, size)` (without `O_DIRECT`):
+When a Python or C++ program calls standard `read(fd, buf, size)` (such as `open(path, "rb").read()` or legacy `torch.load()` without `mmap=True`):
 1. The NVMe controller DMAs blocks from NAND flash into the kernel **Page Cache** (`struct page` frames managed by Linux in unused DDR5).
 2. The CPU executes `copy_to_user()`, copying bytes from the kernel Page Cache into the user-space heap buffer `buf`.
-* **Cost:** Doubles memory consumption (weights live in both Page Cache *and* process heap), saturates CPU memory bandwidth during the `memcpy`, and incurs syscall transitions per chunk.
+* **Cost:** Doubles memory consumption (loading a 140 GB model consumes 140 GB in Page Cache *plus* 140 GB in process heap), saturates CPU memory bandwidth during the `memcpy`, and incurs syscall transitions per chunk.
 
 ### 3.2 `mmap()` (Memory-Mapped Files)
 
-Calling `mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0)` maps the file's kernel **Page Cache** pages directly into the process's virtual address space:
+Calling `mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0)` maps the file's kernel **Page Cache** pages directly into the process's virtual address space—letting Python/PyTorch read the file as if it were an in-memory array without copying a single byte:
 * **Zero CPU `copy_to_user()`:** User space reads directly from the exact same physical DDR5 frames populated by NVMe DMA.
 * **Cross-Process Sharing:** If 4 Tensor-Parallel worker processes `mmap` the same 140 GB model file, Linux maps all 4 processes' page tables to **1 shared physical copy** in the Page Cache (saving 420 GB of host RAM!).
 * **Controlling Readahead & Eviction via `madvise`:**
@@ -168,9 +168,11 @@ If a GPU DMA engine were given the physical address of a pageable buffer and Lin
 
 ### 4.2 Pageable `cudaMemcpy` vs. Pinned `cudaHostAlloc`
 
+In PyTorch, this hardware distinction is controlled by `pin_memory=True` (e.g., in `DataLoader` or `tensor.pin_memory()`) paired with `tensor.to("cuda", non_blocking=True)`:
+
 1. **Pageable Host Pointer (`pin_memory=False`):**
    * Because the user buffer isn't pinned, the CUDA driver must allocate an internal **pinned staging buffer** (ring of small ~4–16 MB chunks), have the **CPU copy** data from the pageable buffer into the pinned staging buffer, and *only then* trigger the GPU DMA Copy Engine.
-   * **Penalty:** Burns 100% of one or more CPU cores doing `memcpy`, caps H2D/D2H throughput around **~10–16 GB/s** even on PCIe Gen5, and **forces `cudaMemcpyAsync` to behave synchronously** up to the staging copy!
+   * **Penalty:** Burns 100% of one or more CPU cores doing `memcpy`, caps H2D/D2H throughput around **~10–16 GB/s** even on PCIe Gen5, and **forces `cudaMemcpyAsync` (and `non_blocking=True`) to behave synchronously** up to the staging copy!
 
 2. **Pinned Host Memory (`cudaHostAlloc` / `cudaHostRegister` / `torch.empty(..., pin_memory=True)`):**
    * Calls Linux `mlock()` (locking virtual pages to non-swappable, non-migratable physical RAM frames) and programs the GPU driver / IOMMU page tables once at allocation time.

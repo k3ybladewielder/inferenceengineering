@@ -36,7 +36,7 @@ Key Cache Tensor:   [batch_slot, num_kv_heads, max_model_len, head_dim]
 Value Cache Tensor: [batch_slot, num_kv_heads, max_model_len, head_dim]
 ```
 
-Because GPU allocators (`cudaMalloc` / PyTorch caching allocator) require contiguous virtual/physical address ranges for fixed-stride tensor indexing, and because a sequence's true output length $L_{\text{out}}$ is unknown at admission time, contiguous engines suffer from **three distinct forms of memory waste**:
+Because GPU allocators (`cudaMalloc` / PyTorch caching allocator) require contiguous virtual/physical address ranges for fixed-stride tensor indexing—just like `torch.empty((B, n_kv_heads, max_model_len, head_dim))` assumes every element sits at `base + b * stride_b + h * stride_h + t * stride_t`—you cannot dynamically grow a sequence's buffer in place without either pre-allocating `max_model_len` or allocating a larger tensor and copying the entire history (`torch.cat`). Because a sequence's true output length $L_{\text{out}}$ is unknown at admission time, contiguous engines suffer from **three distinct forms of memory waste**:
 
 1. **Reservation Waste (Future Slot Over-Allocation):** The allocator must pre-reserve `max_model_len` (e.g., $4{,}096$ or $32{,}768$ tokens) for every active request, even if the request actually terminates after $120$ tokens. For a 120-token sequence in a 4,096-slot buffer, **97.1% of its reserved VRAM sits empty**.
 2. **Internal Fragmentation:** Even if a request specifies a tighter `max_tokens` bound (say 512), any unused slots between the actual `<EOS>` position and `max_tokens` remain trapped inside that sequence's contiguous allocation until completion.
@@ -63,7 +63,7 @@ Empirical measurements from the vLLM paper (Kwon et al., SOSP 2023) showed that 
 
 ### 2.2 Pre-Allocated Physical KV Slab Layout
 
-At engine startup (after loading model weights and profiling peak activation memory via a dummy forward pass), the engine allocates the remaining GPU HBM (e.g., `gpu_memory_utilization = 0.90`) as **one giant pre-allocated KV pool** divided into $N_{\text{blocks}}$ identical fixed-size physical blocks:
+At engine startup (after loading model weights and running a worst-case dummy forward pass to measure the peak temporary activation memory needed by intermediate layers), the engine allocates the remaining GPU HBM (e.g., `gpu_memory_utilization = 0.90`) as **one giant pre-allocated KV pool** divided into $N_{\text{blocks}}$ identical fixed-size physical blocks:
 
 $$\text{Bytes per Physical Block} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times B \times d_{\text{head}} \times \text{sizeof(dtype)}$$
 
@@ -74,7 +74,7 @@ $$\text{Bytes per Physical Block} = 2 \times n_{\text{layers}} \times n_{\text{k
 * If $16\text{ GB}$ holds weights + activations and $56\text{ GB}$ is dedicated to the KV pool:
   $$N_{\text{blocks}} = \frac{56\text{ GB}}{2\text{ MB/block}} = 28{,}672\text{ physical blocks} \implies 458{,}752\text{ total cached tokens.}$$
 
-Inside HBM, the Key and Value caches are typically laid out for **128-bit coalesced CUDA loads** (`LDG.E.128`, 16 bytes per thread):
+Inside HBM, the Key and Value caches are typically laid out for **128-bit coalesced CUDA loads** (`LDG.E.128`, 16 bytes per thread). A GPU warp (32 threads executing in lockstep) achieves peak HBM bandwidth when adjacent threads read adjacent addresses in a single wide 16-byte burst (`x = 8` BF16 values per thread) rather than scattered small reads:
 
 ```text
 Key Cache Pool:   [num_layers, num_physical_blocks, num_kv_heads, head_dim // x, block_size, x]
@@ -119,7 +119,7 @@ Many LLM workloads share identical prefixes across multiple active output trajec
 
 ### 4.1 Physical Block Reference Counting
 
-Each physical block $P_k$ maintains an integer reference count `ref_count[P_k]`:
+Instead of calling `.clone()` on a shared prompt's KV cache for $n$ parallel samples—which would immediately duplicate gigabytes of HBM—all $n$ sequences point to the exact same physical block IDs. Each physical block $P_k$ maintains an integer reference count `ref_count[P_k]`:
 * `ref_count == 0`: Block is free and resides in `free_block_queue`.
 * `ref_count == 1`: Block is exclusively owned by a single logical sequence slot; **in-place append writes are safe**.
 * `ref_count > 1`: Block is **shared** across multiple sequences (read-only invariant!). Any write to this block **must trigger Copy-on-Write (CoW)**.
@@ -244,7 +244,7 @@ Given:
 * `block_size`: fixed constant $B$ (compile-time template parameter, e.g. `16`)
 * `block_tables`: 2D `int32` tensor on GPU of shape `[num_seqs, max_num_blocks_per_seq]`
 
-To read the Key and Value vectors for historical token position $t \in [0, L - 1]$:
+To read the Key and Value vectors for historical token position $t \in [0, L - 1]$ (for example, token $t = 37$ with `BLOCK_SIZE = 16` maps to `logical_block_idx = 37 // 16 = 2` and `block_offset = 37 % 16 = 5`):
 
 ```cpp
 // 1. Virtual address decomposition (compile-time bitshift when B is power of 2)
@@ -269,7 +269,7 @@ const int64_t v_offset = (int64_t)physical_block_id * v_block_stride
 ### 5.2 Kernel Execution Flow (PagedAttention v1 vs. v2)
 
 Inside the kernel's inner loop over `logical_block_idx`:
-1. **Prefetch `block_table`:** A warp loads `block_tables[seq_idx, 0 ... num_blocks - 1]` into Shared Memory (`__shared__`) once at the start of the thread block so inner-loop iterations do not pay repeated global memory latency for the page table.
+1. **Prefetch `block_table`:** A warp loads `block_tables[seq_idx, 0 ... num_blocks - 1]` into **Shared Memory (`__shared__`)**—a tiny (~228 KB/SM), ultra-fast on-chip scratchpad shared by all threads in a thread block—once at the start of the kernel so inner-loop iterations do not pay repeated slow HBM latency for the page table.
 2. **Coalesced Vectorized Loads:** Every thread in a warp reads consecutive `x` elements (`16 bytes` via `int4` / `uint4`) along `head_dim` for a given `block_offset` inside `physical_block_id`. Because tokens within a single block *are* contiguous in HBM, memory transactions remain **100% coalesced within each block**.
 3. **Dot Product $q \cdot K_j^T$ & Online Softmax:** Threads compute $\frac{q \cdot K_j}{\sqrt{d}}$, maintain running `max_logit` and `exp_sum` (Online Softmax), and immediately accumulate $p_j \cdot V_j$ in registers without ever materializing the $O(L)$ attention matrix in HBM.
 4. **PagedAttention v2 (Split-KV / FlashDecoding Partitioning):**

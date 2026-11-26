@@ -68,18 +68,18 @@ Let's derive from first principles the exact token batch size $B^*$ where `W8A8`
 
 ### 2.2 Arithmetic Intensity & Execution Time Equations
 
-For $Y = X W$ with $X \in \mathbb{R}^{B \times K}$ and $W \in \mathbb{R}^{K \times N}$:
+For $Y = X W$ with $X \in \mathbb{R}^{B \times K}$ and $W \in \mathbb{R}^{K \times N}$ (matching PyTorch `torch.matmul(X, W)`), computing each of the $B \times N$ output elements requires $K$ multiplications and $K$ additions:
 
 $$\text{Total FLOPs} = 2 B K N$$
 
-Now compute exact HBM bytes transferred for each precision (assuming group size $g=128$ with `FP16` scales for `W4A16`, and `BF16` output $Y$ for both):
+To understand whether this matrix multiply is limited by HBM memory bandwidth or Tensor Core math speed, we count the exact HBM bytes transferred for each precision (assuming group size $g=128$ with `FP16` scales for `W4A16`, and `BF16` output $Y$ for both):
 
 * **`W4A16` ($g=128$, symmetric `INT4`):**
   $$\text{Bytes}_{\text{W4A16}} = \underbrace{2 B K}_{X\text{ (FP16)}} + \underbrace{\left(0.5 + \frac{2}{128}\right) K N}_{W\text{ (0.5156 B/param)}} + \underbrace{2 B N}_{Y\text{ (FP16)}}$$
 * **`W8A8` (`FP8` / `INT8`, per-token/per-channel scales):**
   $$\text{Bytes}_{\text{W8A8}} = \underbrace{1 B K}_{X\text{ (8-bit)}} + \underbrace{1.0 K N}_{W\text{ (8-bit)}} + \underbrace{2 B N}_{Y\text{ (FP16/BF16)}} + \underbrace{4(B + N)}_{\text{scales (negligible)}}$$
 
-Under the standard Roofline model, ideal kernel latency $T(B)$ is bounded by the maximum of HBM memory time and Tensor Core compute time:
+Under the standard Roofline model, the GPU overlaps memory transfers and arithmetic, so ideal kernel latency $T(B)$ is bounded by whichever bottleneck takes longer—HBM memory time or Tensor Core compute time (where the **Ridge Point** $I_{\text{ridge}} = P / BW$ is the exact FLOPs-per-byte ratio where both times are equal):
 
 $$T_{\text{W4A16}}(B) = \max\!\left( \frac{\text{Bytes}_{\text{W4A16}}}{BW}, \; \frac{2 B K N}{P_{16}} \right), \qquad T_{\text{W8A8}}(B) = \max\!\left( \frac{\text{Bytes}_{\text{W8A8}}}{BW}, \; \frac{2 B K N}{P_{8}} \right)$$
 
@@ -140,9 +140,9 @@ xychart-beta
 
 ## 3. Inside `W4A16` Register Dequantization: The Marlin Kernel
 
-A naive implementation of `W4A16` dequantizes `INT4` weights into a temporary `FP16` tensor in HBM and then invokes `cublasGemmEx`. That is catastrophic: writing $2KN$ bytes to HBM and reading $2KN$ bytes back **increases** total HBM traffic to $4.5\text{ B/param}$—slower than running native `FP16`!
+A naive PyTorch implementation of `W4A16` (`w_fp16 = dequantize(w_int4); y = x @ w_fp16`) unpacks `INT4` weights into a temporary `FP16` tensor in HBM and then invokes `cublasGemmEx`. That is catastrophic for performance: writing $2KN$ bytes of unpacked weights to HBM and immediately reading $2KN$ bytes back **increases** total HBM traffic to $4.5\text{ B/param}$—more than twice the traffic of native `FP16`!
 
-Production `W4A16` engines (`vLLM`, `SGLang`, `TensorRT-LLM`) rely on **fused register-dequantization kernels**, exemplified by **Marlin** (Frantar et al., 2024), which achieves near-ideal ~3.8×–3.9× speedup over `FP16` on small batches.
+Production `W4A16` engines (`vLLM`, `SGLang`, `TensorRT-LLM`) eliminate that HBM round-trip using **fused register-dequantization kernels**, exemplified by **Marlin** (Frantar et al., 2024), which unpacks weights directly inside on-chip GPU registers and achieves near-ideal ~3.8×–3.9× speedup over `FP16` on small batches.
 
 ### 3.1 Four Architectural Pillars of Marlin
 

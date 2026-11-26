@@ -37,7 +37,7 @@ This document teaches how to measure and diagnose whether an AI inference server
 
 ## 1. The Python GIL Bottleneck in Inference Pipelines
 
-In standard CPython (3.8–3.12, and default builds of 3.13+), memory management relies on non-atomic reference counting (`PyObject->ob_refcnt`). To prevent two OS threads from corrupting reference counts or internal dicts simultaneously, CPython enforces the **Global Interpreter Lock (GIL)**: a single mutex + condition variable allowing **only one thread to execute Python bytecode at any instant**.
+In standard CPython (3.8–3.12, and default builds of 3.13+), every Python object tracks how many variables point to it using a non-atomic reference count (`PyObject->ob_refcnt`). Every time Python executes `x = y`, it increments that counter; when `x` leaves scope, it decrements it. If two OS threads updated those counters simultaneously without a lock, the count would corrupt and cause memory leaks or crashes. To prevent this, CPython enforces the **Global Interpreter Lock (GIL)**: a single mutex + condition variable allowing **only one thread to execute Python bytecode at any instant**.
 
 *(Note: Python 3.13 introduced experimental free-threaded builds via PEP 703 `python3.13t`, though production CUDA/PyTorch inference ecosystems remain predominantly GIL-bound today.)*
 
@@ -50,6 +50,8 @@ In standard CPython (3.8–3.12, and default builds of 3.13+), memory management
 ---
 
 ## 2. Sampling vs. Deterministic Profiling
+
+When an LLM server is slower than expected, `nvidia-smi` showing 30% GPU utilization does **not** mean the GPU is fast—it means the GPU is sitting idle 70% of the time waiting on the CPU, the Python GIL, or synchronization stalls. Choosing the right profiler depends on whether you need to inspect Python bytecode overhead, native C++/Rust extensions, host memory leaks, or the CPU-to-GPU handoff:
 
 | Profiler | Mechanism | Overhead | Visibility | Best Use Case |
 | :--- | :--- | :--- | :--- | :--- |
@@ -162,7 +164,7 @@ with profile(
 
 ### 5.2 Reading the Perfetto / Chrome Trace Timeline
 
-A healthy GPU-bound trace looks like a **solid wall of packed GPU kernels** on the CUDA Stream track, with CPU `cudaLaunchKernel` slices running **ahead** of the GPU (asynchronous queuing):
+Think of the CPU-to-GPU relationship like a restaurant order counter: the CPU drops kernel tickets (`cudaLaunchKernel`) onto the CUDA Stream queue in microseconds and immediately moves on to prepare the next step, while the GPU works through the queued tickets asynchronously. A healthy GPU-bound trace looks like a **solid wall of packed GPU kernels** on the CUDA Stream track, with CPU `cudaLaunchKernel` slices running **ahead** of the GPU (asynchronous queuing):
 
 1. **CPU Thread Track (`python` / `pt_autograd_0`):**
    * Shows `record_function` labels, ATen C++ dispatchers (`aten::mm`, `aten::scaled_dot_product_attention`), and **CUDA Runtime calls** (`cudaLaunchKernel`, `cudaMemcpyAsync`, `cudaStreamSynchronize`, `cudaDeviceSynchronize`).

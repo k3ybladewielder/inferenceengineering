@@ -29,7 +29,9 @@ Every technical term, acronym, hardware component, and inference concept used in
 
 ## 1. Memory Tier Overview: Capacity, Bandwidth, and Latency
 
-A GPU is fundamentally a **bandwidth-starved throughput engine**. While an NVIDIA H100 SXM5 delivers $989\text{ TFLOPS}$ (FP16) and an H200 delivers $4.8\text{ TB/s}$ of HBM3e bandwidth, moving a single tensor element from HBM to a Tensor Core costs roughly **$100\times$ more energy and $100\times$ more latency** than performing an FMA on data already sitting in registers or Shared Memory.
+In PyTorch, calling `tensor.cuda()` allocates memory in **HBM (Global Memory)**—for example, the 80 GB of capacity advertised on an H100. However, a GPU's arithmetic units cannot operate directly on HBM. Every element of `A` and `B` in `torch.matmul(A, B)` must travel from off-chip HBM, through the shared L2 cache, into the SM's on-chip SRAM or Register File, and back out again.
+
+This makes a GPU fundamentally a **bandwidth-starved throughput engine**. While an NVIDIA H100 SXM5 delivers $989\text{ TFLOPS}$ (FP16) and an H200 delivers $4.8\text{ TB/s}$ of HBM3e bandwidth, moving a single tensor element from HBM to a Tensor Core costs roughly **$100\times$ more energy and $100\times$ more latency** than performing an FMA on data already sitting in registers or Shared Memory. Optimizing LLM inference therefore revolves around keeping data in the fastest, closest memory tiers (Registers and SMEM) and minimizing round-trips to HBM.
 
 | Memory Tier | Scope | Location | Typical Capacity (A100 / H100 / B200) | Bandwidth (Per-SM or Aggregate) | Access Latency |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -80,7 +82,7 @@ The **Register File (RF)** is the fastest and largest on-chip storage per SM: **
 * **Register Bank Conflicts:** Physically, the register file is banked (e.g., 2 or 4 banks of 128-bit/64-bit ports per sub-partition). When an instruction like `FFMA R4, R0, R1, R2` needs 3 source operands in a single cycle, an **Operand Collector** buffers operands across cycles if multiple source registers sit in the same physical RF bank. The compiler schedules register assignments to minimize RF bank conflicts.
 
 ### Local Memory & Register Spilling
-When a kernel uses thread-local arrays that cannot be indexed at compile time (dynamic indexing like `float acc[8]; acc[i] = ...`) or exceeds the register budget (either $> 255$ registers or capped via `__launch_bounds__(maxThreadsPerBlock, minBlocksPerSm)` / `-maxrregcount=N`), the compiler **spills** registers to **Local Memory** (`LDL` / `STL` instructions).
+When a kernel uses thread-local arrays that cannot be indexed at compile time (dynamic indexing like `float acc[8]; acc[i] = ...`, where the compiler cannot map `acc[i]` to a fixed register name) or exceeds the register budget (either $> 255$ registers or capped via `__launch_bounds__(maxThreadsPerBlock, minBlocksPerSm)` / `-maxrregcount=N`), the compiler **spills** registers to **Local Memory** (`LDL` / `STL` instructions). Because registers are finite on-chip hardware slots, spilling is the GPU equivalent of Python running out of RAM and swapping to disk—except here, "disk" is off-chip HBM.
 
 > **Critical Warning:** "Local" Memory is a logical scope, *not* a fast physical memory! It resides in **off-chip HBM3/HBM3e** (though cached in L1/L2). In a register-heavy FlashAttention or quantized GEMM kernel, accidental register spilling injects thousands of extra `STL`/`LDL` bytes into L1/L2/HBM, destroying both arithmetic throughput and memory bandwidth. Always inspect `ptxas --verbose` (`used N registers, M bytes lmem`) or Nsight Compute (`l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum`).
 
@@ -96,7 +98,7 @@ At kernel launch, CUDA configures the split via `cudaFuncSetAttribute(kernel, cu
 * Choosing a larger SMEM tile (e.g., 164 KB for FlashAttention-3 double-buffered $Q/K/V$ tiles) shrinks L1 cache to 92 KB—which is optimal when data reuse is explicitly managed in SRAM rather than relying on hardware L1 caching.
 
 ### 32-Bank Architecture & Bank Conflict Math
-Shared Memory is physically organized into **32 independent SRAM banks**, each **4 bytes (32 bits) wide** and capable of servicing one 32-bit read or write per clock cycle. Successive 32-bit words map round-robin across the 32 banks:
+To deliver 128 bytes per cycle to 32 threads simultaneously without building an impossibly expensive 32-port memory cell, Shared Memory is physically organized into **32 independent SRAM banks**, each **4 bytes (32 bits) wide** and capable of servicing one 32-bit read or write per clock cycle (just like 32 separate checkout lanes at a grocery store). Successive 32-bit words map round-robin across the 32 banks:
 
 $$\text{bank\_id}(\text{byte\_addr}) = \left\lfloor \frac{\text{byte\_addr}}{4} \right\rfloor \bmod 32$$
 
@@ -155,7 +157,9 @@ Each HBM3 stack exposes a **1024-bit interface** split into **16 independent 64-
 
 ## 5. Memory Access Coalescing & 32B / 128B Transactions
 
-When a warp of 32 threads executes a global memory load (`LDG`) or store (`STG`), the Load/Store Unit (LSU) inside the SM inspects all 32 per-thread addresses and **coalesces** them into the minimum number of hardware memory transactions.
+In PyTorch, you often hear that calling `.contiguous()` before a kernel or avoiding non-contiguous `.transpose()` views makes operations dramatically faster. The physical reason is **memory coalescing**.
+
+When a warp of 32 threads executes a global memory load (`LDG`) or store (`STG`), the Load/Store Unit (LSU) inside the SM inspects all 32 per-thread addresses and **coalesces** (merges) them into the minimum number of hardware memory transactions. If 32 threads read 32 adjacent 4-byte floats (`x[0]` through `x[31]`), the hardware fetches a single 128-byte chunk in one trip. If those 32 threads read elements spaced far apart (e.g., down a column of a row-major tensor), the hardware must issue 32 separate memory fetches, wasting most of the bytes transferred on each trip.
 
 ### 128-Byte Cache Lines vs. 32-Byte Sectors
 Modern NVIDIA GPUs (Volta through Blackwell) organize L1 and L2 caches with **128-byte cache lines** subdivided into **four 32-byte sectors**:
@@ -220,8 +224,8 @@ sequenceDiagram
 
 ## 6. Direct Impact on LLM Inference
 
-* **KV Cache Layout & Coalescing:** Storing KV cache tensors as `[num_blocks, num_heads, head_dim, block_size]` vs. `[num_blocks, num_heads, block_size, head_dim]` determines whether loading a token's `head_dim = 128` vector across 32 threads is a contiguous coalesced 128-byte/256-byte read or a strided scatter that throws away $87.5\%$ of HBM3e bandwidth.
-* **PagedAttention / FlashAttention:** FlashAttention avoids writing the $O(N^2)$ attention score matrix $S = QK^T$ to HBM at all—keeping tiles in **Registers** and **Shared Memory**, cutting HBM traffic by $5\times$–$20\times$ and shifting attention from HBM-bound to Tensor-Core-bound.
+* **KV Cache Layout & Coalescing:** In PyTorch, a tensor's shape and dimension ordering (`[num_blocks, num_heads, head_dim, block_size]` vs. `[num_blocks, num_heads, block_size, head_dim]`) dictate which elements are physically adjacent in HBM. Putting `head_dim = 128` as the innermost (stride-1) dimension ensures that when a warp of 32 threads loads a token's key/value vector, all 32 threads read contiguous addresses in a single coalesced 128-byte/256-byte transaction. Putting `block_size` innermost instead forces threads reading across `head_dim` to stride over `block_size` elements, turning one coalesced read into a strided scatter that throws away $87.5\%$ of HBM3e bandwidth.
+* **PagedAttention / FlashAttention:** Standard PyTorch attention (`softmax(Q @ K.T) @ V`) materializes the $O(N^2)$ attention score matrix $S = QK^T$ in HBM, requiring huge memory writes and reads. FlashAttention avoids writing $S$ to HBM at all—tiling $Q, K, V$ into **Shared Memory** and keeping running softmax accumulators in **Registers**, cutting HBM traffic by $5\times$–$20\times$ and shifting attention from HBM-bound to Tensor-Core-bound.
 
 ---
 

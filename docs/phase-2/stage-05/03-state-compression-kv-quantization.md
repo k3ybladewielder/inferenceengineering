@@ -74,14 +74,14 @@ Because decode is strictly HBM-bandwidth-bound, compressing KV from BF16 to FP8 
 
 ### 2.3 Scaling Granularity Hierarchy
 
-Let a KV cache tensor for one layer have shape `[H_kv, S, d_head]`:
+Let a KV cache tensor for one layer have shape `[H_kv, S, d_head]`. In PyTorch terms, scaling granularity determines which axis (`dim`) you reduce over when computing `amax` or `min`/`max`:
 
-1. **Per-Tensor:** 1 scalar scale `s` for all heads, tokens, and channels in the layer. (Fastest metadata, worst accuracy if any head/channel has outliers.)
-2. **Per-Head:** `[H_kv]` scales (1 scale per KV head). Used by vLLM FP8 static KV quantization (`k_scale`, `v_scale` per layer/head).
+1. **Per-Tensor:** 1 scalar scale `s` for all heads, tokens, and channels in the layer (`X.abs().max()`). (Fastest metadata, worst accuracy if any head/channel has outliers.)
+2. **Per-Head:** `[H_kv]` scales (1 scale per KV head, reducing over `(S, d_head)`). Used by vLLM FP8 static KV quantization (`k_scale`, `v_scale` per layer/head).
 3. **Per-Token (Row-wise along `d_head`, or Group-wise along `d_head`):**
-   Scale computed across the $d_{\text{head}}$ (or sub-group $g=64/128$) channels of a *single* token $t$: `s[H_kv, S, d_head / g]`. Captures token-to-token amplitude changes immediately as each new token arrives!
+   Scale computed across the $d_{\text{head}}$ (or sub-group $g=64/128$) channels of a *single* token $t$ (`X.abs().amax(dim=-1)`), yielding shape `[H_kv, S, d_head / g]`. Captures token-to-token amplitude changes immediately as each new token arrives!
 4. **Per-Channel (Column-wise along sequence `S`, or Group-wise along `S`):**
-   Scale computed across a window of tokens $G_s$ (e.g., $G_s = 32$ or $64$ tokens) for a *single* feature channel $d \in [0, d_{\text{head}}-1]$: `s[H_kv, S / G_s, d_head]`.
+   Scale computed across a window of tokens $G_s$ (e.g., $G_s = 32$ or $64$ tokens) for a *single* feature channel $d \in [0, d_{\text{head}}-1]$ (`X.view(..., S // G_s, G_s, d_head).abs().amax(dim=-2)`), yielding shape `[H_kv, S / G_s, d_head]`.
 
 ---
 
@@ -124,8 +124,8 @@ Unlike Keys—which are matched via dot products against Queries and develop fix
 Putting the physics together yields the **asymmetric K/V scheme** (exemplified by **KIVI**):
 
 * **Keys (`K`):** Quantized **per-channel** along a group of $G$ tokens (e.g., $G = 32$ or $64$).
-  * *The Streaming Problem:* During autoregressive decode, tokens arrive **1 at a time**. You cannot compute a per-channel scale over $32$ tokens when only $1$ new token exists!
-  * *Solution — Residual Unquantized Buffer:* Maintain a small FP16/BF16 **streaming residual buffer** of capacity $R = G$ tokens (at most $31$ tokens per active sequence—negligible memory, $<0.1\%$ of a $32\text{K}$ context!). Once the residual buffer accumulates $G$ tokens, a background/step kernel packs all $G$ Key tokens together per-channel into INT4/INT2 and flushes them into the compressed KV pool, resetting the residual buffer to $0$.
+  * *The Streaming Problem:* During autoregressive decode, tokens arrive **1 at a time** (shape `[H_kv, 1, d_head]`). You cannot compute a per-channel `min`/`max` scale across $32$ tokens along the sequence axis `S` when only $1$ new token exists!
+  * *Solution — Residual Unquantized Buffer:* Maintain a small FP16/BF16 **streaming residual buffer** of capacity $R = G$ tokens (holding at most $31$ unquantized tokens per active sequence—negligible memory, $<0.1\%$ of a $32\text{K}$ context!). Once the residual buffer accumulates $G$ tokens, a step kernel packs all $G$ Key tokens together per-channel into INT4/INT2 and flushes them into the compressed KV pool, resetting the residual buffer length $r$ to $0$.
 * **Values (`V`):** Quantized **per-token** (along `d_head`, or groups of `d_head`). Since all $d_{\text{head}}$ elements of $V_t$ are ready immediately at token $t$, $V_t$ can be quantized right away (or batched alongside $K$'s residual flush for uniform kernel scheduling).
 
 ### Architecture Flowchart: Outlier Axes & Asymmetric Granularities
@@ -150,7 +150,7 @@ flowchart TD
 
 ## 5. Kernel Mechanics: Quantize-on-Write & Dequantize-on-Attention
 
-Storing packed INT4 or FP8 KV values saves HBM capacity and bandwidth, **but GPU Tensor Cores in standard attention cannot directly multiply BF16 Queries by INT4 Keys** (especially with per-channel/asymmetric zero-points). Therefore, kernels must execute **on-the-fly dequantization in registers/SRAM** right before the dot product.
+Storing packed INT4 or FP8 KV values saves HBM capacity and bandwidth, **but GPU Tensor Cores in standard attention cannot directly multiply BF16 Queries by INT4 Keys** (especially with per-channel/asymmetric zero-points). If a naive PyTorch implementation dequantized the entire compressed `[H_kv, S, d_head]` tensor back to BF16 in HBM before calling `F.scaled_dot_product_attention`, it would still write and re-read the full BF16 tensor—destroying the bandwidth savings. Instead, fused attention kernels must execute **on-the-fly dequantization in registers/SRAM** right before the dot product.
 
 ### 5.1 Memory Layout & Bit-Packing (INT4)
 

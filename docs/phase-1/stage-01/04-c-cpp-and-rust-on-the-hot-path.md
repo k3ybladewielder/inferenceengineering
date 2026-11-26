@@ -42,7 +42,7 @@ This document explains why Python becomes a bottleneck on the CPU steps between 
 
 ## 1. Why Python Fails on the Inference Hot Path
 
-While PyTorch orchestrates GPU compute via Python, **every CPU step inside the per-token decode loop sits directly on the critical path of Inter-Token Latency (ITL)**. For a fast 8B model decoding at 10 ms/token (or 2 ms/token under speculative decoding), spending 3 ms in Python destroys latency SLAs:
+In offline model training or batch analytics, Python feels fast because a single PyTorch call (`y = x @ W`) spends 99.9% of its time inside compiled C++/CUDA kernels operating on large tensors. In **online LLM serving**, however, the **per-token decode loop** runs in Python between every GPU forward pass—updating request queues, checking stop tokens, applying grammar masks, and dispatching the next batch. Every microsecond spent in Python sits directly on the critical path of **Inter-Token Latency (ITL)**. For a fast 8B model decoding at 10 ms/token (or 2 ms/token under speculative decoding), spending 3 ms in Python destroys latency SLAs:
 
 * **Bytecode Dispatch & Boxing:** CPython executes an interpreter loop (`_PyEval_EvalFrameDefault`) taking ~30–100 ns per bytecode opcode. Every integer (`PyLongObject`) or float (`PyFloatObject`) is heap-allocated and reference-counted (~28+ bytes instead of 4 bytes), destroying CPU L1/L2 cache density.
 * **Pointer Chasing:** A Python `list[int]` of 128,256 vocabulary tokens is an array of 8-byte pointers scattered across the heap—guaranteeing DDR5 cache misses and defeating SIMD vectorization.
@@ -56,7 +56,7 @@ Moving these hot paths to **C/C++** or **Rust** eliminates interpreter overhead,
 
 ### 2.1 Manual Memory Management (C) & Custom Arenas
 
-In raw C (`malloc`/`free`, `aligned_alloc(64, size)`), allocation lifetime is completely manual:
+Every program uses two regions of RAM: a fast per-thread **stack** (which automatically allocates and pops fixed-size local variables as functions enter and return) and a shared **heap** (for dynamic buffers whose size or lifetime outlives a single function call). In raw C (`malloc`/`free`, `aligned_alloc(64, size)`), heap allocation lifetime is completely manual:
 * **Failure Modes:** Memory leaks (long-running serving processes slowly OOM over days), use-after-free (corrupting allocator metadata or logits), double-free, and general-purpose allocator lock contention (`ptmalloc2` arena locks across threads).
 * **Inference Pattern — Arena / Bump Allocators:** Instead of calling `malloc`/`free` per request or token step, engines pre-allocate a contiguous slab (e.g., 64 MB aligned to 64B/2MB) and advance a single offset pointer (`offset += aligned_size`) in **1–2 CPU instructions**, resetting `offset = 0` at the end of the decode step with zero per-object `free()` calls.
 
@@ -296,7 +296,7 @@ flowchart LR
 
 ## 7. End-to-End Zero-Copy Hot Path Sequence
 
-The timeline below traces a single inference control step: batch tokenization on multi-core Rust (with GIL released), passing pinned token IDs into PyTorch via DLPack, launching GPU forward pass, and applying a zero-copy GPU/CPU logit mask back through FFI.
+The diagrams below trace a single inference control step: batch tokenization on multi-core Rust (with GIL released), passing pinned token IDs into PyTorch via DLPack, launching the GPU forward pass, and applying a zero-copy GPU/CPU logit mask back through FF
 
 ```mermaid
 sequenceDiagram

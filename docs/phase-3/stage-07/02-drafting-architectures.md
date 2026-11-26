@@ -50,21 +50,21 @@ Modern LLM inference systems resolve this tension across four distinct architect
 The classic Draft-Target setup pairs a small standalone Transformer $M_q$ (e.g., `Llama-3.2-1B`, `Qwen2.5-0.5B`, or a 160M–680M distilled model) with a large target Transformer $M_p$ (e.g., `70B` or `405B`) from the **same model family**.
 
 During each round:
-1. $M_q$ runs $\gamma$ tiny autoregressive decode steps, maintaining **its own separate KV cache** (much smaller because $M_q$ has fewer layers and narrower KV dimensions).
+1. $M_q$ runs $\gamma$ tiny autoregressive decode steps, maintaining **its own separate KV cache**. Because $M_q$ has its own learned $W_K, W_V$ projections and smaller hidden dimensions, it cannot reuse $M_p$'s KV cache; however, its cache is tiny (often $10\times\text{--}50\times$ smaller than $M_p$'s).
 2. $M_p$ verifies $[x_0, x_1, \dots, x_\gamma]$ in a single parallel pass.
 3. On rejection at position $k$, both $M_p$'s KV cache and $M_q$'s KV cache must rewind to `L_ctx + (k - 1)`, and the resampled replacement token $x'_k$ is fed into $M_q$ at the start of the next draft round.
 
 ### 2.2 Tokenizer, Vocabulary, and Alignment Constraints
 
-Modified rejection sampling compares $p(x)$ and $q(x)$ token-by-token over an identical discrete vocabulary $\mathcal{V}$. Consequently, **exact tokenizer and vocabulary alignment** is strictly required:
-* **Byte-Level BPE / SentencePiece Equivalence:** Both models must share the exact same merge rules, special token IDs (`<|eot_id|>`, `<|im_end|>`, BOS/EOS), and vocabulary size $|\mathcal{V}|$ (e.g., $128{,}256$ for Llama-3). Even a single mismatched token ID causes silent rejection cascades or corrupted text.
+Modified rejection sampling compares $p(x)$ and $q(x)$ token-by-token over an identical discrete vocabulary $\mathcal{V}$ (for instance, comparing `target_probs[token_id]` directly against `draft_probs[token_id]`). Consequently, **exact tokenizer and vocabulary alignment** is strictly required:
+* **Byte-Level BPE / SentencePiece Equivalence:** Both models must share the exact same merge rules, special token IDs (`<|eot_id|>`, `<|im_end|>`, BOS/EOS), and vocabulary size $|\mathcal{V}|$ (e.g., $128{,}256$ for Llama-3). If token ID `421` means `"ing"` in the target model and `"the"` in the draft model, comparing $p(421)$ with $q(421)$ is mathematically nonsensical, causing silent rejection cascades or corrupted text.
 * **Cross-Tokenizer Workarounds (Rare):** When vocabularies differ, systems must align at character/byte boundaries or translate token IDs via byte-string intersection, adding CPU synchronization overhead and lowering $\alpha$.
-* **Embedding/LM-Head Weight Cost:** Even a "tiny" 0.5B draft model with $|\mathcal{V}| = 151{,}936$ and $d = 896$ spends $2 \times 151{,}936 \times 896 \times 2\text{ bytes} \approx 544\text{ MB}$ just on embedding + untied LM head weights—and every draft step still performs a $[1, d] \times [d, |\mathcal{V}|]$ GEMV!
+* **Embedding/LM-Head Weight Cost:** Even a "tiny" 0.5B draft model with $|\mathcal{V}| = 151{,}936$ and $d = 896$ spends $2 \times 151{,}936 \times 896 \times 2\text{ bytes} \approx 544\text{ MB}$ just on embedding + untied LM head weights—and every draft step still performs a `[1, d] @ [d, |V|]` GEMV!
 
 ### 2.3 Systems Tradeoffs
 
 * **Prefill Synchronization Overhead:** Before $M_q$ can draft, $M_q$ must also prefill the user's prompt to populate its own KV cache. On long prompts ($32\text{k}$ tokens), draft prefill adds non-trivial TTFT unless overlapped on a separate CUDA stream or pipelined.
-* **Tensor Parallelism Mismatch:** A 70B target model often runs with $\text{TP}=4$ or $\text{TP}=8$, whereas a 1B draft model runs faster on $\text{TP}=1$ (since sharding a 1B model across 8 GPUs wastes latency on `AllReduce` synchronization barriers). Production engines (vLLM, TensorRT-LLM) replicate the 1B draft model on rank 0 or all ranks rather than tensor-sharding it.
+* **Tensor Parallelism Mismatch:** A 70B target model often runs with $\text{TP}=4$ or $\text{TP}=8$, whereas a 1B draft model runs faster on $\text{TP}=1$. Sharding a tiny 1B model across 8 GPUs slices its small weight matrices into slivers so fast to compute that the `AllReduce` GPU-to-GPU synchronization latency takes longer than the matrix math itself. Production engines (vLLM, TensorRT-LLM) therefore replicate the 1B draft model on rank 0 or all ranks rather than tensor-sharding it.
 
 ---
 
@@ -82,14 +82,14 @@ Because all $K$ heads execute **simultaneously in one batched kernel** from $h_t
 
 ### 3.2 Why Conditional Independence Hurts Single-Path Accuracy — and Tree Attention Fixes It
 
-Medusa heads share a fundamental statistical limitation: head $2$ predicts $x_{t+3}$ conditioned *only* on $h_t$, **without seeing which token $x_{t+2}$ was chosen by head $1$**! Formally, Medusa models:
+Medusa heads share a fundamental statistical limitation: head $2$ predicts $x_{t+3}$ conditioned *only* on $h_t$, **without seeing which token $x_{t+2}$ was chosen by head $1$**! Think of this as trying to predict the third word of a sentence from the first word alone, without knowing whether the second word was `"is"` or `"was"`. Formally, Medusa models:
 $$q(x_{t+2}, x_{t+3} \mid x_{\le t}) = q^{(1)}(x_{t+2} \mid h_t) \cdot q^{(2)}(x_{t+3} \mid h_t)$$
 rather than the true autoregressive factorization $p(x_{t+2} \mid x_{\le t}) \cdot p(x_{t+3} \mid x_{\le t}, x_{t+2})$.
 
-If position $t+2$ has two plausible tokens (e.g., `"the"` at $45\%$ and `"a"` at $40\%$), a single greedy chain would guess wrong roughly half the time. Medusa overcomes this via **Tree-Based Attention Verification**:
+If position $t+2$ has two plausible tokens (e.g., `"the"` at $45\%$ and `"a"` at $40\%$), a single greedy chain would guess wrong roughly half the time. Medusa overcomes this via **Tree-Based Attention Verification**, which turns a branching tree of guesses into a single batched PyTorch-style attention call:
 1. From each head $k$, take the top-$s_k$ candidate tokens (e.g., top-$2$ from head 1, top-$3$ from head 2, etc.) and form a **sparse candidate tree** of paths (typically pruned to $N_{\text{tree}} \approx 32\text{--}64$ total nodes based on empirical head accuracy).
-2. Flatten all $N_{\text{tree}}$ tree nodes into a single 1D token sequence of length $N_{\text{tree}}$ and construct a custom **tree attention mask** $M_{\text{tree}} \in \{0, -\infty\}^{N_{\text{tree}} \times N_{\text{tree}}}$ (plus matching RoPE position IDs equal to each node's depth in the tree).
-3. In $M_{\text{tree}}$, node $u$ can attend **only to its ancestors** on the root-to-$u$ path (and all prefix KV tokens), **never to sibling branches**.
+2. Flatten all $N_{\text{tree}}$ tree nodes into a single 1D token sequence of length $N_{\text{tree}}$ (shape `[1, N_tree]`) and construct a custom **tree attention mask** $M_{\text{tree}} \in \{0, -\infty\}^{N_{\text{tree}} \times N_{\text{tree}}}$ (plus matching RoPE position IDs equal to each node's depth in the tree, so position encodings reflect tree depth rather than flattened array index).
+3. In $M_{\text{tree}}$, node $u$ can attend **only to its ancestors** on the root-to-$u$ path (and all prefix KV tokens), **never to sibling branches**—allowing dozens of competing hypotheses to coexist in one tensor without leaking into each other.
 4. The target model verifies the entire tree of $64$ nodes in **one single forward pass**! Even though $64$ nodes are verified, the memory-bound target model still loads weights once, and the longest accepted root-to-leaf path is committed to the KV cache.
 
 ### 3.3 Medusa-1 vs. Medusa-2 Training
@@ -106,10 +106,10 @@ If position $t+2$ has two plausible tokens (e.g., `"the"` at $45\%$ and `"a"` at
 Medusa fails to condition head $k$ on the sampled token $x_{t+k}$, while Draft-Target models discard all rich contextual representations computed by the 70B target model and start drafting from raw token IDs alone.
 
 **EAGLE** (*Extrapolation Algorithm for Greater Language-model Efficiency*, Li et al., 2024) combines the best of both worlds:
-1. **Autoregressive at the Feature Level:** Instead of predicting tokens independently in parallel, EAGLE uses a single lightweight autoregressive Transformer layer (1 decoder layer, ~0.2B–0.3B params for a 70B target) that predicts the **target model's next top-layer hidden feature vector** $\hat{f}_{t+1} \in \mathbb{R}^d$.
-2. **Resolving Sampling Uncertainty via Token Embedding Injection:** Hidden features $f_t$ alone have high variance because the next token $x_{t+1}$ hasn't been chosen yet (e.g., `"I"` vs `"We"` lead to completely different hidden states). EAGLE feeds the **concatenation** of the previous feature vector $f_t$ and the **embedding of the sampled token** $e_{t+1} = E(x_{t+1})$ into its single Transformer layer:
+1. **Autoregressive at the Feature Level:** Instead of predicting tokens independently in parallel, EAGLE uses a single lightweight autoregressive Transformer layer (1 decoder layer, ~0.2B–0.3B params for a 70B target) that predicts the **target model's next top-layer hidden feature vector** $\hat{f}_{t+1} \in \mathbb{R}^d$. In PyTorch terms, this is a single `nn.TransformerDecoderLayer` operating on the last hidden state before `lm_head`, rather than a full 80-layer model.
+2. **Resolving Sampling Uncertainty via Token Embedding Injection:** Hidden features $f_t$ alone have high variance because the next token $x_{t+1}$ hasn't been chosen yet (e.g., choosing `"I"` vs `"We"` leads to completely different subsequent hidden states). By concatenating the previous feature vector $f_t$ with the **embedding of the actually sampled token** $e_{t+1} = E(x_{t+1})$ (`torch.cat([f_t, e_next], dim=-1)`), EAGLE tells its single Transformer layer which branch was taken before predicting $\hat{f}_{t+1}$:
    $$\hat{f}_{t+1} = \text{EAGLE\_Layer}\Big(\text{Linear}\big([f_t \,;\, e_{t+1}]\big)\Big)$$
-3. **Reusing the Target LM Head (Zero Extra Vocabulary Parameters):** To obtain draft logits $q_{t+2}$, EAGLE passes $\hat{f}_{t+1}$ directly through the **target model's frozen LM head** $W_{\text{lm}}$! It does not duplicate the embedding table or LM head.
+3. **Reusing the Target LM Head (Zero Extra Vocabulary Parameters):** To obtain draft logits $q_{t+2}$, EAGLE passes $\hat{f}_{t+1}$ directly through the **target model's frozen LM head** $W_{\text{lm}}$! Because `lm_head` (`[d_model, vocab_size]`) can easily consume 0.5–1 GB of VRAM on large vocabularies, sharing it avoids duplicating the embedding table or output projection.
 
 Because $\hat{f}_{t+1}$ incorporates the exact token $x_{t+1}$ that was actually sampled, conditional uncertainty collapses, achieving far higher acceptance rates ($\alpha \approx 0.75\text{--}0.88$) than Medusa with a tiny fraction of the parameters of an independent draft model.
 
@@ -158,7 +158,7 @@ In RAG, summarization, code editing, multi-turn chat, and document QA, large spa
 
 **Lookahead Decoding** (Fu et al., 2024) converts autoregressive decoding into parallel **Jacobi fixed-point iteration** within a single forward pass—with no draft model and no training:
 
-1. **Jacobi Iteration Principle:** Autoregressive generation of $W$ future tokens $(x_{t+1}, \dots, x_{t+W})$ is equivalent to solving a system of $W$ coupled nonlinear equations $x_{t+k} = \arg\max P(\cdot \mid x_{\le t}, x_{t+1}, \dots, x_{t+k-1})$. Starting from random/guessed tokens and iteratively feeding all $W$ positions in parallel converges in $\le W$ steps (and faster whenever tokens don't depend strongly on immediate predecessors).
+1. **Jacobi Iteration Principle:** Autoregressive generation of $W$ future tokens $(x_{t+1}, \dots, x_{t+W})$ is equivalent to solving a system of $W$ coupled nonlinear equations $x_{t+k} = \arg\max P(\cdot \mid x_{\le t}, x_{t+1}, \dots, x_{t+k-1})$. Instead of solving them one by one, Jacobi iteration guesses all $W$ tokens simultaneously (like filling in a row of a puzzle) and feeds all $W$ positions through the model in parallel; each pass refines every position using the previous pass's guesses, converging to the exact same fixed point in $\le W$ steps (and much faster whenever tokens do not depend strongly on immediate predecessors).
 2. **2D Lookahead Window + Verification Branch:** Lookahead Decoding splits the target model's single forward pass into two parallel attention-masked regions:
    * **Lookahead Branch (size $(N-1) \times W$):** Maintains a sliding 2D trajectory buffer of the last $N-1$ Jacobi steps over a window of length $W$, harvesting newly formed candidate $N$-grams into a local **n-gram pool** keyed by the first token.
    * **Verification Branch (size $G \times N$):** Looks up up to $G$ candidate $N$-grams matching the current last token $x_t$ and verifies all of them in parallel in the **exact same forward pass**!

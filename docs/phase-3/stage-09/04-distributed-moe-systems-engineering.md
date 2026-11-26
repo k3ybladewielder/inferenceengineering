@@ -38,7 +38,7 @@ Every model architecture detail, GPU kernel technique, and networking primitive 
 
 Frontier Mixture-of-Experts (MoE) architectures—such as DeepSeek-V3 (671B total parameters, 37B active, 256 routed experts, top-$k = 8$), Qwen3-235B-A22B, and Mixtral-8x22B—decouple model capacity (total parameter count) from per-token FLOPs. However, running 671B parameters in FP8 (~671 GB of weights alone, before KV Cache and activations) exceeds the HBM of a single 8x H100 server (640 GB total), requiring multi-node deployment.
 
-While Attention can use Data Parallelism (DP) or Tensor Parallelism (TP), replicating 256 experts on every node wastes massive HBM and forces skinny memory-bound GEMVs during Decode. **Expert Parallelism (EP)** shards the $E$ routed experts across $N_{\text{EP}}$ GPUs ($E / N_{\text{EP}}$ experts per GPU), transforming the FFN block into a **dynamic, data-dependent `All-to-All` distributed routing problem**.
+While Attention can use Data Parallelism (DP) or Tensor Parallelism (TP), replicating 256 experts on every node wastes massive HBM and forces skinny memory-bound GEMVs during Decode. **Expert Parallelism (EP)** shards the $E$ routed experts across $N_{\text{EP}}$ GPUs ($E / N_{\text{EP}}$ experts per GPU). Unlike a dense PyTorch MLP where every token in `x` (`[T_local, H]`) multiplies against the same local weights, EP transforms the FFN block into a **dynamic, data-dependent `All-to-All` distributed routing problem**: each token must travel over the network to the specific GPU holding its chosen experts, run the FFN there, and return.
 
 In an MoE layer with $E$ routed experts distributed across $N_{\text{EP}}$ GPUs (typically $N_{\text{EP}} = 16, 32, 64,$ or up to $320$ in large-scale deployments), each GPU processes a local batch of $T_{\text{local}}$ tokens from its Attention/DP group.
 
@@ -57,8 +57,8 @@ In an MoE layer with $E$ routed experts distributed across $N_{\text{EP}}$ GPUs 
 
 ### Why Standard `ncclAlltoAll` Fails & How DeepEP-Style Kernels Solve It
 
-Using generic `ncclAlltoAll` / `ncclAlltoAllv` for MoE inference introduces crippling bottlenecks:
-* **Metadata Synchronization Stall:** In MoE, the number of tokens routed to each peer GPU varies dynamically every step. `ncclAlltoAllv` requires the host CPU to know exact `sendcounts`/`recvcounts` up front—forcing an extra `AllGather` + GPU-to-CPU `cudaMemcpy` synchronization stall before `AlltoAll` can even launch!
+Using generic `ncclAlltoAll` / `ncclAlltoAllv` (the backend behind `torch.distributed.all_to_all`) for MoE inference introduces crippling bottlenecks:
+* **Metadata Synchronization Stall:** In MoE, the number of tokens routed to each peer GPU varies dynamically every step. `ncclAlltoAllv` requires the host CPU to know exact `sendcounts`/`recvcounts` up front—forcing an extra `AllGather` + GPU-to-CPU `cudaMemcpy` synchronization stall (equivalent to calling `.cpu()` in PyTorch on every layer) before `AlltoAll` can even launch!
 * **Lack of Node-Level Deduplication:** If 3 of a token's top-8 experts live on Node 4, naive token-level `AlltoAll` sends 3 identical copies of that token across the slow InfiniBand fabric to Node 4.
 * **Host Launch & Ring Latency:** NCCL kernel launch + host proxy threads add ~15–30 µs per collective, intolerable during Decode (where $60\text{ layers} \times 2\text{ collectives} = 120$ barriers would burn 3.6+ ms just on launch jitter).
 
@@ -102,7 +102,7 @@ $$\text{Capacity}_{\text{expert}} = \left\lceil CF \cdot \frac{k \cdot T_{\text{
 
 ### Dropless MoE Kernels (MegaBlocks & Grouped GEMM)
 
-Production inference engines eliminate Capacity Factor entirely using **Dropless MoE execution**:
+In naive PyTorch, executing variable-sized expert batches either requires padding every expert to a fixed 3D tensor `[E_local, Capacity, H]` (wasting FLOPs and HBM) or running a Python `for e in range(E_local)` loop of small `torch.matmul` calls (incurring heavy kernel-launch overhead). Production inference engines eliminate both problems using **Dropless MoE execution**:
 
 1. **Prefix-Sum Permutation (`gather` / `scatter`):**
    Given dynamic per-expert token counts $[c_0, c_1, \dots, c_{E_{\text{local}}-1}]$, a fast GPU `cub::DeviceScan::ExclusiveSum` computes exact contiguous start offsets `offsets[e]`. Tokens are permuted in HBM into a dense, **zero-padding** packed buffer sorted by local expert ID.
@@ -116,7 +116,7 @@ Production inference engines eliminate Capacity Factor entirely using **Dropless
 
 ## 4. Redundant Replication of Hot Experts (EPLB)
 
-To eliminate stragglers *without* dropping tokens, systems like DeepSeek-V3 deploy **EPLB (Expert Parallelism Load Balancer)**—decoupling **logical experts** ($E$) from **physical expert slots** ($S > E$):
+To eliminate stragglers *without* dropping tokens, systems like DeepSeek-V3 deploy **EPLB (Expert Parallelism Load Balancer)**—decoupling **logical experts** ($E$) from **physical expert slots** ($S > E$), much like replicating a hot shard across multiple servers in a distributed database:
 
 ### How EPLB Works
 
@@ -188,7 +188,7 @@ During both `Dispatch` and `Combine`, **100% of Tensor Cores sit idle**, tanking
 
 ### Dual-Microbatch Ping-Pong Pipeline (Two-Batch Overlap / TBO)
 
-As pioneered in **DeepSeek-V3** (and adopted in SGLang/vLLM TBO), the incoming batch of tokens is split along the batch/sequence dimension into **two independent micro-batches: Micro-Batch A and Micro-Batch B**, executed concurrently across two CUDA streams (`ComputeStream` and `CommStream`):
+As pioneered in **DeepSeek-V3** (and adopted in SGLang/vLLM TBO), the incoming batch of tokens `[B, H]` is split along the batch/sequence dimension into **two independent micro-batches: Micro-Batch A and Micro-Batch B (`[B/2, H]` each)**, executed concurrently across two CUDA streams (`ComputeStream` and `CommStream`) so the NIC transfers one micro-batch while the Tensor Cores compute on the other:
 
 1. **Stage 1 (Prefill/Decode Start):** `ComputeStream` executes **Attention** for Micro-Batch A.
 2. **Stage 2 (Ping):** `CommStream` launches **`All-to-All Dispatch` for Micro-Batch A** over NVLink/RDMA **simultaneously while** `ComputeStream` executes **Attention for Micro-Batch B**.

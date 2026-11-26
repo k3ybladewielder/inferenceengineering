@@ -38,15 +38,15 @@ In causal self-attention, a sequence of length $t$ requires each query vector $q
 
 $$\text{Attention}(q_t, K_{1:t}, V_{1:t}) = \text{softmax}\!\left(\frac{q_t K_{1:t}^T}{\sqrt{d_{\text{head}}}}\right) V_{1:t}$$
 
-Without caching, generating token $t+1$ would force the model to re-run linear projections $K_{1:t} = X_{1:t} W_K$ and $V_{1:t} = X_{1:t} W_V$ across all $t$ preceding tokens at every single decode step, turning an $O(S^2)$ total generation process into $O(S^3)$ compute.
+Think of what happens in a naive PyTorch generation loop without caching: at every step $t$, you concatenate the new token onto the sequence `tokens = torch.cat([tokens, next_token], dim=1)` and call `model(tokens)` on the entire history `1..t`. That forces the model to re-run the linear projections $K_{1:t} = X_{1:t} W_K$ and $V_{1:t} = X_{1:t} W_V$ across all $t$ preceding tokens on every single step—turning an $O(S^2)$ total generation process into $O(S^3)$ compute.
 
-Because causal masking ensures that the hidden state $x_i$ (for $i < t$) never depends on future tokens $x_{i+1}, \dots, x_t$, its projected Key vector $k_i$ and Value vector $v_i$ are **mathematically immutable** once computed during Prefill or an earlier Decode step. Storing $(k_i, v_i)$ in GPU HBM—the **KV Cache**—reduces per-step projection work from $O(t)$ tokens to $O(1)$ token, trading **VRAM capacity and HBM read bandwidth** for massive FLOP savings.
+Because causal masking ensures that the hidden state $x_i$ (for $i < t$) never depends on future tokens $x_{i+1}, \dots, x_t$, its projected Key vector $k_i$ and Value vector $v_i$ are **mathematically immutable** once computed during Prefill or an earlier Decode step. By saving $(k_i, v_i)$ in a persistent GPU HBM tensor—the **KV Cache**—and appending only the new token's slice `(k_t, v_t)` at each step, Decode only projects 1 token (`[B, 1, d_model] @ [d_model, d_kv]`) instead of $t$ tokens. This reduces per-step projection work from $O(t)$ to $O(1)$, trading **VRAM capacity and HBM read bandwidth** for massive FLOP savings.
 
 ---
 
 ## 2. Exact KV Cache Memory Equation
 
-For a standard decoder-only Transformer with $n_{\text{layers}}$ blocks, $n_{\text{kv\_heads}}$ Key-Value attention heads per layer, head dimension $d_{\text{head}}$, and numerical precision of $b$ bytes per parameter ($\text{bytes\_per\_param}$), the exact KV Cache memory required per token is:
+In PyTorch, the KV Cache for a single Transformer layer is a pair of tensors `(K_cache, V_cache)`, each with shape `[B, n_kv_heads, S, d_head]`. For a standard decoder-only Transformer with $n_{\text{layers}}$ blocks, $n_{\text{kv\_heads}}$ Key-Value attention heads per layer, head dimension $d_{\text{head}}$, and numerical precision of $b$ bytes per parameter ($\text{bytes\_per\_param}$), the exact KV Cache memory required per token is:
 
 $$\text{Bytes per Token} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times \text{bytes\_per\_param}$$
 
@@ -82,19 +82,21 @@ Because KV Cache size scales linearly with $n_{\text{kv\_heads}} \times d_{\text
 ### 3.3 Grouped-Query Attention (GQA)
 * **Design:** Introduced by Ainslie et al. (2023) and adopted across Llama-2 70B, Llama-3 (8B/70B/405B), Mistral, and Qwen2.5. Query heads are partitioned into $n_{\text{kv\_heads}}$ groups, where each KV head serves a group of $G = n_{\text{q\_heads}} / n_{\text{kv\_heads}}$ Query heads:
   $$1 < n_{\text{kv\_heads}} < n_{\text{q\_heads}}, \quad \text{Compression Factor} = G = \frac{n_{\text{q\_heads}}}{n_{\text{kv\_heads}}}$$
-* **Impact:** Achieves near-MHA model quality while shrinking KV Cache by $4\times$ to $8\times$ (e.g., $n_{\text{kv\_heads}} = 8$ allows clean sharding up to $\text{TP}=8$ without replicating KV caches across GPUs).
+  In PyTorch terms, the KV Cache stores only `n_kv_heads` slices in HBM, and the attention kernel broadcasts each Key/Value head across its $G$ paired Query heads on the fly inside fast on-chip SRAM—never materializing a duplicated `n_q_heads` tensor in HBM.
+* **Impact:** Achieves near-MHA model quality while shrinking KV Cache by $4\times$ to $8\times$ (e.g., $n_{\text{kv\_heads}} = 8$ allows clean sharding across up to $8$ GPUs under **Tensor Parallelism** ($\text{TP}=8$), where each GPU owns $1$ KV head and $n_q/8$ Query heads without replicating KV caches across GPUs).
 
 ### 3.4 Multi-Head Latent Attention (MLA — DeepSeek-V2 / V3 / R1)
 * **Design:** Introduced in DeepSeek-V2 and scaled in DeepSeek-V3/R1 (671B MoE). Instead of projecting separate $K$ and $V$ tensors per head and caching them, MLA performs **joint low-rank KV compression** into a single compact latent vector $c_t^{KV} \in \mathbb{R}^{d_c}$ (where $d_c \ll n_h d_h$, e.g., $d_c = 512$ vs. $128 \times 128 = 16{,}384$):
   $$c_t^{KV} = x_t W^{DKV}, \quad K_t^C = c_t^{KV} W^{UK}, \quad V_t^C = c_t^{KV} W^{UV}$$
-* **Decoupled RoPE:** Because Rotary Position Embeddings (RoPE) inject a position-dependent rotation matrix $R_t$ between $q_t$ and $k_t$, applying RoPE inside $W^{UK}$ prevents algebraic matrix absorption during decode. MLA solves this by allocating a separate, shared low-dimensional RoPE key $k_t^R = \text{RoPE}(x_t W^{KR}) \in \mathbb{R}^{d_h^R}$ (e.g., $d_h^R = 64$, broadcast across all query heads), and concatenating content + position dimensions:
+  Here $W^{DKV}$ is a down-projection matrix that compresses $x_t$ into the $512$-element latent vector, and $W^{UK}, W^{UV}$ are up-projection matrices that expand it back into full per-head Keys and Values.
+* **Decoupled RoPE:** Rotary Position Embeddings (RoPE) inject a position-dependent rotation matrix $R_t$ between $q_t$ and $k_t$ ($q_t R_t K_j^T$). If RoPE were applied directly to $K_t^C = c_t^{KV} W^{UK}$, the position-dependent rotation $R_t$ would sit *between* $W^{UK}$ and $W_Q$, preventing us from merging $W^{UK}$ into $W_Q$ ahead of time. MLA solves this by splitting both Queries and Keys into a position-free **content** part ($C$) and a small shared **decoupled RoPE** key $k_t^R = \text{RoPE}(x_t W^{KR}) \in \mathbb{R}^{d_h^R}$ (e.g., $d_h^R = 64$, broadcast across all query heads), and concatenating them:
   $$q_t = [q_t^C;\; q_t^R], \quad k_t = [K_t^C;\; k_t^R]$$
 * **Exact MLA KV Cache Bytes per Token:** During inference, we cache **only** the compressed latent vector $c_t^{KV}$ and the decoupled RoPE key $k_t^R$ (never the decompressed $K_t^C, V_t^C$!):
   $$\text{Bytes per Token}_{\text{MLA}} = n_{\text{layers}} \times (d_c + d_h^R) \times \text{bytes\_per\_param}$$
   *(Notice there is **no factor of 2** because $c_t^{KV}$ jointly generates both $K^C$ and $V^C$!)*
-* **Inference Matrix Absorption Trick:** During Decode, MLA avoids materializing $K^C = c^{KV} W^{UK}$ and $V^C = c^{KV} W^{UV}$ in HBM by exploiting associativity of matrix multiplication:
+* **Inference Matrix Absorption Trick:** During Decode, MLA avoids materializing $K^C = c^{KV} W^{UK}$ and $V^C = c^{KV} W^{UV}$ in HBM by exploiting the associative property of matrix multiplication—$(AB)C = A(BC)$:
   $$(q_t^C) (c_j^{KV} W^{UK})^T = \underbrace{(q_t^C (W^{UK})^T)}_{\text{absorbed into Query}} (c_j^{KV})^T$$
-  and similarly absorbing $W^{UV}$ into the output projection $W^O$. Consequently, the decode attention kernel reads **only $d_c + d_h^R = 576$ scalars per token per layer** from HBM—achieving lower KV Cache footprint than GQA while matching or exceeding full 128-head MHA quality.
+  Because $q_t^C$ is a single decode vector, multiplying it by $(W^{UK})^T$ once before the attention loop lets the kernel dot-product directly against the compressed $c_j^{KV}$ entries in HBM. Similarly, $W^{UV}$ is absorbed into the output projection $W^O$. Consequently, the decode attention kernel reads **only $d_c + d_h^R = 576$ scalars per token per layer** from HBM—achieving a smaller KV Cache footprint than GQA while matching or exceeding full 128-head MHA quality.
 
 ```mermaid
 flowchart LR

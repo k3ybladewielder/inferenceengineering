@@ -42,7 +42,7 @@ $$\frac{p_a}{p_b} = \exp\left(\frac{z_a - z_b}{T}\right)$$
 1. **Why $-\infty$ instead of `-1e4` or `-1e9`?**
    * Using `-1e4` in FP16/BF16 leaves $\exp(-10000) = 0$ *unless* valid logits are unusually negative or temperature $T$ is very large (e.g., $T = 10 \implies -1000$). Worse, in FP16 the maximum finite negative number is $-65{,}504$, so `-1e9` overflows to `-inf` anyway (or raises overflow warnings in some kernels). Always assign exact IEEE-754 `-INFINITY` (`-math.inf` / `-INFINITY` in CUDA).
 2. **All-Masked Dead State (`NaN` Crash):**
-   * If $\sum_{j} m_j = 0$ (all tokens masked to $-\infty$, caused by a malformed regex, an unreachable accepting state, or hitting `max_tokens` mid-rule), Softmax computes $\max_j \tilde{z}_j = -\infty$, then $\exp(-\infty - (-\infty)) = \exp(\text{NaN}) = \text{NaN}$, crashing `torch.multinomial` with a CUDA device-side assert! Production samplers explicitly assert `bitmask.any()` or fall back to forcing `<EOS>` if a dead state is detected.
+   * If $\sum_{j} m_j = 0$ (all tokens masked to $-\infty$, caused by a malformed regex, an unreachable accepting state, or hitting `max_tokens` mid-rule), numerically stable Softmax (`logits - logits.max()`) computes $\max_j \tilde{z}_j = -\infty$, then $\exp(-\infty - (-\infty)) = \exp(\text{NaN}) = \text{NaN}$, crashing `torch.multinomial` with a CUDA device-side assert! Production samplers explicitly assert `bitmask.any()` or fall back to forcing `<EOS>` if a dead state is detected.
 
 ---
 
@@ -61,10 +61,10 @@ Applying a vocabulary mask across a continuous batch of size $B$ with $|V| = 128
 ### 2.2 CPU Masking Antipattern vs. GPU Bitmask Kernel
 
 **The CPU Masking Pitfall:**
-If an engine copies logits from GPU $\to$ CPU (`logits.cpu()`), masks them in Python/NumPy, and copies them back CPU $\to$ GPU, it forces an immediate **`cudaStreamSynchronize()`** stall, transfers $B \times |V| \times 4\text{ bytes}$ twice across PCIe, and blocks all asynchronous CPU-GPU overlap—often adding $3\text{–}10\text{ ms}$ per decode step (doubling ITL!).
+If an engine copies logits from GPU $\to$ CPU (e.g., `logits.cpu()` in PyTorch), masks them in Python/NumPy, and copies them back CPU $\to$ GPU, it forces an immediate **`cudaStreamSynchronize()`** stall—halting the CPU until every queued GPU kernel finishes—transfers $B \times |V| \times 4\text{ bytes}$ (~$33\text{ MB}$ at $B=64$) twice across PCIe, and blocks all asynchronous CPU-GPU overlap, often adding $3\text{–}10\text{ ms}$ per decode step (doubling ITL!).
 
 **The Production Solution — Fused GPU Bitmask Kernel (XGrammar / FlashInfer / vLLM):**
-1. The CPU grammar engine writes only the compact bit-packed `int32` array of shape `[batch_size, ceil(|V| / 32)]` into **pinned host memory** (`cudaHostAlloc`), then issues a single non-blocking `cudaMemcpyAsync` H2D (~$1\text{ MB}$ for $B=64$).
+1. Instead of storing 1 `bool` (1 byte) or 1 `float32` (4 bytes) per token, the CPU grammar engine packs 32 boolean flags into the 32 bits of a single `uint32` integer—shrinking a 128,256-token mask from $513\text{ KB}$ (`float32`) to **$16.03\text{ KB}$**. It writes this compact `[batch_size, ceil(|V| / 32)]` array into **pinned host memory** (`cudaHostAlloc`), then issues a single non-blocking `cudaMemcpyAsync` H2D (~$1\text{ MB}$ for $B=64$).
 2. A lightweight CUDA kernel launches with `grid = (batch_size, ceil(|V| / (32 * BLOCK_THREADS)))`, where each CUDA thread unpacks 1 bit (or 1 `uint32` word = 32 tokens per thread) directly in HBM:
 
 ```cpp
@@ -181,7 +181,7 @@ If you omit $S_{\text{det}}$ from the KV Cache, the model loses positional aware
 
 ### 5.1 Resolving KV Consistency: Batched Mini-Prefill vs. Sequential Decode
 
-Instead of skipping the Transformer computation altogether, Jump-Forward Decoding transforms **$k$ sequential memory-bound decode steps** into **1 parallel mini-prefill pass**:
+Instead of skipping the Transformer computation altogether (which would omit the Key/Value vectors of `", "currency": "` from the KV Cache and break attention for later tokens), Jump-Forward Decoding transforms **$k$ sequential memory-bound decode steps** into **1 parallel mini-prefill pass**:
 
 1. Tokenize $S_{\text{det}}$ into $k$ token IDs $[t_1, t_2, \dots, t_k]$.
 2. Allocate KV slots for all $k$ tokens at once in `BlockManager`.

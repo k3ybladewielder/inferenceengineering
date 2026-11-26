@@ -53,27 +53,30 @@ Every technical term, numerical format, and hardware concept used in this docume
 
 ## 1. Why Bit-Level Representation Governs LLM Inference
 
-Every parameter stored in `BF16` or `FP16` consumes **2 bytes**. A 70B-parameter dense Transformer requires $70 \times 10^9 \times 2 = 140\text{ GB}$ just for static weights—exceeding a single 80 GB H100/A100 GPU before allocating a single byte of KV Cache or activations. Furthermore, during batch-1 autoregressive decode, every generated token forces the GPU to stream nearly the entire weight matrix from HBM into on-chip SRAM/registers.
+In PyTorch, a standard `nn.Linear(K, N)` layer stores its weight tensor `W` in `torch.bfloat16` or `torch.float16`, where every parameter consumes **2 bytes**. A 70B-parameter dense Transformer requires $70 \times 10^9 \times 2 = 140\text{ GB}$ just for static weights—triggering an immediate out-of-memory failure on a single 80 GB H100/A100 GPU before allocating a single byte of KV Cache or activations. Furthermore, during batch-1 autoregressive decode, each generated token executes a vector-matrix multiply (`[1, K] @ [K, N]`): the GPU performs only two floating-point operations per weight, yet must stream the entire weight matrix from slow off-chip HBM (VRAM) into on-chip SRAM/registers for every single token. In this regime, inference latency is governed almost entirely by **bytes moved from HBM**, not arithmetic speed.
 
 Reducing weight representation from 16 bits to 8 bits or 4 bits cuts static VRAM footprint and decode HBM traffic by **2× to 4×**. Yet not all 4-bit or 8-bit encodings allocate their bit budgets equally:
 
-* **Integer formats (`INT8`, `INT4`)** space representable values **uniformly** across a linear range, maximizing precision near the outer bounds of a clamped interval while relying on external scale factors for dynamic range.
-* **Floating-point formats (`FP8`, `FP4`, `MXFP4`)** split bits between an **exponent** (geometric dynamic range across orders of magnitude) and a **mantissa/significand** (relative local precision within each exponent bin).
-* **Information-theoretic quantile formats (`NF4`)** place representable levels nonuniformly at the exact quantiles of a standard normal distribution $\mathcal{N}(0, 1)$, matching the empirical distribution of trained neural network weights.
+* **Integer formats (`INT8`, `INT4`)** space representable values **uniformly** across a linear range (like `torch.linspace(-alpha, alpha, 2**b)`), maximizing precision near the outer bounds of a clamped interval while relying on external scale factors for dynamic range.
+* **Floating-point formats (`FP8`, `FP4`, `MXFP4`)** split bits between an **exponent** (geometric dynamic range across orders of magnitude, acting like a power-of-two zoom level) and a **mantissa/significand** (uniformly spaced tick marks within each exponent bin).
+* **Information-theoretic quantile formats (`NF4`)** place representable levels nonuniformly at the exact quantiles of a standard normal distribution $\mathcal{N}(0, 1)$, matching the bell-shaped empirical distribution of trained neural network weights so dense regions near zero receive finer resolution than rare tails.
 
-Choosing the wrong bit format or scaling granularity shifts quantization noise into catastrophic logit distortion or breaks hardware Tensor Core pipelines.
+Choosing the wrong bit format or scaling granularity shifts quantization noise into catastrophic logit distortion or forces expensive software fallbacks that break hardware Tensor Core pipelines.
 
 ---
 
 ## 2. Low-Precision Floating-Point Formats
 
+A floating-point format encodes a real number using scientific notation in base 2: a **sign bit** $S$ sets positive or negative, an **exponent** $E$ selects the power-of-two interval (called a *binade*, $[2^k, 2^{k+1})$), and a **mantissa** $M$ subdivides that interval into $2^M$ evenly spaced steps. Because the exponent is stored as an unsigned integer $e_{\text{uint}}$, a constant **bias** $B = 2^{E-1} - 1$ is subtracted so the format can represent both tiny fractions (negative powers of 2) and large numbers (positive powers of 2).
+
 For a standard $b$-bit IEEE-like floating-point encoding with 1 sign bit $S$, $E$ exponent bits (with bias $B = 2^{E-1} - 1$), and $M$ mantissa bits ($b = 1 + E + M$):
 
 * **Normal numbers** ($1 \le e_{\text{uint}} \le e_{\max}$):
   $$x = (-1)^S \cdot 2^{e_{\text{uint}} - B} \cdot \left(1 + \frac{m_{\text{uint}}}{2^M}\right)$$
+  Here, the leading `1.` is implicit—saving one bit of storage because every normalized binary number starts with `1`.
 * **Subnormal numbers** ($e_{\text{uint}} = 0$):
   $$x = (-1)^S \cdot 2^{1 - B} \cdot \left(0 + \frac{m_{\text{uint}}}{2^M}\right)$$
-  Subnormals provide **gradual underflow** down to $2^{1 - B - M}$ without an implicit leading `1.`, filling the gap around zero uniformly.
+  When $e_{\text{uint}} = 0$, the implicit leading digit switches from `1.` to `0.` and the exponent stays pinned at $2^{1-B}$. Subnormals provide **gradual underflow** down to $2^{1 - B - M}$, filling the gap around zero uniformly instead of dropping abruptly from the smallest normal number straight to `0.0`.
 
 ### 2.1 FP8: `E4M3` vs. `E5M2` (OFM / OCP / IEEE-Style)
 
@@ -153,9 +156,9 @@ NF4 Codebook (index 0..15):
    0.44070983,  0.56261700,  0.72295684,  1.00000000 ]
 ```
 
-* **Quantization:** Normalize a weight block $W_b$ by its absolute maximum $s_b = \max(|W_b|)$, then map each normalized value $w / s_b \in [-1, 1]$ to the nearest index $i \in \{0, \dots, 15\}$ in the `NF4` table.
+* **Quantization:** Normalize a weight block $W_b$ by its absolute maximum $s_b = \max(|W_b|)$ (just as `w / w.abs().max()` maps a PyTorch tensor into $[-1, 1]$), then map each normalized value $w / s_b \in [-1, 1]$ to the nearest index $i \in \{0, \dots, 15\}$ in the `NF4` table.
 * **Dequantization:** Look up `NF4_LUT[i]` in registers/shared memory and multiply by $s_b$.
-* **Why `NF4` is software-only:** Unlike `FP4 E2M1`, `NF4`'s irregular floating-point constants cannot be executed directly by hardware `FP4` Tensor Core multipliers; it requires **table-lookup dequantization into `FP16`/`BF16`** prior to `HMMA`, making it ideal for memory-bound `W4A16` inference or QLoRA fine-tuning, but incompatible with native `W4A4` Tensor Core math.
+* **Why `NF4` is software-only:** Unlike `FP4 E2M1`, whose values follow exact powers of two that hardware multipliers can decode with simple bit-shifts, `NF4`'s irregular floating-point constants (such as `0.24611230`) cannot be executed directly by hardware `FP4` Tensor Core multipliers. `NF4` requires **table-lookup dequantization into `FP16`/`BF16`** prior to `HMMA`, making it ideal for memory-bound `W4A16` inference or QLoRA fine-tuning, but incompatible with native `W4A4` Tensor Core math.
 
 ---
 
@@ -249,13 +252,13 @@ A single scalar $s_W \in \mathbb{R}$ covers the entire $K \times N$ matrix.
 
 ### 4.2 Per-Channel (Weights) & Per-Token (Activations) Scaling
 
-Because matrix multiplication reduces along $K$ ($Y_{mn} = \sum_{k=1}^{K} X_{mk} W_{kn}$), any scale factor that depends **only on the non-reduction indices** ($m$ for activations $X$, $n$ for weights $W$) can be factored completely **outside** the $K$-dimension dot product:
+Because matrix multiplication reduces along $K$ ($Y_{mn} = \sum_{k=1}^{K} X_{mk} W_{kn}$), any scale factor that depends **only on the non-reduction indices** ($m$ for activations $X$, $n$ for weights $W$) can be factored completely **outside** the $K$-dimension dot product—analogous to computing `(Q_X @ Q_W)` first in PyTorch and broadcasting `s_X[:, None] * acc * s_W[None, :]` afterward:
 
 $$Y_{mn} = \sum_{k=1}^{K} \left(s_{X}[m] \, Q_{X}[m, k]\right) \left(Q_{W}[k, n] \, s_{W}[n]\right) = s_{X}[m] \, s_{W}[n] \sum_{k=1}^{K} Q_{X}[m, k] \, Q_{W}[k, n]$$
 
 * **Per-channel weights:** One scale per output column $n$ ($s_W \in \mathbb{R}^N$). Negligible overhead: for `K=4096, N=4096`, $4096 \times 2\text{ bytes} = 8\text{ KB}$ vs $8\text{ MB}$ (`INT4`) or $16\text{ MB}$ (`INT8`), i.e., **< 0.1% overhead**.
 * **Per-token activations:** One dynamic scale per token row $m$ ($s_X \in \mathbb{R}^M$), computed on-the-fly during the preceding RMSNorm/LayerNorm or activation epilogue.
-* **Limitation:** Still vulnerable if outliers occur along the **reduction dimension $K$** (which is exactly where emergent activation outliers reside!).
+* **Limitation:** Still vulnerable if outliers occur along the **reduction dimension $K$** (which is exactly where emergent activation outliers reside!). Because $K$ is summed inside the hardware matrix-multiply loop, a scale $s_X[k]$ indexed by $k$ cannot be factored outside the `matmul`.
 
 ### 4.3 Group-Wise (Block-Wise / Sub-Channel) Scaling
 

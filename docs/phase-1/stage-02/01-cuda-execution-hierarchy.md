@@ -57,7 +57,9 @@ Every technical term, acronym, hardware unit, and inference concept used in this
 
 ## 1. Software Abstraction vs. Hardware Topology
 
-CUDA decouples algorithmic parallelism from fixed core counts through a three-level software hierarchy—**Grid**, **Thread Block (CTA)**, and **Thread**—which the GPU hardware maps dynamically onto **Streaming Multiprocessors (SMs)**, **SM Sub-Partitions**, and **Warps**.
+When you call `y = x + 1` or `torch.matmul(A, B)` on a GPU tensor in PyTorch, the Python interpreter does not loop over elements itself. Instead, PyTorch dispatches a compiled **CUDA kernel** to the GPU. Inside that kernel, the programmer writes logic for a single worker (**Thread**), and launches millions of copies of that worker simultaneously.
+
+To ensure the exact same compiled kernel runs unmodified on both a 28-SM laptop GPU and a 132-SM H100 data-center GPU, CUDA decouples algorithmic parallelism from physical core counts through a three-level software hierarchy—**Grid**, **Thread Block (CTA)**, and **Thread**. The GPU hardware dynamically maps these software units onto **Streaming Multiprocessors (SMs)**, **SM Sub-Partitions**, and **Warps** at runtime:
 
 | Software Concept | Hardware Mapping | Architectural Constraints (Hopper H100 / cc 9.0) |
 | :--- | :--- | :--- |
@@ -70,13 +72,15 @@ CUDA decouples algorithmic parallelism from fixed core counts through a three-le
 
 ### Grid $\to$ Block $\to$ Warp $\to$ Thread Mapping onto SMs
 
-When a kernel launches via `kernel<<<gridDim, blockDim, sharedMemBytes, stream>>>(...)`, the **GigaThread Engine** (the GPU's global work distributor) iterates over the Grid's CTAs and assigns them to SMs that have sufficient free hardware resources across four dimensions:
+To map this hierarchy to a PyTorch mental model: if a `torch.Tensor` of shape `[M, N]` lives in off-chip **Global Memory (HBM)**, a matrix-multiply kernel divides the output tensor into `[B_m, B_n]` tiles. Each **Thread Block (CTA)** computes one output tile, using on-chip **Shared Memory (SMEM)** as a fast local scratchpad array to stage input tiles, and **Registers** as private scalar variables for accumulating partial sums. The entire collection of CTAs covering all tiles forms the **Grid**.
+
+When a kernel launches via `kernel<<<gridDim, blockDim, sharedMemBytes, stream>>>(...)`, the **GigaThread Engine** (the GPU's global hardware work distributor) iterates over the Grid's CTAs and assigns them to SMs that have sufficient free hardware resources across four dimensions:
 1. **Warp slots** ($\lceil \text{threads\_per\_block} / 32 \rceil$ warps available).
 2. **Block slots** (1 CTA slot available).
 3. **Registers** (total registers needed by the block available in the SM's 65,536-register file).
 4. **Shared Memory** (dynamic + static SMEM bytes available in the SM's unified L1/SMEM pool).
 
-Once a CTA is placed on an SM, it **never migrates** to another SM. Inside the SM, the CTA is immediately partitioned into warps of 32 consecutive threads, indexed linearly by `linear_tid`:
+Once a CTA is placed on an SM, it **never migrates** to another SM—it runs to completion on that SM while holding its allocated registers and SMEM. Inside the SM, the CTA is immediately partitioned into warps of 32 consecutive threads, indexed linearly by `linear_tid`:
 
 $$\text{linear\_tid} = t_x + t_y \cdot B_x + t_z \cdot (B_x \cdot B_y)$$
 
@@ -112,14 +116,16 @@ flowchart TD
 
 ### Physical Implications for LLM Inference
 
-* **Wave Quantization:** An NVIDIA H100 SXM5 has **132 SMs**. If a decode kernel launches a grid of $133$ CTAs where each CTA fills an entire SM (e.g., 1 CTA/SM), the first $132$ CTAs run concurrently in **Wave 1**, and the final $1$ CTA executes alone in **Wave 2** while $131$ SMs ($99.2\%$ of the GPU) sit idle. Latency nearly doubles for $0.75\%$ extra work!
-* **Tail Latency in Variable-Length Batches:** In ragged continuous batching, if CTA $k$ processes a prompt of length $4096$ while other CTAs process prompts of length $128$, the longest CTA pins its SM slot and delays kernel completion (unless work is tiled across sequence chunks, as in **FlashDecoding** / **PagedAttention** split-K).
+* **Wave Quantization:** An NVIDIA H100 SXM5 has **132 SMs**. Think of each round of concurrent CTAs across the GPU as a "wave." If a decode kernel launches a grid of $133$ CTAs where each CTA fills an entire SM (e.g., 1 CTA/SM), the first $132$ CTAs run concurrently in **Wave 1**, and the final $1$ CTA executes alone in **Wave 2** while $131$ SMs ($99.2\%$ of the GPU) sit idle. Latency nearly doubles for $0.75\%$ extra work! In PyTorch/TensorRT-LLM, this is why choosing batch sizes, tensor-parallel splits, or tile sizes that produce grid counts near multiples of $132$ (e.g., $132, 264, 528$) can yield sudden step-function drops in latency.
+* **Tail Latency in Variable-Length Batches:** Because a Grid does not complete until its slowest CTA finishes, imbalanced work across CTAs causes severe tail latency. In ragged continuous batching, if CTA $k$ processes a prompt of length $4096$ while other CTAs process prompts of length $128$, the longest CTA pins its SM slot and delays kernel completion (unless work is tiled across sequence chunks, as in **FlashDecoding** / **PagedAttention** split-K).
 
 ---
 
 ## 2. SIMT Execution Model
 
-CPUs execute **SIMD** (Single Instruction, Multiple Data): software explicitly packs $8$ or $16$ scalars into a wide vector register (`__m512`) and executes one vector instruction over one program counter (PC). GPUs execute **SIMT** (Single Instruction, Multiple Thread): software is written from the perspective of a *single scalar thread* with its own thread index (`threadIdx.x`), registers, and control flow, while hardware dynamically groups $32$ threads into a **Warp** that shares instruction fetch/decode bandwidth.
+A traditional CPU core is optimized for **low latency on a single thread**: it spends the vast majority of its silicon area on large caches, branch predictors, and out-of-order execution buffers so one instruction stream runs as fast as possible. A GPU makes the opposite architectural trade-off for **massive parallel throughput**: it strips away heavy per-thread control logic and shares a single instruction-fetch and decode unit across 32 threads.
+
+CPUs execute **SIMD** (Single Instruction, Multiple Data): software explicitly packs $8$ or $16$ scalars into a wide vector register (`__m512`, conceptually similar to a tiny fixed-length NumPy vector) and executes one vector instruction over one program counter (PC). GPUs execute **SIMT** (Single Instruction, Multiple Thread): software is written from the perspective of a *single scalar thread* with its own thread index (`threadIdx.x`), registers, and control flow, while hardware dynamically groups $32$ threads into a **Warp** that shares instruction fetch/decode bandwidth.
 
 Key architectural properties of SIMT:
 1. **Amortized Control Logic:** Only $1$ instruction fetch, decode, and dependency check unit is needed per $32$ execution lanes, dedicating far more silicon area to ALUs and Tensor Cores rather than branch predictors or out-of-order reorder buffers.
@@ -132,7 +138,7 @@ Key architectural properties of SIMT:
 
 ### Pre-Volta SIMT Stack vs. Volta+ Independent Thread Scheduling
 
-When threads inside a single warp evaluate a data-dependent branch (`if (cond) { A } else { B }`) differently, **warp divergence** occurs.
+In Python or CPU C++, two threads executing an `if/else` branch run independently on separate cores. Inside a GPU warp, however, all $32$ threads share a single instruction issue slot per cycle. When threads inside a single warp evaluate a data-dependent branch (`if (cond) { A } else { B }`) differently—for instance, `if (x[tid] > 0)` where half the elements are positive and half are negative—**warp divergence** occurs. Because the warp can only issue one instruction stream at a time, the hardware must mask off inactive lanes and serialize the two paths.
 
 * **Pre-Volta (Kepler, Maxwell, Pascal — cc $\le 6.x$):** All $32$ threads in a warp shared a **single Program Counter (PC)** and a hardware **SIMT Divergence Stack** containing `(reconvergence_PC, active_mask)`. When diverging, the hardware pushed the `else` path onto the stack, ran the `if` path completely to the immediate post-dominator reconvergence point, then popped and ran the `else` path. Consequently, threads on different branches could **never interleave**—if one thread spun in a `while (atomicCAS(...))` loop waiting for another thread in the *same* warp to release a lock, the GPU **deadlocked**.
 * **Volta and Newer (Volta, Turing, Ampere, Ada, Hopper, Blackwell — cc $\ge 7.0$):** NVIDIA introduced **Independent Thread Scheduling (ITS)**. The hardware maintains a **per-thread PC and per-thread call stack/state** for all $32$ lanes.
@@ -166,11 +172,13 @@ The CUDA compiler (`nvcc` / `ptxas`) chooses between two code-generation strateg
 
 ## 4. Zero-Overhead Context Switching & Warp Scheduling
 
-Unlike CPU threads—where a context switch traps into the OS kernel or saves/restores dozens of architectural registers to L1/RAM (costing hundreds to thousands of nanoseconds)—an SM performs **zero-overhead warp context switching on every single clock cycle**.
+On a CPU, switching from Thread A to Thread B is expensive: the operating system must trap into kernel mode, save dozens of registers out to main memory (RAM), and load Thread B's state—costing hundreds to thousands of nanoseconds. To hide memory latency without switching threads, CPUs rely on massive multi-megabyte caches.
+
+GPUs take the opposite approach: they use tiny caches and instead keep **dozens of warps resident simultaneously on every SM**, performing **zero-overhead warp context switching on every single clock cycle**. Whenever Warp 0 stalls waiting for data from HBM (~400 cycles away), the SM immediately issues an instruction from Warp 1 on the very next clock tick, keeping the arithmetic units busy while Warp 0's memory request travels across the chip.
 
 ### Why Context Switching Costs Zero Cycles
 
-The SM's register file (**256 KB = 65,536 $\times$ 32-bit registers per SM**) is **statically partitioned** among all resident warps at CTA launch time. Because every resident warp's registers, predicates, and PCs sit physically wired inside the SM silicon for the CTA's entire lifetime:
+The SM's register file (**256 KB = 65,536 $\times$ 32-bit registers per SM**) is **statically partitioned** among all resident warps at CTA launch time. Think of this as pre-allocating a dedicated, permanently wired desk for every resident warp rather than sharing one desk and packing/unpacking boxes on every switch. Because every resident warp's registers, predicates, and PCs sit physically wired inside the SM silicon for the CTA's entire lifetime:
 * Switching from Warp $3$ to Warp $17$ requires **zero memory copies** and **zero register saves**.
 * The warp scheduler simply drives a multiplexer selecting Warp $17$'s PC and register-bank base offset on the very next clock edge.
 

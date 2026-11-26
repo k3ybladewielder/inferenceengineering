@@ -26,7 +26,7 @@ Every hardware, model, and distributed systems term used in this document is def
 
 ## 1. Why Single-GPU Serving Hits Hard Limits
 
-A dense 70B parameter model in BF16 requires $140\text{ GB}$ just for static weights (before KV cache or activations), exceeding an $80\text{ GB}$ H100. A 405B model in BF16 requires $810\text{ GB}$ ($11+$ H100s). Even when a model *fits* on one GPU (e.g., 70B FP8 on an $80\text{ GB}$ H100), a single GPU's $3.35\text{ TB/s}$ HBM bandwidth caps minimum BF16/FP8 decode latency at $\frac{\text{Weight Bytes}}{\text{Bandwidth}}$.
+A dense 70B parameter model in BF16 ($2\text{ bytes/param}$) requires $70 \times 10^9 \times 2 = 140\text{ GB}$ just for static weights (before KV cache or activations), exceeding an $80\text{ GB}$ H100. A 405B model in BF16 requires $810\text{ GB}$ ($11+$ H100s). Even when a model *fits* on one GPU (e.g., 70B FP8 at $70\text{ GB}$ on an $80\text{ GB}$ H100), a single GPU's $3.35\text{ TB/s}$ HBM bandwidth caps minimum decode latency at $\frac{70\text{ GB}}{3.35\text{ TB/s}} \approx 20.9\text{ ms}$ per token just to read the weights from HBM. Splitting a model across multiple GPUs therefore solves two distinct problems: **total VRAM capacity** and **aggregate HBM bandwidth**.
 
 Splitting a Transformer across $P$ GPUs requires choosing *which dimension* to partition:
 * **Intra-Layer Parallelism (Tensor Parallelism, TP):** Splits individual weight matrices *within* every layer across $P$ GPUs, aggregating partial results at every layer boundary via high-speed collectives (`AllReduce`). Reduces **both VRAM per GPU and single-request latency (ITL)**.
@@ -43,13 +43,13 @@ Naively splitting a single matrix multiplication $Y = XW$ across $P$ GPUs requir
 **Megatron-LM Tensor Parallelism** (Shoeybi et al., 2019) pairs a **Column-Parallel Linear** layer directly with a **Row-Parallel Linear** layer so that intermediate activations remain partitioned across GPUs without communication, reducing synchronization to **just 2 `AllReduce` calls per Transformer layer** (one after Attention, one after MLP).
 
 #### Mathematical Proof for the MLP Block
-Consider a standard two-layer MLP (or gated SwiGLU MLP) with input $X \in \mathbb{R}^{S \times d}$ (replicated on all $P$ ranks), first weight $W_1 \in \mathbb{R}^{d \times d_{\text{ff}}}$, element-wise nonlinearity $\sigma(\cdot)$ (GeLU or SiLU), and second weight $W_2 \in \mathbb{R}^{d_{\text{ff}} \times d}$:
+Consider a standard two-layer MLP (or gated SwiGLU MLP) in PyTorch with input tensor `X` of shape `[S, d]` (replicated identically on all $P$ GPUs), first linear weight `W_1` of shape `[d, d_ff]`, element-wise nonlinearity $\sigma(\cdot)$ (`F.gelu` or `F.silu`), and second linear weight `W_2` of shape `[d_ff, d]`:
 
-1. **Column-Parallel Partitioning of $W_1$:** Split $W_1$ along its *columns* (output dimension $d_{\text{ff}}$) into $P$ slices:
+1. **Column-Parallel Partitioning of $W_1$:** Split $W_1$ along its *columns* (output dimension $d_{\text{ff}}$, i.e., `torch.chunk(W_1, P, dim=1)`) into $P$ slices:
    $$W_1 = \big[\, W_1^{(0)} \;\big|\; W_1^{(1)} \;\big|\; \dots \;\big|\; W_1^{(P-1)} \,\big], \qquad W_1^{(r)} \in \mathbb{R}^{d \times (d_{\text{ff}}/P)}$$
    Each GPU rank $r$ computes its local slice independently using the replicated input $X$:
    $$Z^{(r)} = \sigma\!\left(X W_1^{(r)}\right) \in \mathbb{R}^{S \times (d_{\text{ff}}/P)}$$
-   Because $\sigma(\cdot)$ is **strictly element-wise**, $\sigma([A_0 \mid A_1]) = [\sigma(A_0) \mid \sigma(A_1)]$. Thus, **zero communication is required** between $W_1$ and $W_2$! (For SwiGLU, both $W_{\text{gate}}$ and $W_{\text{up}}$ are column-parallel along $d_{\text{ff}}$, and the element-wise product $\text{SiLU}(X W_{\text{gate}}^{(r)}) \odot (X W_{\text{up}}^{(r)})$ also requires zero communication.)
+   Because $\sigma(\cdot)$ is **strictly element-wise**, applying it to a concatenated tensor is identical to applying it to each slice separately: $\sigma([A_0 \mid A_1]) = [\sigma(A_0) \mid \sigma(A_1)]$. Thus, **zero communication is required** between $W_1$ and $W_2$! (For SwiGLU, both $W_{\text{gate}}$ and $W_{\text{up}}$ are column-parallel along $d_{\text{ff}}$, and the element-wise product `F.silu(X @ W_gate_r) * (X @ W_up_r)` also requires zero communication.)
 
 2. **Row-Parallel Partitioning of $W_2$:** Split $W_2$ along its *rows* (input dimension $d_{\text{ff}}$) to match the column slices of $Z$:
    $$W_2 = \begin{bmatrix} W_2^{(0)} \\ W_2^{(1)} \\ \vdots \\ W_2^{(P-1)} \end{bmatrix}, \qquad W_2^{(r)} \in \mathbb{R}^{(d_{\text{ff}}/P) \times d}$$
@@ -96,12 +96,12 @@ For Llama-3-70B ($L = 80$ layers), there are $2 \times 80 = 160$ `AllReduce` bar
 
 ### 3.1 Layer-Wise Partitioning and the Pipeline Bubble
 
-**Pipeline Parallelism** splits the $L$ Transformer layers sequentially into $p$ stages (e.g., for $L = 80$ layers across $p = 4$ GPUs: GPU 0 holds layers $0\text{--}19$, GPU 1 holds $20\text{--}39$, GPU 2 holds $40\text{--}59$, GPU 3 holds $60\text{--}79$).
+**Pipeline Parallelism** splits the $L$ Transformer layers sequentially into $p$ stages—analogous to taking an 80-layer `nn.Sequential` module in PyTorch and placing layers `0..19` on `cuda:0`, `20..39` on `cuda:1`, `40..59` on `cuda:2`, and `60..79` on `cuda:3`.
 
-Instead of `AllReduce` barriers inside layers, stage $s$ sends only the **hidden state tensor** $H \in \mathbb{R}^{B \times S_{\text{step}} \times d}$ to stage $s+1$ via point-to-point `NCCL Send/Recv` ($p - 1$ hops total per forward pass).
+Instead of `AllReduce` barriers inside layers, stage $s$ sends only the **hidden state tensor** $H \in \mathbb{R}^{B \times S_{\text{step}} \times d}$ to stage $s+1$ via point-to-point `NCCL Send/Recv` ($p - 1$ hops total per forward pass). In PyTorch terms, if a 80-layer model is split across 4 GPUs, GPU 0 runs `layers[0:20](x)` and sends the resulting tensor `h` to GPU 1, which runs `layers[20:40](h)`, and so on. Once stage $s$ hands off $H$, it is free to immediately start computing the next micro-batch without waiting for downstream stages.
 
-* **Naive Execution (No Micro-Batching):** If a single batch runs through GPU 0 $\to$ 1 $\to$ 2 $\to$ 3 sequentially, only 1 GPU is active at any instant! Hardware utilization is $\frac{1}{p}$ ($25\%$ on 4 GPUs), and the **pipeline bubble** (idle time) is $\frac{p - 1}{p} = 75\%$.
-* **Micro-Batching ($m$ micro-batches):** Split a global batch $B$ into $m$ smaller micro-batches of size $B / m$. As soon as GPU 0 finishes micro-batch 1, it passes activations to GPU 1 and immediately starts micro-batch 2.
+* **Naive Execution (No Micro-Batching):** If a single batch runs through GPU 0 $\to$ 1 $\to$ 2 $\to$ 3 sequentially, only 1 GPU is active at any instant! While GPU 1 computes layers 20–39, GPUs 0, 2, and 3 sit completely idle. Hardware utilization is $\frac{1}{p}$ ($25\%$ on 4 GPUs), and the **pipeline bubble** (idle time) is $\frac{p - 1}{p} = 75\%$.
+* **Micro-Batching ($m$ micro-batches):** Split a global batch $B$ into $m$ smaller micro-batches of size $B / m$ (e.g., `torch.chunk(batch, m, dim=0)`). As soon as GPU 0 finishes micro-batch 1, it passes activations to GPU 1 and immediately starts micro-batch 2, keeping all stages busy concurrently in steady state.
 
 ### 3.2 GPipe vs. 1F1B (and Interleaved 1F1B) Schedules
 

@@ -33,7 +33,7 @@ Consider Llama-3-8B in FP8 on an H100 SXM ($3.35\text{ TB/s}$ HBM3):
 * Weight size $\approx 8\text{ GB}$.
 * Ideal memory-bandwidth-bound decode step time at low batch size:
   $$T_{\text{GPU\_step}} \approx \frac{8\text{ GB}}{3.35\text{ TB/s}} \approx 2.4\text{ ms}$$
-* If the CPU spends $1.2\text{ ms}$ per step inside Python's Global Interpreter Lock (GIL), JSON/HTTP serialization, tokenizer/detokenizer calls, scheduler queue scanning, and PyTorch kernel-dispatch overhead, **the GPU sits idle 33% of the time** between steps!
+* If the CPU spends $1.2\text{ ms}$ per step inside Python's Global Interpreter Lock (GIL), JSON/HTTP serialization, tokenizer/detokenizer calls, scheduler queue scanning, and PyTorch kernel-dispatch overhead (where each `nn.Module` op triggers a separate CPU-to-GPU `cudaLaunchKernel` driver call across hundreds of ops per forward pass), **the GPU sits idle 33% of the time** between steps!
 
 Production serving engines differ fundamentally in **how they isolate the CPU control plane from the GPU hot path**, **how they manage KV memory**, and **whether they compile execution graphs Ahead-of-Time (AoT) or Just-in-Time (JIT)**.
 
@@ -51,7 +51,7 @@ vLLM V0 established the blueprint for PagedAttention-based serving through five 
 4. **`Executor` (`GPUExecutor` / `MultiprocessingGPUExecutor` / `RayGPUExecutor`):** Broadcasts `ExecuteModelRequest` metadata from the driver process to all Tensor-Parallel / Pipeline-Parallel worker processes.
 5. **`Worker` & `ModelRunner`:** Each GPU rank runs a `Worker` containing a `ModelRunner`. On every step, `ModelRunner`:
    * Converts scheduler metadata into GPU tensors (`input_ids`, `positions`, `slot_mapping`, `block_tables`, `seq_lens`, `AttentionMetadata`).
-   * Runs the forward pass (replaying captured **CUDA Graphs** for pure decode batches to eliminate Python/CUDA launch overhead, or eager PyTorch + FlashAttention/FlashInfer for prefills).
+   * Runs the forward pass (replaying captured **CUDA Graphs** for pure decode batches—recording the entire sequence of ~300+ GPU kernel launches once per batch size so the CPU replays them in a single call with zero Python/CUDA dispatch overhead—or eager PyTorch + FlashAttention/FlashInfer for prefills).
    * Runs the `Sampler` (logits $\to$ penalties $\to$ temperature/top-$k$/top-$p$ $\to$ token IDs) and returns sampled tokens to the driver.
 
 **V0 Bottlenecks Exposed at Scale:**
@@ -92,7 +92,7 @@ Unlike vLLM V0's fixed-block hash table (which only matched exact multiples of `
 * **LRU Leaf Eviction:** Completed request paths remain in the Radix Tree with `lock_ref = 0` until VRAM is needed; when free KV space runs low, leaf nodes are evicted in Least-Recently-Used (LRU) order (`lock_ref == 0`).
 
 ### 3.3 Zero-Overhead CPU Scheduler (Overlap Scheduling)
-In standard engines, the CPU runs: `Schedule(t) -> Launch GPU(t) -> Wait/Sync -> Sample(t) -> Schedule(t+1)`. Waiting for GPU completion to know the sampled token IDs and `<EOS>` status stalls the CPU, and then the GPU stalls waiting for `Schedule(t+1)`.
+In standard engines, the CPU runs: `Schedule(t) -> Launch GPU(t) -> Wait/Sync -> Sample(t) -> Schedule(t+1)`. Normally, Python must read the sampled token back to the host (e.g., `next_token.item()`, which triggers an implicit `cudaStreamSynchronize` barrier) to know the token IDs and `<EOS>` status before building step $t+1$—stalling the CPU while the GPU works, and then stalling the GPU while the CPU schedules.
 
 SGLang's **Zero-Overhead Scheduler** runs a **one-step lookahead pipeline** on a separate CPU thread/stream:
 1. While the GPU executes forward pass $t$ on CUDA Stream `compute`, the CPU immediately constructs the batch metadata for step $t+1$ **assuming none of the running requests hit EOS at step $t$**!
@@ -111,7 +111,7 @@ SGLang provides an embedded Python DSL (`@sgl.function`, `sgl.gen()`, `sgl.selec
 
 ## 4. TensorRT-LLM Architecture
 
-**TensorRT-LLM** (NVIDIA) represents the **Ahead-of-Time (AoT) compiled C++ runtime** paradigm, trading Python flexibility for maximum bare-metal silicon efficiency.
+**TensorRT-LLM** (NVIDIA) represents the **Ahead-of-Time (AoT) compiled C++ runtime** paradigm, trading Python flexibility for maximum bare-metal silicon efficiency. Instead of interpreting PyTorch `nn.Module` layers dynamically at serving time, it compiles the entire model into a static, hardware-tuned C++ execution plan before the server starts.
 
 ### 4.1 Ahead-of-Time (AoT) Graph Compilation (`trtllm-build`)
 Unlike vLLM/SGLang (which load HuggingFace Safetensors directly at startup and execute PyTorch/CUDA Graph modules dynamically), classic TensorRT-LLM uses a two-stage build-then-serve workflow:

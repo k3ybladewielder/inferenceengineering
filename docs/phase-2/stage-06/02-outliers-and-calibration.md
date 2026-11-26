@@ -69,10 +69,10 @@ Quantized INT8 q:  [   0,     -1,      0,  ... ,    127,        ...,   -1  ]
 Dequantized x_hat: [ 0.00,  -0.50,   0.00, ... ,   64.00,       ..., -0.50 ] -> Normal features obliterated!
 ```
 
-* **Why per-channel activation scaling ($s_x[k]$) cannot be used directly in GEMM:** Because $k$ is the **reduction dimension** of $Y_{mn} = \sum_{k=1}^K X_{mk} W_{kn}$, a scale $s_x[k]$ depending on $k$ cannot be factored outside the Tensor Core `IMMA`/`FP8` dot product without dequantizing inside the inner loop (unless using fine-grained hardware block scaling like `MXFP8` at $k=32$).
-* **Why `LLM.int8()` mixed-precision decomposition is too slow:** Splitting $X$ and $W$ into `FP16` outlier columns ($\mathcal{O}$) and `INT8` normal columns ($[K] \setminus \mathcal{O}$) requires scattered indexing, two separate GEMMs, and synchronization, making `LLM.int8()` **slower than pure `FP16`** on modern GPUs.
+* **Why per-channel activation scaling ($s_x[k]$) cannot be used directly in GEMM:** In PyTorch notation, per-token scaling computes `X.abs().max(dim=-1, keepdim=True)` (shape `[M, 1]`), which factors cleanly outside `X @ W`. By contrast, scaling along the feature dimension $k$ (`X.abs().max(dim=0)`, shape `[1, K]`) sits along the **reduction dimension** of $Y_{mn} = \sum_{k=1}^K X_{mk} W_{kn}$. A scale $s_x[k]$ depending on $k$ cannot be factored outside the Tensor Core `IMMA`/`FP8` dot product without dequantizing inside the inner loop (unless using fine-grained hardware block scaling like `MXFP8` at $k=32$).
+* **Why `LLM.int8()` mixed-precision decomposition is too slow:** Splitting $X$ and $W$ into `FP16` outlier columns ($\mathcal{O}$) and `INT8` normal columns ($[K] \setminus \mathcal{O}$) requires gathering non-contiguous columns from memory, running two separate GEMMs, and adding their results—overhead that makes `LLM.int8()` **slower than pure `FP16`** on modern GPUs.
 
-To keep **pure, dense, fast integer/FP8/INT4 GEMMs**, calibration algorithms transform the weights and scales offline using a small calibration dataset (typically 128–512 sequences from Pile/C4/WikiText-2).
+To keep **pure, dense, fast integer/FP8/INT4 GEMMs**, calibration algorithms transform the weights and scales offline using a small calibration dataset (typically 128–512 sequences from Pile/C4/WikiText-2) so that standard, contiguous matrix multiplications preserve accuracy.
 
 ---
 
@@ -82,11 +82,11 @@ Introduced by Xiao et al. (2023), **SmoothQuant** solves the `W8A8` activation o
 
 ### 2.1 Mathematical Equivalence via Diagonal Scaling Migration
 
-For any linear projection $Y = X W$ ($X \in \mathbb{R}^{M \times K}, W \in \mathbb{R}^{K \times N}$), introduce an arbitrary positive per-channel smoothing vector $s \in \mathbb{R}_{>0}^{K}$:
+For any linear projection $Y = X W$ ($X \in \mathbb{R}^{M \times K}, W \in \mathbb{R}^{K \times N}$), we can insert an identity matrix $I = \text{diag}(s)^{-1} \text{diag}(s)$ for any positive per-channel smoothing vector $s \in \mathbb{R}_{>0}^{K}$ without changing the exact mathematical output:
 
 $$Y = X W = \left( X \, \text{diag}(s)^{-1} \right) \cdot \left( \text{diag}(s) \, W \right) = \widehat{X} \, \widehat{W}$$
 
-Dividing column $j$ of $X$ by $s_j$ shrinks the outlier activation channel $j$ into the normal range, while multiplying row $j$ of $W$ by $s_j$ increases the magnitude of the corresponding input-channel weight row—**migrating the quantization difficulty from $X$ into $W$**.
+In PyTorch terms, this divides column `j` of `X` by `s[j]` (`X / s[None, :]`) and multiplies row `j` of `W` by `s[j]` (`W * s[:, None]`). Dividing column $j$ of $X$ by $s_j$ shrinks the outlier activation channel $j$ down into the normal range, while multiplying row $j$ of $W$ by $s_j$ increases the magnitude of the corresponding input-channel weight row—**migrating the quantization difficulty from $X$ into $W$** before either tensor is rounded.
 
 ### 2.2 Balancing Factor $\alpha$
 
@@ -166,15 +166,15 @@ While AWQ optimizes a diagonal channel scale before rounding, **GPTQ** (Frantar 
 
 ### 4.1 Layer-Wise Reconstruction & Hessian Derivation
 
-Consider a single linear layer $W \in \mathbb{R}^{K \times N}$ (note: in row-major notation per output neuron $w \in \mathbb{R}^K$, we quantize each row independently; here $X \in \mathbb{R}^{K \times M}$ denotes stacked calibration inputs):
+Consider a single linear layer $W \in \mathbb{R}^{K \times N}$ (in row-major notation per output neuron $w \in \mathbb{R}^K$, we quantize each output row independently; here $X \in \mathbb{R}^{K \times M}$ denotes stacked calibration inputs). Rather than minimizing weight error $\|W - \widehat{W}\|_F^2$ in isolation, GPTQ minimizes the **actual layer output error** on the calibration inputs:
 
 $$\min_{\widehat{W}} \| W X - \widehat{W} X \|_2^2 = \sum_{n=1}^{N} \| w_n^\top X - \hat{w}_n^\top X \|_2^2$$
 
-Taking a second-order Taylor expansion of the loss $L(w) = \| w^\top X - \hat{w}^\top X \|_2^2$ around the unquantized optimal $w$ (where gradient $\nabla L(w) = 0$):
+Taking a second-order Taylor expansion of the loss $L(w) = \| w^\top X - \hat{w}^\top X \|_2^2$ around the unquantized optimal $w$ (where gradient $\nabla L(w) = 0$ because $\delta w = 0$ is already a minimum):
 
 $$\delta L \approx \frac{1}{2} \delta w^\top H \, \delta w, \qquad \text{where } H = 2 X X^\top \in \mathbb{R}^{K \times K}$$
 
-Crucially, **$H = 2 X X^\top$ depends only on the layer inputs $X$ and is shared identically across all $N$ output channels** of that linear layer!
+Here $H$ is the Hessian (curvature) matrix of the squared reconstruction loss—essentially the unnormalized input feature covariance matrix. Crucially, **$H = 2 X X^\top$ depends only on the layer inputs $X$ and is shared identically across all $N$ output channels** of that linear layer, so it only needs to be inverted once per layer rather than $N$ times!
 
 ### 4.2 Optimal Brain Quantization (OBQ) Update Formula
 

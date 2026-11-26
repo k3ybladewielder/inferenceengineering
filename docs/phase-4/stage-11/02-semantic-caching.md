@@ -41,7 +41,8 @@ However, naive semantic caching is a notorious source of silent production bugs:
 
 ## 2. Sub-5 ms Low-Latency Embedding Models
 
-For the semantic cache to reduce TTFT, the combined embedding + vector search + guardrail pipeline must complete well under **$10\text{ ms}$** (ideally **$3\text{–}7\text{ ms}$**), leaving ample headroom below typical GPU TTFT ($100\text{–}500\text{ ms}$).
+
+For the semantic cache to reduce TTFT, the combined embedding + vector search + guardrail pipeline must complete well under **$10\text{ ms}$** (ideally **$3\text{–}7\text{ ms}$**), leaving ample headroom below typical GPU TTFT ($100\text{–}500\text{ ms}$). Just as `F.cosine_similarity` compares two PyTorch embedding vectors, an in-memory Approximate Nearest Neighbor index compares the incoming prompt vector against millions of cached vectors in sub-millisecond time—provided a deterministic guardrail verifies that negations or numbers did not flip the meaning:
 
 ### 2.1 Bi-Encoder Architecture & Quantized Execution
 
@@ -102,7 +103,7 @@ When cache size scales to $10^7\text{–}10^9$ entries and RAM becomes prohibiti
 
 A common mistake is setting the cache threshold to `0.80` or `0.85` (standard RAG retrieval thresholds). In **RAG**, retrieving a slightly adjacent chunk at `0.82` is helpful context; in **Semantic Caching**, returning a cached final answer directly replaces LLM reasoning—a single false positive delivers a completely wrong answer to the user.
 
-Furthermore, transformer embedding spaces exhibit **anisotropy** (the *narrow cone phenomenon*): embeddings of arbitrary English sentences within the same domain already share a baseline cosine similarity of **$0.55\text{–}0.75$**. Consequently, subtle adversarial or factual perturbations sit dangerously high on the cosine scale:
+Furthermore, transformer embedding spaces exhibit **anisotropy** (the *narrow cone phenomenon*): rather than spreading uniformly across the unit hypersphere, embeddings of arbitrary English sentences within the same domain cluster into a narrow cone and already share a baseline cosine similarity of **$0.55\text{–}0.75$**. Consequently, subtle adversarial or factual perturbations sit dangerously high on the cosine scale:
 
 | Query A | Query B (Perturbed) | Typical Cosine (`bge-small` / `MiniLM`) | Safe to Serve Cache? |
 | :--- | :--- | :---: | :---: |

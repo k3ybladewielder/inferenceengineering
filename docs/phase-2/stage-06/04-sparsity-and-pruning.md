@@ -35,7 +35,7 @@ Every technical term, hardware mechanism, numerical format, and pruning algorith
 
 ## 1. Taxonomy of Sparsity on GPU Silicon
 
-Pruning removes redundant parameters from weight matrices $W \in \mathbb{R}^{K \times N}$ by setting selected entries to exact zero (`0.0`). On CPUs, even irregular sparsity can sometimes save FLOPs via branchy loops. On massively parallel GPUs—where 32 threads in a warp execute in lockstep (`SIMT`) and Tensor Cores operate strictly on rigid matrix tiles (`16×8×16`, `64×N×32`)—the **geometric structure** of zeros determines whether pruning speeds up inference or actually *slows it down*:
+Pruning removes redundant parameters from weight matrices $W \in \mathbb{R}^{K \times N}$ by setting selected entries to exact zero (`0.0`). In PyTorch, zeroing out 50% of a tensor (`W[mask] = 0`) leaves `X @ W` running at the exact same speed because dense `matmul` kernels still load and multiply every zero. Switching to general sparse formats like `CSR` or `COO` helps on CPUs with branchy loops, but on massively parallel GPUs—where 32 threads in a warp execute in lockstep (`SIMT`) and Tensor Cores operate strictly on rigid matrix tiles (`16×8×16`, `64×N×32`)—irregular indices scatter memory reads and stall warps. Consequently, the **geometric structure** of zeros determines whether pruning speeds up inference or actually *slows it down*:
 
 | Sparsity Type | Pattern Constraint | Storage Overhead | GPU Tensor Core Support? | Typical Inference Impact |
 | :--- | :--- | :--- | :---: | :--- |
@@ -76,10 +76,10 @@ A widespread misconception is that `2:4` sparsity cuts memory footprint by 50%. 
 
 ### 2.2 How Sparse Tensor Cores Achieve 2× Compute Throughput
 
-Inside a Sparse Tensor Core instruction (`mma.sp.sync` on Ampere/Ada, `wgmma.mma_async.sp` on Hopper):
-1. The hardware loads the **compressed** operand ($K/2$ elements) alongside its **2-bit metadata indices**, and loads the **full dense** activation tile ($K$ elements).
-2. Hardware **2:1 multiplexers** built directly into the Tensor Core datapath use the 2-bit index metadata to select *only* the matching 2 activation elements from every 4-element slice of $X$.
-3. The multipliers perform only **half the MAC operations** per unit area—meaning twice as many logical $K$-elements complete per clock cycle!
+Inside a Sparse Tensor Core instruction (`mma.sp.sync` on Ampere/Ada, `wgmma.mma_async.sp` on Hopper), the hardware pairs a compressed weight matrix with a dense activation matrix without wasting multipliers on zeros:
+1. The hardware loads the **compressed** weight operand ($K/2$ nonzero elements) alongside its **2-bit metadata indices**, and loads the **full dense** activation tile ($K$ elements) into on-chip memory.
+2. Hardware **2:1 multiplexers** (`MUX`—fast digital selector switches) built directly into the Tensor Core datapath read each 2-bit index and route *only* the matching 2 activation elements from every 4-element slice of $X$ into the multipliers, discarding the 2 positions where the weight is zero.
+3. Because each multiplier performs only **half the MAC operations** per unit silicon area, twice as many logical $K$-elements complete per clock cycle—doubling peak Tensor Core math throughput:
    * **H100 SXM5 `FP16` Sparse Peak:** $1{,}979\text{ TFLOPS}$ (vs. $989\text{ TFLOPS}$ dense).
    * **H100 SXM5 `FP8` Sparse Peak:** $3{,}958\text{ TFLOPS}$ (vs. $1{,}979\text{ TFLOPS}$ dense).
 

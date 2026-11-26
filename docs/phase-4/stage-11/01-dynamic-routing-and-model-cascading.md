@@ -54,7 +54,8 @@ Even with Tensor Parallelism ($TP=8$) and high-bandwidth HBM3e ($4.8\text{ TB/s}
 
 ## 2. Upfront Dynamic Routing vs. Speculative Model Cascading
 
-There are two fundamentally distinct architectural paradigms for multi-tier dispatch:
+
+There are two fundamentally distinct architectural paradigms for multi-tier dispatch. In PyTorch terms, an upfront router acts like a fast `if/else` gate running a tiny 20M-parameter CPU classifier before deciding which model checkpoint to call, whereas a speculative cascade runs the small 8B model first and inspects its output `logprobs` or a reward verifier before deciding whether to discard the draft and invoke the 405B model:
 
 1. **Upfront Dynamic Routing (Pre-Inference Classification):** Inspect the prompt *before* calling any LLM using a cheap heuristic, entropy estimator, or trained classifier ($<5\text{ ms}$), and dispatch once to either the small model $M_s$ or the frontier model $M_f$.
 2. **Speculative Model Cascading (Post-Inference Verification):** Optimistically send the prompt to the cheap/fast model $M_s$ first, evaluate a confidence or verifier signal on $M_s$'s output, and **escalate** to $M_f$ only if $M_s$ exhibits low confidence or fails verification.
@@ -122,7 +123,7 @@ The workhorse of production AI gateways is a fine-tuned bidirectional encoder tr
 
 * **Model Choices & Architectural Mechanics:**
   * **DeBERTa-v3-small / base (44M–86M params):** Uses disentangled content-to-position attention, providing strong accuracy on subtle reasoning cues up to 512 tokens.
-  * **ModernBERT-base / large (149M–395M params):** Replaces absolute positional embeddings with **RoPE**, uses alternating local/global attention, **FlashAttention**, and sequence **unpadding** (packing variable-length prompts without wasted `[PAD]` compute), supporting **8,192-token contexts** natively in single-digit milliseconds.
+  * **ModernBERT-base / large (149M–395M params):** Replaces absolute positional embeddings with **RoPE**, uses alternating local/global attention, **FlashAttention**, and sequence **unpadding** (concatenating variable-length prompts into a single 1D batch without wasted `[PAD]` token compute, analogous to ragged tensors), supporting **8,192-token contexts** natively in single-digit milliseconds.
 * **Deployment Latency Optimization:** Exporting to **INT8 ONNX Runtime** (CPU with AVX-512 VNNI) or **FP16 TensorRT** (co-located on a lightweight T4/L4 or sidecar GPU) executes a 512-token forward pass in **$2\text{–}6\text{ ms}$**.
 * **Probability Calibration:** Raw classifier logits are uncalibrated. Gateways apply **Temperature Scaling** ($p = \sigma(z / T)$) fitted on a held-out validation set so that setting a routing threshold $\tau = 0.85$ reliably guarantees $\ge 85\%$ expected pass-rate on the small model.
 

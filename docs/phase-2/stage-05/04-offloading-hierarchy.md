@@ -61,13 +61,13 @@ Offloading/reloading over PCIe is **$\sim 40\times$ faster than recomputing** fo
 
 ### 2.1 Why Pageable Host Memory Kills Async Overlap (`malloc` vs. `cudaHostAlloc`)
 
-Standard host allocations (`malloc` / `new` / standard PyTorch CPU tensors) reside in **pageable virtual memory**. The Linux kernel may page them out to swap or migrate physical frames at any moment, and their physical RAM pages are scattered (non-pinned).
+Standard host allocations (`malloc` / `new` / standard PyTorch CPU tensors like `torch.empty(...)`) reside in **pageable virtual memory**. The Linux kernel may page them out to disk swap or migrate their physical RAM frames at any moment, and their physical RAM pages are scattered.
 
-If you call `cudaMemcpyAsync(dst_gpu, src_pageable_cpu, ..., stream)`:
+If you call `cudaMemcpyAsync(dst_gpu, src_pageable_cpu, ..., stream)` (or `cpu_tensor.to('cuda', non_blocking=True)` without `pin_memory=True`):
 1. The GPU's **Copy Engine (CE) DMA controller** cannot safely read/write pageable virtual addresses directly because physical pages could move mid-DMA.
 2. Therefore, the CUDA driver silently **blocks the CPU thread**, allocates a temporary **pinned staging buffer**, performs a CPU `memcpy` into the staging buffer, executes DMA from staging to GPU, and only then returns—destroying both PCIe throughput (extra CPU memory copy) and stream asynchronicity!
 
-To achieve true zero-CPU-copy, non-blocking DMA at full PCIe line rate, Tier 2 host KV pools **must** be allocated as **page-locked (pinned) memory**:
+To achieve true zero-CPU-copy, non-blocking DMA at full PCIe line rate (just like PyTorch's `pin_memory=True` for DataLoaders), Tier 2 host KV pools **must** be allocated as **page-locked (pinned) memory**:
 ```cpp
 // Allocate 64 GiB pinned host KV pool (locked in physical DRAM, DMA-accessible)
 cudaHostAlloc(&host_kv_pool, 64ULL << 30, cudaHostAllocDefault);
@@ -84,14 +84,14 @@ GPU hardware contains **independent execution engines**:
 * **SM Compute Engine:** Executes GEMMs, RoPE, Softmax, Attention.
 * **Copy Engines (CE — typically 1 H2D and 1 D2H DMA engine on A100/H100):** Execute PCIe transfers independently in full duplex (simultaneous Host-to-Device and Device-to-Host!) without consuming SM warps.
 
-To overlap KV spilling (D2H) and prefetching (H2D) with active forward passes, the engine creates **dedicated non-blocking CUDA streams** (`cudaStreamNonBlocking`):
+To overlap KV spilling (D2H) and prefetching (H2D) with active forward passes, the engine creates **dedicated non-blocking CUDA streams** (`cudaStreamNonBlocking`, analogous to separate `torch.cuda.Stream()` queues that run independently of PyTorch's default stream):
 * `compute_stream`: Runs Transformer layers $0 \dots L-1$ and sampling.
 * `d2h_stream` (Spill stream): Copies inactive/evictable VRAM blocks → Pinned Host RAM.
 * `h2d_stream` (Prefetch stream): Copies predicted/scheduled Host RAM blocks → VRAM.
 
 #### Exact Synchronization Rules (`cudaEvent_t`)
 
-Never use `cudaDeviceSynchronize()` or `cudaStreamSynchronize()` on the hot path—that stalls the host scheduler and drains the GPU pipeline. Instead, enforce fine-grained GPU-side dependency edges using **`cudaEventRecord`** and **`cudaStreamWaitEvent`**:
+Never use `cudaDeviceSynchronize()` or `cudaStreamSynchronize()` (the C++ equivalents of `torch.cuda.synchronize()`) on the hot path—that stalls the host Python/C++ scheduler and drains the GPU pipeline. Instead, enforce fine-grained GPU-side dependency edges using **`cudaEventRecord`** and **`cudaStreamWaitEvent`** (just like `event.record(stream)` and `other_stream.wait_event(event)` in PyTorch):
 
 1. **Spill Safety (RAW Hazard — Do Not Overwrite Before Copy Finishes):**
    * Suppose block `B_phys` finishes being written on `compute_stream`. Record `ev_compute_done` on `compute_stream`.

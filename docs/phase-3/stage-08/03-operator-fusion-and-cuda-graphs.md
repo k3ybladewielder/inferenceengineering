@@ -44,7 +44,7 @@ In a modern Transformer block (e.g., Llama-3, Qwen2.5, Mistral), the dense matri
 
 This tax comes from two distinct physical sources:
 
-1. **Intermediate HBM Materialization:** Every unfused PyTorch operator reads its inputs from off-chip HBM, computes a trivial arithmetic operation in registers, and writes the full intermediate tensor back out to HBM—only for the next kernel milliseconds or microseconds later to read that exact same tensor right back from HBM.
+1. **Intermediate HBM Materialization:** In eager PyTorch, writing `h = x + r; h_norm = rmsnorm(h); q = quantize(h_norm)` allocates a new `torch.Tensor` in off-chip HBM at every step. Each operator reads its inputs from HBM, computes a trivial arithmetic operation in registers, and writes the full intermediate tensor back out to HBM—only for the next kernel microseconds later to read that exact same tensor right back from HBM.
 2. **CPU Kernel Launch Overhead:** Every individual kernel invocation incurs ~5–20 µs of CPU/driver dispatch overhead (plus Python/ATen overhead if running eagerly). Across an 80-layer model issuing 500–800 tiny kernels per decode step, CPU dispatch alone injects milliseconds of pure idle GPU bubbles.
 
 **Operator Fusion** eliminates (1) and reduces kernel count; **CUDA Graphs** eliminate (2).
@@ -137,7 +137,7 @@ Consider `batch_size = 1` decode on Llama-3-8B ($d = 4096$, GQA 8 KV heads $\imp
 
 ### Anatomy of the CPU Kernel Launch Bottleneck
 
-When PyTorch executes a model eagerly, the GPU does not autonomously run a loop over layers. For **every single kernel**, the host CPU must traverse a long software and hardware path:
+When PyTorch executes a model eagerly, the GPU does not autonomously run a loop over layers. Instead, the GPU behaves like a fast worker waiting for individual instructions from a manager (the CPU). For **every single kernel**, the host CPU must traverse a long software and hardware path:
 1. Python interpreter executes method call (~2–5 µs).
 2. PyTorch ATen dispatcher resolves dtype, device, strides, and autograd/allocator metadata (~3–10 µs).
 3. CUDA Runtime calls `cudaLaunchKernel` -> CUDA Driver constructs a GPU **command packet (QMD — Queue Meta Data)** inside host pinned pushbuffer memory and rings a PCIe MMIO doorbell (~3–5 µs).
@@ -187,7 +187,9 @@ with torch.cuda.graph(g):
 
 # 4. Runtime Inference Loop (Zero Python/ATen/Driver launch overhead!)
 def run_decode(new_token_ids: torch.Tensor, new_positions: torch.Tensor) -> torch.Tensor:
-    # Copy dynamic data INTO the fixed GPU addresses before replay
+    # Copy dynamic data INTO the fixed GPU addresses before replay.
+    # Reassigning (static_input_ids = new_token_ids) would fail because the captured
+    # graph's compiled command buffer hardcodes the original tensor's memory pointer.
     static_input_ids.copy_(new_token_ids)
     static_positions.copy_(new_positions)
     g.replay()  # Single cudaGraphLaunch (~2 us CPU time for entire 80-layer model!)
@@ -227,7 +229,7 @@ sequenceDiagram
 Because `cudaGraphInstantiate` freezes **every virtual memory pointer, tensor stride, grid dimension, and scalar kernel argument** into hardware pushbuffers at capture time, a captured CUDA Graph has strict runtime invariants:
 
 ### What Breaks CUDA Graph Capture or Replay
-1. **CPU-GPU Synchronization inside capture:** Calling `tensor.item()`, `.cpu()`, `torch.nonzero()`, or host-side dynamic `if seq_len > threshold:` throws `cudaErrorStreamCaptureUnsupported`.
+1. **CPU-GPU Synchronization inside capture:** Calling `tensor.item()`, `.cpu()`, `torch.nonzero()`, or host-side dynamic `if seq_len > threshold:` throws `cudaErrorStreamCaptureUnsupported`. During capture, kernels are only being recorded into a blueprint rather than executed on the GPU, so the CPU cannot read back a runtime tensor value to make a Python control-flow decision.
 2. **Dynamic memory allocation (`cudaMalloc` / `cudaFree`):** All intermediate activations must reside at the exact virtual addresses recorded during capture (PyTorch handles this via a private `graph_pool_handle()`).
 3. **Changing tensor shapes / batch sizes:** If `batch_size` changes from `7` to `12`, the GEMM grid dimensions `(cdiv(M, BLOCK_M), ...)` and kernel scalar arguments `M=7` are stale inside `cudaGraphExec_t`.
 
